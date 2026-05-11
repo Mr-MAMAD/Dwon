@@ -1,0 +1,132 @@
+name: Direct DL Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Direct URLs (Separate with space, comma, or new line)"
+        required: true
+        type: string
+
+      password:
+        description: "ZIP Password (Optional)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  direct-download:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2 zip
+
+      - name: Download Files
+        shell: bash
+        run: |
+          RAW_URLS="${{ github.event.inputs.url }}"
+          FORMATTED_URLS=$(echo "$RAW_URLS" | tr ',' ' ' | tr '\n' ' ')
+
+          rm -rf tmp_downloads
+          rm -rf upload
+
+          mkdir -p tmp_downloads
+          mkdir -p upload
+
+          for URL in $FORMATTED_URLS; do
+            if [ -z "$URL" ]; then
+              continue
+            fi
+
+            echo "Downloading: $URL"
+
+            aria2c \
+              --split=4 \
+              --max-connection-per-server=4 \
+              --dir="tmp_downloads" \
+              "$URL"
+
+            if [ $? -ne 0 ]; then
+              echo "Failed to download: $URL"
+            fi
+          done
+
+      - name: Prepare Files
+        shell: bash
+        run: |
+          PASS="${{ github.event.inputs.password }}"
+          LIMIT=$((2 * 1024 * 1024 * 1024))
+
+          for FILE in tmp_downloads/*; do
+            if [ ! -f "$FILE" ]; then
+              continue
+            fi
+
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "Large file detected: $BASENAME"
+
+              if [ -n "$PASS" ]; then
+                zip -s 2g -P "$PASS" "upload/${BASENAME}.zip" -j "$FILE"
+              else
+                zip -s 2g "upload/${BASENAME}.zip" -j "$FILE"
+              fi
+
+            else
+              if [ -n "$PASS" ]; then
+                echo "Creating password protected zip: $BASENAME"
+
+                zip -P "$PASS" "upload/${BASENAME}.zip" -j "$FILE"
+              else
+                echo "Keeping original file: $BASENAME"
+
+                cp "$FILE" "upload/$BASENAME"
+              fi
+            fi
+          done
+
+          rm -rf tmp_downloads
+
+      - name: Generate Release Info
+        id: meta
+        shell: bash
+        run: |
+          TAG="run-$(date +%Y%m%d-%H%M%S)"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "## Download Files" > body.md
+          echo "" >> body.md
+
+          for FILE in upload/*; do
+            if [ ! -f "$FILE" ]; then
+              continue
+            fi
+
+            NAME=$(basename "$FILE")
+
+            echo "- $NAME" >> body.md
+          done
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Download ${{ steps.meta.outputs.tag }}
+          body_path: body.md
+          files: upload/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
