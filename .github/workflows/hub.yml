@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "Pornhub Video URL(s) (one per line or comma separated)"
+        description: "Pornhub Video URL(s) - comma, space or newline separated"
         required: true
         type: string
 
@@ -43,7 +43,7 @@ jobs:
           rm -rf downloads
           mkdir -p downloads
 
-      - name: Download videos
+      - name: Download videos (FIXED MULTI-LINK)
         shell: bash
         run: |
           RAW_URLS="${{ github.event.inputs.video_url }}"
@@ -55,12 +55,16 @@ jobs:
             FORMAT="bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]"
           fi
 
-          # تبدیل کاما به خط جدید
-          CLEAN_URLS=$(echo "$RAW_URLS" | tr ',' '\n')
+          echo "Raw input: $RAW_URLS"
+
+          # مهم: تبدیل همه جداکننده‌ها به یک استاندارد
+          CLEAN_URLS=$(echo "$RAW_URLS" | tr ',' '\n' | tr ' ' '\n')
 
           INDEX=1
 
           while IFS= read -r URL; do
+            URL=$(echo "$URL" | xargs)
+
             if [ -z "$URL" ]; then
               continue
             fi
@@ -79,7 +83,7 @@ jobs:
               "$URL"
 
             if [ $? -ne 0 ]; then
-              echo "Failed: $URL"
+              echo "Failed download: $URL"
             fi
 
             INDEX=$((INDEX + 1))
