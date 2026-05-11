@@ -1,4 +1,4 @@
-name: Direct DL Release
+name: sxp DL Release
 
 on:
   workflow_dispatch:
