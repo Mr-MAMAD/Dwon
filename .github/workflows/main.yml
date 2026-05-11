@@ -55,6 +55,8 @@ jobs:
               --split=4 \
               --max-connection-per-server=4 \
               --dir="tmp_downloads" \
+              --header="Referer: https://www.erome.com/" \
+              --header="User-Agent: Mozilla/5.0" \
               "$URL"
 
             if [ $? -ne 0 ]; then
