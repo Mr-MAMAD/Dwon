@@ -1,0 +1,172 @@
+name: Direct DL Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Direct URLs (Separate with space, comma, or new line)"
+        required: true
+        type: string
+
+      password:
+        description: "ZIP Password (Optional)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  direct-download:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2 zip curl ffmpeg
+          python3 -m pip install -U yt-dlp
+
+      - name: Download Files
+        shell: bash
+        run: |
+          RAW_URLS="${{ github.event.inputs.url }}"
+          FORMATTED_URLS=$(echo "$RAW_URLS" | tr ',' ' ' | tr '\n' ' ')
+
+          rm -rf tmp_downloads
+          rm -rf upload
+
+          mkdir -p tmp_downloads
+          mkdir -p upload
+
+          INDEX=1
+
+          for URL in $FORMATTED_URLS; do
+            if [ -z "$URL" ]; then
+              continue
+            fi
+
+            echo "======================================"
+            echo "Downloading: $URL"
+            echo "======================================"
+
+            FILE_NAME="file_${INDEX}"
+
+            aria2c \
+              --split=1 \
+              --max-connection-per-server=1 \
+              --retry-wait=10 \
+              --max-tries=10 \
+              --timeout=60 \
+              --connect-timeout=60 \
+              --lowest-speed-limit=1K \
+              --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36" \
+              --header="Referer: https://google.com/" \
+              --check-certificate=false \
+              --dir="tmp_downloads" \
+              --out="${FILE_NAME}" \
+              "$URL"
+
+            if [ $? -ne 0 ]; then
+              echo "Aria2 failed. Trying curl..."
+
+              curl -L \
+                -A "Mozilla/5.0" \
+                -e "https://google.com/" \
+                --retry 10 \
+                --retry-delay 5 \
+                --connect-timeout 60 \
+                -o "tmp_downloads/${FILE_NAME}" \
+                "$URL"
+            fi
+
+            if [ $? -ne 0 ]; then
+              echo "Curl failed. Trying yt-dlp..."
+
+              yt-dlp \
+                --no-playlist \
+                --user-agent "Mozilla/5.0" \
+                -o "tmp_downloads/${FILE_NAME}.%(ext)s" \
+                "$URL"
+            fi
+
+            if [ $? -ne 0 ]; then
+              echo "All download methods failed: $URL"
+            else
+              echo "Download completed: $URL"
+            fi
+
+            INDEX=$((INDEX + 1))
+          done
+
+      - name: Prepare Files
+        shell: bash
+        run: |
+          PASS="${{ github.event.inputs.password }}"
+          LIMIT=$((2 * 1024 * 1024 * 1024))
+
+          for FILE in tmp_downloads/*; do
+            if [ ! -f "$FILE" ]; then
+              continue
+            fi
+
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "Large file detected: $BASENAME"
+
+              if [ -n "$PASS" ]; then
+                zip -s 2g -P "$PASS" "upload/${BASENAME}.zip" -j "$FILE"
+              else
+                zip -s 2g "upload/${BASENAME}.zip" -j "$FILE"
+              fi
+
+            else
+              if [ -n "$PASS" ]; then
+                echo "Creating password protected zip: $BASENAME"
+
+                zip -P "$PASS" "upload/${BASENAME}.zip" -j "$FILE"
+              else
+                echo "Keeping original file: $BASENAME"
+
+                cp "$FILE" "upload/$BASENAME"
+              fi
+            fi
+          done
+
+          rm -rf tmp_downloads
+
+      - name: Generate Release Info
+        id: meta
+        shell: bash
+        run: |
+          TAG="run-$(date +%Y%m%d-%H%M%S)"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "## Download Files" > body.md
+          echo "" >> body.md
+
+          for FILE in upload/*; do
+            if [ -f "$FILE" ]; then
+              NAME=$(basename "$FILE")
+              echo "- $NAME" >> body.md
+            fi
+          done
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Download ${{ steps.meta.outputs.tag }}
+          body_path: body.md
+          files: upload/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
