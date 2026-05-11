@@ -43,9 +43,11 @@ jobs:
           rm -rf downloads
           mkdir -p downloads
 
-      - name: Download videos (FIXED MULTI-LINK)
+      - name: Download videos (FAIL SAFE + REPORT)
         shell: bash
         run: |
+          set +e
+
           RAW_URLS="${{ github.event.inputs.video_url }}"
           QUALITY="${{ github.event.inputs.quality }}"
 
@@ -57,12 +59,17 @@ jobs:
 
           echo "Raw input: $RAW_URLS"
 
-          # مهم: تبدیل همه جداکننده‌ها به یک استاندارد
           CLEAN_URLS=$(echo "$RAW_URLS" | tr ',' '\n' | tr ' ' '\n')
 
           INDEX=1
 
-          while IFS= read -r URL; do
+          SUCCESS_FILE="downloads/success.txt"
+          FAILED_FILE="downloads/failed.txt"
+
+          > "$SUCCESS_FILE"
+          > "$FAILED_FILE"
+
+          for URL in $CLEAN_URLS; do
             URL=$(echo "$URL" | xargs)
 
             if [ -z "$URL" ]; then
@@ -82,13 +89,20 @@ jobs:
               -o "downloads/%(title)s_${INDEX}.%(ext)s" \
               "$URL"
 
-            if [ $? -ne 0 ]; then
-              echo "Failed download: $URL"
+            STATUS=$?
+
+            if [ $STATUS -ne 0 ]; then
+              echo "FAILED: $URL"
+              echo "$URL" >> "$FAILED_FILE"
+            else
+              echo "SUCCESS: $URL"
+              echo "$URL" >> "$SUCCESS_FILE"
             fi
 
             INDEX=$((INDEX + 1))
+          done
 
-          done <<< "$CLEAN_URLS"
+          set -e
 
       - name: Generate Release Info
         id: meta
@@ -97,14 +111,23 @@ jobs:
           TAG="run-$(date +%Y%m%d-%H%M%S)"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-          echo "## Downloaded Files" > body.md
+          echo "## Download Report" > body.md
           echo "" >> body.md
 
-          for FILE in downloads/*; do
-            if [ -f "$FILE" ]; then
-              echo "- $(basename "$FILE")" >> body.md
-            fi
-          done
+          echo "### Successful Downloads:" >> body.md
+          if [ -f downloads/success.txt ]; then
+            cat downloads/success.txt | while read line; do
+              echo "- $line" >> body.md
+            done
+          fi
+
+          echo "" >> body.md
+          echo "### Failed Downloads:" >> body.md
+          if [ -f downloads/failed.txt ]; then
+            cat downloads/failed.txt | while read line; do
+              echo "- $line" >> body.md
+            done
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
