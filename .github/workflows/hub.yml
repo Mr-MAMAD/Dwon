@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "Pornhub Video URL"
+        description: "Pornhub Video URL(s) (one per line or comma separated)"
         required: true
         type: string
 
@@ -38,38 +38,59 @@ jobs:
           sudo apt-get install -y ffmpeg
           python3 -m pip install -U yt-dlp
 
-      - name: Create folders
+      - name: Prepare folders
         run: |
           rm -rf downloads
           mkdir -p downloads
 
-      - name: Download Video
+      - name: Download videos
         shell: bash
         run: |
-          URL="${{ github.event.inputs.video_url }}"
+          RAW_URLS="${{ github.event.inputs.video_url }}"
           QUALITY="${{ github.event.inputs.quality }}"
 
           if [ "$QUALITY" = "best" ]; then
-            FORMAT="best"
+            FORMAT="bestvideo+bestaudio/best"
           else
-            FORMAT="best[height<=${QUALITY}]"
+            FORMAT="bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]"
           fi
 
-          yt-dlp \
-            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36" \
-            --add-header "Referer:https://www.pornhub.com/" \
-            --extractor-args "pornhub:skip=authcheck" \
-            -f "$FORMAT" \
-            --merge-output-format mp4 \
-            -o "downloads/%(title)s.%(ext)s" \
-            "$URL"
+          # تبدیل کاما به خط جدید
+          CLEAN_URLS=$(echo "$RAW_URLS" | tr ',' '\n')
+
+          INDEX=1
+
+          while IFS= read -r URL; do
+            if [ -z "$URL" ]; then
+              continue
+            fi
+
+            echo "======================================"
+            echo "Downloading [$INDEX]: $URL"
+            echo "======================================"
+
+            yt-dlp \
+              --no-playlist \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124 Safari/537.36" \
+              --add-header "Referer:https://www.pornhub.com/" \
+              -f "$FORMAT" \
+              --merge-output-format mp4 \
+              -o "downloads/%(title)s_${INDEX}.%(ext)s" \
+              "$URL"
+
+            if [ $? -ne 0 ]; then
+              echo "Failed: $URL"
+            fi
+
+            INDEX=$((INDEX + 1))
+
+          done <<< "$CLEAN_URLS"
 
       - name: Generate Release Info
         id: meta
         shell: bash
         run: |
           TAG="run-$(date +%Y%m%d-%H%M%S)"
-
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
           echo "## Downloaded Files" > body.md
@@ -77,8 +98,7 @@ jobs:
 
           for FILE in downloads/*; do
             if [ -f "$FILE" ]; then
-              NAME=$(basename "$FILE")
-              echo "- $NAME" >> body.md
+              echo "- $(basename "$FILE")" >> body.md
             fi
           done
 
