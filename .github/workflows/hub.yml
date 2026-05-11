@@ -1,0 +1,93 @@
+name: Pornhub Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Pornhub Video URL"
+        required: true
+        type: string
+
+      quality:
+        description: "Video Quality"
+        required: true
+        default: "720"
+        type: choice
+        options:
+          - "240"
+          - "360"
+          - "480"
+          - "720"
+          - "1080"
+          - "best"
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yt-dlp
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          python3 -m pip install -U yt-dlp
+
+      - name: Create folders
+        run: |
+          rm -rf downloads
+          mkdir -p downloads
+
+      - name: Download Video
+        shell: bash
+        run: |
+          URL="${{ github.event.inputs.video_url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+
+          echo "Downloading: $URL"
+          echo "Quality: $QUALITY"
+
+          if [ "$QUALITY" = "best" ]; then
+            FORMAT="bestvideo+bestaudio/best"
+          else
+            FORMAT="bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]"
+          fi
+
+          yt-dlp \
+            -f "$FORMAT" \
+            --merge-output-format mp4 \
+            -o "downloads/%(title)s.%(ext)s" \
+            "$URL"
+
+      - name: Generate Release Info
+        id: meta
+        shell: bash
+        run: |
+          TAG="run-$(date +%Y%m%d-%H%M%S)"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "## Downloaded Files" > body.md
+          echo "" >> body.md
+
+          for FILE in downloads/*; do
+            if [ -f "$FILE" ]; then
+              NAME=$(basename "$FILE")
+              echo "- $NAME" >> body.md
+            fi
+          done
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Download ${{ steps.meta.outputs.tag }}
+          body_path: body.md
+          files: downloads/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
