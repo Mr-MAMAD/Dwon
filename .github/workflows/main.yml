@@ -32,17 +32,24 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y aria2 zip
 
-      - name: Download Files
+      - name: Download Files (FAIL SAFE)
         shell: bash
         run: |
+          set +e
+
           RAW_URLS="${{ github.event.inputs.url }}"
           FORMATTED_URLS=$(echo "$RAW_URLS" | tr ',' ' ' | tr '\n' ' ')
 
-          rm -rf tmp_downloads
-          rm -rf upload
+          rm -rf tmp_downloads upload
+          mkdir -p tmp_downloads upload
 
-          mkdir -p tmp_downloads
-          mkdir -p upload
+          SUCCESS_FILE="upload/success.txt"
+          FAILED_FILE="upload/failed.txt"
+
+          > "$SUCCESS_FILE"
+          > "$FAILED_FILE"
+
+          INDEX=1
 
           for URL in $FORMATTED_URLS; do
             if [ -z "$URL" ]; then
@@ -51,18 +58,31 @@ jobs:
 
             echo "Downloading: $URL"
 
+            FILE_NAME="file_${INDEX}"
+
             aria2c \
               --split=4 \
               --max-connection-per-server=4 \
               --dir="tmp_downloads" \
+              --out="$FILE_NAME" \
               --header="Referer: https://www.erome.com/" \
               --header="User-Agent: Mozilla/5.0" \
               "$URL"
 
-            if [ $? -ne 0 ]; then
-              echo "Failed to download: $URL"
+            STATUS=$?
+
+            if [ $STATUS -ne 0 ]; then
+              echo "FAILED: $URL"
+              echo "$URL" >> "$FAILED_FILE"
+            else
+              echo "SUCCESS: $URL"
+              echo "$URL" >> "$SUCCESS_FILE"
             fi
+
+            INDEX=$((INDEX + 1))
           done
+
+          set -e
 
       - name: Prepare Files
         shell: bash
@@ -89,12 +109,8 @@ jobs:
 
             else
               if [ -n "$PASS" ]; then
-                echo "Creating password protected zip: $BASENAME"
-
                 zip -P "$PASS" "upload/${BASENAME}.zip" -j "$FILE"
               else
-                echo "Keeping original file: $BASENAME"
-
                 cp "$FILE" "upload/$BASENAME"
               fi
             fi
@@ -107,21 +123,26 @@ jobs:
         shell: bash
         run: |
           TAG="run-$(date +%Y%m%d-%H%M%S)"
-
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-          echo "## Download Files" > body.md
+          echo "## Download Report" > body.md
           echo "" >> body.md
 
-          for FILE in upload/*; do
-            if [ ! -f "$FILE" ]; then
-              continue
-            fi
+          echo "### Successful Downloads" >> body.md
+          if [ -f upload/success.txt ]; then
+            while read LINE; do
+              echo "- $LINE" >> body.md
+            done < upload/success.txt
+          fi
 
-            NAME=$(basename "$FILE")
+          echo "" >> body.md
 
-            echo "- $NAME" >> body.md
-          done
+          echo "### Failed Downloads" >> body.md
+          if [ -f upload/failed.txt ]; then
+            while read LINE; do
+              echo "- $LINE" >> body.md
+            done < upload/failed.txt
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
