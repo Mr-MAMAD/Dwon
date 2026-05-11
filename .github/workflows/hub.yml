@@ -32,7 +32,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install yt-dlp
+      - name: Install tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
@@ -49,16 +49,16 @@ jobs:
           URL="${{ github.event.inputs.video_url }}"
           QUALITY="${{ github.event.inputs.quality }}"
 
-          echo "Downloading: $URL"
-          echo "Quality: $QUALITY"
-
           if [ "$QUALITY" = "best" ]; then
-            FORMAT="bestvideo+bestaudio/best"
+            FORMAT="best"
           else
-            FORMAT="bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]"
+            FORMAT="best[height<=${QUALITY}]"
           fi
 
           yt-dlp \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36" \
+            --add-header "Referer:https://www.pornhub.com/" \
+            --extractor-args "pornhub:skip=authcheck" \
             -f "$FORMAT" \
             --merge-output-format mp4 \
             -o "downloads/%(title)s.%(ext)s" \
