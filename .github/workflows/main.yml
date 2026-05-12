@@ -143,7 +143,11 @@ jobs:
               echo "- $LINE" >> body.md
             done < upload/failed.txt
           fi
-
+       - name: Remove empty files
+         shell: bash
+         run: |
+            find upload -type f -size 0 -delete
+            
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
