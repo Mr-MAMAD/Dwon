@@ -128,10 +128,7 @@ jobs:
               echo "- $line" >> body.md
             done
           fi
-       - name: Remove empty files
-         shell: bash
-         run: |
-            find upload -type f -size 0 -delete
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
