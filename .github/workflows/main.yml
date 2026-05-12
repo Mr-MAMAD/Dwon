@@ -143,6 +143,7 @@ jobs:
               echo "- $LINE" >> body.md
             done < upload/failed.txt
           fi
+          
        - name: Remove empty files
          shell: bash
          run: |
