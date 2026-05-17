@@ -1,0 +1,190 @@
+name: Yes DL Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Direct URLs (Separate with space, comma, or new line)"
+        required: true
+        type: string
+
+      password:
+        description: "ZIP Password (Optional)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  direct-download:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2 zip
+
+      - name: Download Files (FAIL SAFE)
+        shell: bash
+        run: |
+          set +e
+
+          RAW_URLS="${{ github.event.inputs.url }}"
+          FORMATTED_URLS=$(echo "$RAW_URLS" | tr ',' ' ' | tr '\n' ' ')
+
+          rm -rf tmp_downloads upload
+
+          mkdir -p tmp_downloads
+          mkdir -p upload
+
+          SUCCESS_FILE="upload/success.txt"
+          FAILED_FILE="upload/failed.txt"
+
+          > "$SUCCESS_FILE"
+          > "$FAILED_FILE"
+
+          INDEX=1
+
+          for URL in $FORMATTED_URLS; do
+            if [ -z "$URL" ]; then
+              continue
+            fi
+
+            echo "======================================"
+            echo "Downloading [$INDEX]: $URL"
+            echo "======================================"
+
+            FILE_NAME="file_${INDEX}"
+
+            aria2c \
+              --split=4 \
+              --max-connection-per-server=4 \
+              --dir="tmp_downloads" \
+              --out="$FILE_NAME" \
+              --header="User-Agent: Mozilla/5.0" \
+              "$URL"
+
+            STATUS=$?
+
+            DOWNLOADED_FILE="tmp_downloads/${FILE_NAME}"
+
+            if [ $STATUS -ne 0 ]; then
+              echo "FAILED: $URL"
+              echo "$URL" >> "$FAILED_FILE"
+
+              rm -f "$DOWNLOADED_FILE"
+
+            elif [ ! -f "$DOWNLOADED_FILE" ]; then
+              echo "FAILED: $URL"
+              echo "$URL" >> "$FAILED_FILE"
+
+            elif [ ! -s "$DOWNLOADED_FILE" ]; then
+              echo "FAILED (EMPTY FILE): $URL"
+              echo "$URL" >> "$FAILED_FILE"
+
+              rm -f "$DOWNLOADED_FILE"
+
+            else
+              echo "SUCCESS: $URL"
+              echo "$URL" >> "$SUCCESS_FILE"
+            fi
+
+            INDEX=$((INDEX + 1))
+          done
+
+          set -e
+
+      - name: Prepare Files
+        shell: bash
+        run: |
+          PASS="${{ github.event.inputs.password }}"
+          LIMIT=$((2 * 1024 * 1024 * 1024))
+
+          for FILE in tmp_downloads/*; do
+            if [ ! -f "$FILE" ]; then
+              continue
+            fi
+
+            if [ ! -s "$FILE" ]; then
+              continue
+            fi
+
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "Large file detected: $BASENAME"
+
+              if [ -n "$PASS" ]; then
+                zip -s 2g -P "$PASS" "upload/${BASENAME}.zip" -j "$FILE"
+              else
+                zip -s 2g "upload/${BASENAME}.zip" -j "$FILE"
+              fi
+
+            else
+              if [ -n "$PASS" ]; then
+                echo "Creating password protected zip: $BASENAME"
+
+                zip -P "$PASS" "upload/${BASENAME}.zip" -j "$FILE"
+              else
+                echo "Keeping original file: $BASENAME"
+
+                cp "$FILE" "upload/$BASENAME"
+              fi
+            fi
+          done
+
+          rm -rf tmp_downloads
+
+      - name: Remove invalid files
+        shell: bash
+        run: |
+          find upload -type f -empty -delete
+          find upload -type f -size -10k -delete
+
+      - name: Generate Release Info
+        id: meta
+        shell: bash
+        run: |
+          TAG="run-$(date +%Y%m%d-%H%M%S)"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "## Download Report" > body.md
+          echo "" >> body.md
+
+          echo "### Successful Downloads" >> body.md
+
+          if [ -f upload/success.txt ]; then
+            while read LINE; do
+              echo "- $LINE" >> body.md
+            done < upload/success.txt
+          fi
+
+          echo "" >> body.md
+
+          echo "### Failed Downloads" >> body.md
+
+          if [ -f upload/failed.txt ]; then
+            while read LINE; do
+              echo "- $LINE" >> body.md
+            done < upload/failed.txt
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Download ${{ steps.meta.outputs.tag }}
+          body_path: body.md
+          files: upload/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
