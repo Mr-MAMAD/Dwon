@@ -57,17 +57,15 @@ jobs:
             FORMAT="bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]"
           fi
 
-          echo "Raw input: $RAW_URLS"
-
           CLEAN_URLS=$(echo "$RAW_URLS" | tr ',' '\n' | tr ' ' '\n')
-
-          INDEX=1
 
           SUCCESS_FILE="downloads/success.txt"
           FAILED_FILE="downloads/failed.txt"
 
           > "$SUCCESS_FILE"
           > "$FAILED_FILE"
+
+          INDEX=1
 
           for URL in $CLEAN_URLS; do
             URL=$(echo "$URL" | xargs)
@@ -77,16 +75,19 @@ jobs:
             fi
 
             echo "======================================"
-            echo "Downloading [$INDEX]: $URL"
+            echo "Downloading [$INDEX]"
+            echo "$URL"
             echo "======================================"
 
             yt-dlp \
               --no-playlist \
+              --ignore-errors \
+              --no-warnings \
               --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124 Safari/537.36" \
               --add-header "Referer:https://www.pornhub.com/" \
               -f "$FORMAT" \
               --merge-output-format mp4 \
-              -o "downloads/%(title)s_${INDEX}.%(ext)s" \
+              -o "downloads/%(title).150s_${INDEX}.%(ext)s" \
               "$URL"
 
             STATUS=$?
@@ -104,37 +105,60 @@ jobs:
 
           set -e
 
+      - name: Remove invalid files
+        shell: bash
+        run: |
+          find downloads -type f -empty -delete
+
+      - name: Check downloaded files
+        id: check_files
+        shell: bash
+        run: |
+          COUNT=$(find downloads -type f ! -name "success.txt" ! -name "failed.txt" | wc -l)
+
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No valid downloaded files found."
+          fi
+
       - name: Generate Release Info
         id: meta
         shell: bash
         run: |
           TAG="run-$(date +%Y%m%d-%H%M%S)"
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
           echo "## Download Report" > body.md
           echo "" >> body.md
 
-          echo "### Successful Downloads:" >> body.md
+          echo "### Successful Downloads" >> body.md
+
           if [ -f downloads/success.txt ]; then
-            cat downloads/success.txt | while read line; do
+            while read line; do
               echo "- $line" >> body.md
-            done
+            done < downloads/success.txt
           fi
 
           echo "" >> body.md
-          echo "### Failed Downloads:" >> body.md
+
+          echo "### Failed Downloads" >> body.md
+
           if [ -f downloads/failed.txt ]; then
-            cat downloads/failed.txt | while read line; do
+            while read line; do
               echo "- $line" >> body.md
-            done
+            done < downloads/failed.txt
           fi
 
       - name: Create Release
+        if: steps.check_files.outputs.count != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: Download ${{ steps.meta.outputs.tag }}
           body_path: body.md
-          files: downloads/*
+          files: |
+            downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
