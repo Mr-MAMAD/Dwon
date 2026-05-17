@@ -62,20 +62,17 @@ jobs:
             echo "Downloading [$INDEX]: $URL"
             echo "======================================"
 
-            FILE_NAME="file_${INDEX}"
 
             aria2c \
               --split=4 \
               --max-connection-per-server=4 \
               --dir="tmp_downloads" \
-              --out="$FILE_NAME" \
               --header="Referer: https://www.erome.com/" \
               --header="User-Agent: Mozilla/5.0" \
               "$URL"
 
             STATUS=$?
 
-            DOWNLOADED_FILE="tmp_downloads/${FILE_NAME}"
 
             if [ $STATUS -ne 0 ]; then
               echo "FAILED: $URL"
