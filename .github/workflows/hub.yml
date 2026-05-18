@@ -15,6 +15,10 @@ on:
           - 'best'
           - '720p'
           - '480p'
+      cookies:
+        description: 'Cookies from browser (Netscape format - export with extension)'
+        required: false
+        type: string
 
 jobs:
   download:
@@ -33,14 +37,22 @@ jobs:
           sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
           sudo chmod a+rx /usr/local/bin/yt-dlp
 
+      - name: Setup Cookies
+        env:
+          INPUT_COOKIES: ${{ github.event.inputs.cookies }}
+        run: |
+          if [ -n "$INPUT_COOKIES" ]; then
+            echo "$INPUT_COOKIES" > cookies.txt
+            echo "Cookies file created"
+          else
+            echo "No cookies provided - using headers only"
+          fi
+
       - name: Prepare URL List
         env:
           INPUT_URL: ${{ github.event.inputs.url }}
         run: |
-          # جداسازی URL ها
           echo "$INPUT_URL" | sed 's/[,[:space:]]\+/\n/g' | grep -v '^$' > urls.txt
-          
-          # محدود به 100 لینک
           head -n 100 urls.txt > urls_limited.txt
           mv urls_limited.txt urls.txt
           
@@ -58,7 +70,6 @@ jobs:
         run: |
           mkdir -p output
 
-          # تعیین فرمت بر اساس کیفیت
           if [ "$QUALITY" = "720p" ]; then
             FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
           elif [ "$QUALITY" = "480p" ]; then
@@ -67,7 +78,13 @@ jobs:
             FORMAT="bestvideo+bestaudio/best"
           fi
 
-          # ایجاد اسکریپت دانلود
+          # تشخیص وجود cookies
+          COOKIES_OPT=""
+          if [ -f cookies.txt ]; then
+            COOKIES_OPT="--cookies cookies.txt"
+          fi
+          export COOKIES_OPT
+
           cat > download.sh << 'SCRIPT'
           #!/bin/bash
           URL="$1"
@@ -76,78 +93,80 @@ jobs:
           
           USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
           
-          # اول چک کن ویدیو وجود داره یا نه
-          echo "[$INDEX] Checking: $URL"
-          CHECK_OUTPUT=$(yt-dlp --simulate --no-warnings "$URL" 2>&1)
-          
-          if echo "$CHECK_OUTPUT" | grep -q "410: Gone"; then
-            echo "[$INDEX] DELETED: Video has been removed from site"
-            echo "$URL [DELETED - 410 Gone]" >> failed.txt
-            exit 1
-          fi
-          
-          if echo "$CHECK_OUTPUT" | grep -q "403: Forbidden"; then
-            echo "[$INDEX] BLOCKED: Access denied, will retry with headers..."
-          fi
-          
-          if echo "$CHECK_OUTPUT" | grep -q "Video is unavailable"; then
-            echo "[$INDEX] UNAVAILABLE: Video is not available"
-            echo "$URL [UNAVAILABLE]" >> failed.txt
-            exit 1
-          fi
+          # گرفتن cookies option از محیط
+          COOKIES_OPT="${COOKIES_OPT:-}"
           
           for i in 1 2 3 4 5; do
             echo "[$INDEX] Attempt $i: $URL"
-            OUTPUT=$(yt-dlp -f "$FORMAT" \
-              --merge-output-format mp4 \
-              --no-playlist \
-              --restrict-filenames \
-              --user-agent "$USER_AGENT" \
-              --referer "https://www.pornhub.com/" \
-              --add-header "Accept-Language: en-US,en;q=0.9" \
-              --add-header "Cookie: platform=pc" \
-              --sleep-requests 1 \
-              --sleep-interval 2 \
-              --max-sleep-interval 5 \
-              --retries 3 \
-              --fragment-retries 3 \
-              --extractor-retries 3 \
-              --no-check-certificates \
-              -o "output/%(title).100s.%(ext)s" \
-              "$URL" 2>&1) && {
-                echo "[$INDEX] SUCCESS"
-                exit 0
-              }
             
-            # اگر 410 گرفت دیگه retry نکن
-            if echo "$OUTPUT" | grep -q "410: Gone"; then
-              echo "[$INDEX] DELETED: Video removed"
-              echo "$URL [DELETED - 410 Gone]" >> failed.txt
+            # ساخت command به صورت array برای handle کردن cookies
+            CMD=(yt-dlp -f "$FORMAT"
+              --merge-output-format mp4
+              --no-playlist
+              --restrict-filenames
+              --user-agent "$USER_AGENT"
+              --referer "https://www.pornhub.com/"
+              --add-header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+              --add-header "Accept-Language: en-US,en;q=0.9"
+              --add-header "Cache-Control: no-cache"
+              --add-header "Sec-Ch-Ua: \"Google Chrome\";v=\"125\", \"Chromium\";v=\"125\", \"Not.A/Brand\";v=\"24\""
+              --add-header "Sec-Ch-Ua-Mobile: ?0"
+              --add-header "Sec-Ch-Ua-Platform: \"Windows\""
+              --add-header "Sec-Fetch-Dest: document"
+              --add-header "Sec-Fetch-Mode: navigate"
+              --add-header "Sec-Fetch-Site: none"
+              --add-header "Sec-Fetch-User: ?1"
+              --add-header "Upgrade-Insecure-Requests: 1"
+              --sleep-requests 2
+              --sleep-interval 3
+              --max-sleep-interval 8
+              --retries 5
+              --fragment-retries 5
+              --extractor-retries 5
+              --no-check-certificates
+              --geo-bypass
+              --legacy-server-connect
+              -o "output/%(title).100s.%(ext)s"
+            )
+            
+            # اضافه کردن cookies اگر وجود داشت
+            if [ -n "$COOKIES_OPT" ]; then
+              CMD+=($COOKIES_OPT)
+            fi
+            
+            CMD+=("$URL")
+            
+            OUTPUT=$("${CMD[@]}" 2>&1) && {
+              echo "[$INDEX] SUCCESS"
+              exit 0
+            }
+            
+            echo "$OUTPUT" | tail -5
+            
+            # اگر 410 یا private بود، skip کن
+            if echo "$OUTPUT" | grep -qE "410: Gone|Private video|Video unavailable"; then
+              echo "[$INDEX] SKIPPED: Video not accessible"
+              echo "$URL [NOT ACCESSIBLE]" >> failed.txt
               exit 1
             fi
             
-            sleep $((i * 3))
+            sleep $((i * 5))
           done
+          
           echo "[$INDEX] FAILED after 5 attempts"
-          echo "$URL [FAILED - Max retries]" >> failed.txt
+          echo "$URL [FAILED]" >> failed.txt
           exit 1
           SCRIPT
           chmod +x download.sh
 
-          # اجرای دانلودها (2 همزمان)
+          # اجرای دانلودها - فقط 1 همزمان برای جلوگیری از بلاک
           INDEX=0
           while IFS= read -r url || [ -n "$url" ]; do
             [ -z "$url" ] && continue
             INDEX=$((INDEX + 1))
-            ./download.sh "$url" "$FORMAT" "$INDEX" &
-            
-            while [ "$(jobs -r | wc -l)" -ge 2 ]; do
-              sleep 2
-            done
-            sleep 3
+            ./download.sh "$url" "$FORMAT" "$INDEX"
+            sleep 5
           done < urls.txt
-
-          wait
 
       - name: Check output
         id: check
