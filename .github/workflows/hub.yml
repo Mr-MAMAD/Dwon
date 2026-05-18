@@ -1,123 +1,163 @@
-name: Fast Video Downloader
+name: PH Downloader (100 URLs)
 
 on:
   workflow_dispatch:
     inputs:
-      quality:
-        description: "Video Quality"
-        required: true
-        default: "720"
-        type: choice
-        options:
-          - "360"
-          - "480"
-          - "720"
-          - "1080"
-
-      links:
-        description: "Paste video links"
+      url:
+        description: 'Video URLs (comma/space/newline separated) - up to 100 links'
         required: true
         type: string
+      quality:
+        description: 'Quality'
+        required: true
+        type: choice
+        options:
+          - 'best'
+          - '720p'
+          - '480p'
 
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install yt-dlp
         run: |
-          sudo apt update
-          sudo apt install -y aria2 ffmpeg
-          python3 -m pip install -U yt-dlp
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
 
-      - name: Prepare folders
-        run: |
-          mkdir -p downloads
-          mkdir -p logs
-
-      - name: Write cookies
-        run: |
-          cat > cookies.txt << 'EOF'
-          ${{ secrets.PH_COOKIE }}
-          EOF
-
-      - name: Extract links
+      - name: Prepare URL List
         env:
-          LINKS: ${{ github.event.inputs.links }}
+          INPUT_URL: ${{ github.event.inputs.url }}
         run: |
-          echo "$LINKS" | tr ' ' '\n' | sed '/^$/d' > parsed_links.txt
+          # جداسازی URL ها
+          echo "$INPUT_URL" | sed 's/[,[:space:]]\+/\n/g' | grep -v '^$' > urls.txt
+          
+          # محدود به 100 لینک
+          head -n 100 urls.txt > urls_limited.txt
+          mv urls_limited.txt urls.txt
+          
+          TOTAL=$(wc -l < urls.txt)
+          echo "Total URLs: $TOTAL"
+          echo "TOTAL_URLS=$TOTAL" >> $GITHUB_ENV
+          
+          echo ""
+          echo "URLs to download:"
+          cat -n urls.txt
 
-          echo "====== LINKS ======"
-          cat parsed_links.txt
-
-      - name: Download videos
+      - name: Download Videos
         env:
           QUALITY: ${{ github.event.inputs.quality }}
         run: |
-          touch logs/success.txt
-          touch logs/failed.txt
+          mkdir -p output
 
-          while read url; do
+          # تعیین فرمت بر اساس کیفیت
+          if [ "$QUALITY" = "720p" ]; then
+            FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
+          elif [ "$QUALITY" = "480p" ]; then
+            FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
+          else
+            FORMAT="bestvideo+bestaudio/best"
+          fi
 
-            echo "=============================="
-            echo "Downloading: $url"
-            echo "=============================="
-
-            yt-dlp \
-              --cookies cookies.txt \
-              --extractor-args "pornhub:client=web" \
-              --add-header "Referer:https://www.pornhub.com/" \
-              --add-header "Origin:https://www.pornhub.com" \
-              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36" \
-              --retries 20 \
-              --fragment-retries 20 \
-              --retry-sleep 5 \
-              --concurrent-fragments 8 \
-              --file-access-retries 10 \
-              --socket-timeout 30 \
-              --no-check-certificates \
-              --geo-bypass \
-              --geo-bypass-country US \
-              -f "best[height<=${QUALITY}]" \
+          # ایجاد اسکریپت دانلود
+          cat > download.sh << 'SCRIPT'
+          #!/bin/bash
+          URL="$1"
+          FORMAT="$2"
+          INDEX="$3"
+          
+          USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+          
+          for i in 1 2 3 4 5; do
+            echo "[$INDEX] Attempt $i: $URL"
+            yt-dlp -f "$FORMAT" \
               --merge-output-format mp4 \
-              --downloader aria2c \
-              --downloader-args "aria2c:-x 16 -s 16 -k 1M --file-allocation=none" \
-              -o "downloads/%(title).120s.%(ext)s" \
-              "$url"
+              --no-playlist \
+              --restrict-filenames \
+              --user-agent "$USER_AGENT" \
+              --referer "https://www.pornhub.com/" \
+              --add-header "Accept-Language: en-US,en;q=0.9" \
+              --sleep-requests 1 \
+              --sleep-interval 2 \
+              --max-sleep-interval 5 \
+              --retries 3 \
+              --fragment-retries 3 \
+              --extractor-retries 3 \
+              --ignore-errors \
+              --no-check-certificates \
+              -o "output/%(title).100s.%(ext)s" \
+              "$URL" && exit 0
+            
+            sleep $((i * 3))
+          done
+          echo "$URL" >> failed.txt
+          exit 1
+          SCRIPT
+          chmod +x download.sh
 
-            if [ $? -eq 0 ]; then
-              echo "$url" >> logs/success.txt
-              echo "SUCCESS"
-            else
-              echo "$url" >> logs/failed.txt
-              echo "FAILED"
-            fi
+          # اجرای دانلودها (2 همزمان)
+          INDEX=0
+          while IFS= read -r url || [ -n "$url" ]; do
+            [ -z "$url" ] && continue
+            INDEX=$((INDEX + 1))
+            ./download.sh "$url" "$FORMAT" "$INDEX" &
+            
+            while [ "$(jobs -r | wc -l)" -ge 2 ]; do
+              sleep 2
+            done
+            sleep 3
+          done < urls.txt
 
-          done < parsed_links.txt
+          wait
 
-      - name: Show results
+      - name: Check output
+        id: check
         run: |
-          echo ""
-          echo "========== SUCCESS =========="
-          cat logs/success.txt || true
+          COUNT=$(find output -type f -name "*.mp4" 2>/dev/null | wc -l)
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "Downloaded $COUNT video(s)"
 
-          echo ""
-          echo "========== FAILED =========="
-          cat logs/failed.txt || true
+      - name: Generate Tag
+        if: steps.check.outputs.count != '0'
+        id: tag
+        run: echo "tag=run-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
 
-      - name: Upload Downloads
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        if: steps.check.outputs.count != '0'
+        uses: softprops/action-gh-release@v2
         with:
-          name: downloaded-videos
-          path: downloads/
-          if-no-files-found: ignore
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Downloaded Videos ${{ steps.tag.outputs.tag }}"
+          files: output/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload Logs
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs
-          path: logs/
+      - name: Show Failed URLs
+        if: always()
+        run: |
+          if [ -f failed.txt ]; then
+            FAILED=$(wc -l < failed.txt)
+            echo "Failed downloads: $FAILED"
+            cat failed.txt
+          else
+            echo "All downloads successful!"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Download Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Total URLs: $TOTAL_URLS" >> $GITHUB_STEP_SUMMARY
+          echo "- Videos downloaded: ${{ steps.check.outputs.count }}" >> $GITHUB_STEP_SUMMARY
+          if [ -f failed.txt ]; then
+            echo "- Failed: $(wc -l < failed.txt)" >> $GITHUB_STEP_SUMMARY
+          fi
