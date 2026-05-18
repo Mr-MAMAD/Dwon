@@ -30,12 +30,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install yt-dlp
+      - name: Install yt-dlp (nightly)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
-          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          # نسخه nightly که آخرین تغییرات PornHub را دارد
+          sudo curl -L https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
           sudo chmod a+rx /usr/local/bin/yt-dlp
+          echo "yt-dlp version:"
+          yt-dlp --version
 
       - name: Setup Cookies
         env:
