@@ -76,29 +76,60 @@ jobs:
           
           USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
           
+          # اول چک کن ویدیو وجود داره یا نه
+          echo "[$INDEX] Checking: $URL"
+          CHECK_OUTPUT=$(yt-dlp --simulate --no-warnings "$URL" 2>&1)
+          
+          if echo "$CHECK_OUTPUT" | grep -q "410: Gone"; then
+            echo "[$INDEX] DELETED: Video has been removed from site"
+            echo "$URL [DELETED - 410 Gone]" >> failed.txt
+            exit 1
+          fi
+          
+          if echo "$CHECK_OUTPUT" | grep -q "403: Forbidden"; then
+            echo "[$INDEX] BLOCKED: Access denied, will retry with headers..."
+          fi
+          
+          if echo "$CHECK_OUTPUT" | grep -q "Video is unavailable"; then
+            echo "[$INDEX] UNAVAILABLE: Video is not available"
+            echo "$URL [UNAVAILABLE]" >> failed.txt
+            exit 1
+          fi
+          
           for i in 1 2 3 4 5; do
             echo "[$INDEX] Attempt $i: $URL"
-            yt-dlp -f "$FORMAT" \
+            OUTPUT=$(yt-dlp -f "$FORMAT" \
               --merge-output-format mp4 \
               --no-playlist \
               --restrict-filenames \
               --user-agent "$USER_AGENT" \
               --referer "https://www.pornhub.com/" \
               --add-header "Accept-Language: en-US,en;q=0.9" \
+              --add-header "Cookie: platform=pc" \
               --sleep-requests 1 \
               --sleep-interval 2 \
               --max-sleep-interval 5 \
               --retries 3 \
               --fragment-retries 3 \
               --extractor-retries 3 \
-              --ignore-errors \
               --no-check-certificates \
               -o "output/%(title).100s.%(ext)s" \
-              "$URL" && exit 0
+              "$URL" 2>&1) && {
+                echo "[$INDEX] SUCCESS"
+                exit 0
+              }
+            
+            # اگر 410 گرفت دیگه retry نکن
+            if echo "$OUTPUT" | grep -q "410: Gone"; then
+              echo "[$INDEX] DELETED: Video removed"
+              echo "$URL [DELETED - 410 Gone]" >> failed.txt
+              exit 1
+            fi
             
             sleep $((i * 3))
           done
-          echo "$URL" >> failed.txt
+          echo "[$INDEX] FAILED after 5 attempts"
+          echo "$URL [FAILED - Max retries]" >> failed.txt
           exit 1
           SCRIPT
           chmod +x download.sh
