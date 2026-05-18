@@ -41,13 +41,16 @@ jobs:
 
       - name: Write cookies
         run: |
-          echo "${{ secrets.PH_COOKIE }}" > cookies.txt
+          cat > cookies.txt << 'EOF'
+          ${{ secrets.PH_COOKIE }}
+          EOF
 
       - name: Extract links
         env:
           LINKS: ${{ github.event.inputs.links }}
         run: |
           echo "$LINKS" | tr ' ' '\n' | sed '/^$/d' > parsed_links.txt
+
           echo "====== LINKS ======"
           cat parsed_links.txt
 
@@ -59,24 +62,32 @@ jobs:
           touch logs/failed.txt
 
           while read url; do
+
             echo "=============================="
             echo "Downloading: $url"
             echo "=============================="
 
             yt-dlp \
               --cookies cookies.txt \
-              --add-header "User-Agent: Mozilla/5.0" \
+              --impersonate chrome \
               --extractor-args "pornhub:client=web" \
-              --retries 10 \
-              --fragment-retries 10 \
+              --add-header "Referer:https://www.pornhub.com/" \
+              --add-header "Origin:https://www.pornhub.com" \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36" \
+              --retries 20 \
+              --fragment-retries 20 \
+              --retry-sleep 5 \
               --concurrent-fragments 8 \
               --file-access-retries 10 \
-              --retry-sleep 5 \
-              -f "bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]" \
+              --socket-timeout 30 \
+              --no-check-certificates \
+              --geo-bypass \
+              --geo-bypass-country US \
+              -f "best[height<=${QUALITY}]" \
               --merge-output-format mp4 \
               --downloader aria2c \
-              --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-              -o "downloads/%(title)s.%(ext)s" \
+              --downloader-args "aria2c:-x 16 -s 16 -k 1M --file-allocation=none" \
+              -o "downloads/%(title).120s.%(ext)s" \
               "$url"
 
             if [ $? -eq 0 ]; then
@@ -104,6 +115,7 @@ jobs:
         with:
           name: downloaded-videos
           path: downloads/
+          if-no-files-found: ignore
 
       - name: Upload Logs
         uses: actions/upload-artifact@v4
