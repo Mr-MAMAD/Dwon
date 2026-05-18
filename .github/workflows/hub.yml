@@ -69,7 +69,6 @@ jobs:
 
             yt-dlp \
               --cookies cookies.txt \
-              --impersonate chrome \
               --extractor-args "pornhub:client=web" \
               --add-header "Referer:https://www.pornhub.com/" \
               --add-header "Origin:https://www.pornhub.com" \
