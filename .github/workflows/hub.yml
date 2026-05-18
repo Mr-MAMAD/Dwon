@@ -107,6 +107,7 @@ jobs:
               --merge-output-format mp4
               --no-playlist
               --restrict-filenames
+              --encoding utf-8
               --user-agent "$USER_AGENT"
               --referer "https://www.pornhub.com/"
               --add-header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
@@ -129,7 +130,8 @@ jobs:
               --no-check-certificates
               --geo-bypass
               --legacy-server-connect
-              -o "output/%(title).100s.%(ext)s"
+              --ignore-no-formats-error
+              -o "output/%(id)s.%(ext)s"
             )
             
             # اضافه کردن cookies اگر وجود داشت
