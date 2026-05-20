@@ -32,12 +32,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y aria2 zip
 
-      - name: Download Files (KEEP ORIGINAL NAME + FAIL SAFE)
+      - name: Download Files
         shell: bash
+        env:
+          RAW_URLS: ${{ github.event.inputs.url }}
         run: |
           set +e
 
-          RAW_URLS="${{ github.event.inputs.url }}"
           FORMATTED_URLS=$(echo "$RAW_URLS" | tr ',' ' ' | tr '\n' ' ')
 
           rm -rf tmp_downloads
@@ -46,8 +47,8 @@ jobs:
           mkdir -p tmp_downloads
           mkdir -p upload
 
-          SUCCESS_FILE="upload/success.txt"
-          FAILED_FILE="upload/failed.txt"
+          SUCCESS_FILE="success.txt"
+          FAILED_FILE="failed.txt"
 
           > "$SUCCESS_FILE"
           > "$FAILED_FILE"
@@ -66,10 +67,20 @@ jobs:
             BEFORE_COUNT=$(find tmp_downloads -type f | wc -l)
 
             aria2c \
-              --split=4 \
-              --max-connection-per-server=4 \
+              --split=16 \
+              --max-connection-per-server=16 \
+              --min-split-size=1M \
+              --max-tries=5 \
+              --retry-wait=3 \
+              --timeout=120 \
+              --connect-timeout=30 \
+              --allow-overwrite=true \
+              --auto-file-renaming=true \
               --dir="tmp_downloads" \
-              --header="User-Agent: Mozilla/5.0" \
+              --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+              --header="Accept: */*" \
+              --header="Accept-Language: en-US,en;q=0.9" \
+              --header="Referer: ${URL}" \
               "$URL"
 
             STATUS=$?
@@ -81,7 +92,7 @@ jobs:
               echo "$URL" >> "$FAILED_FILE"
 
             elif [ "$AFTER_COUNT" -le "$BEFORE_COUNT" ]; then
-              echo "FAILED: $URL"
+              echo "FAILED (no new file): $URL"
               echo "$URL" >> "$FAILED_FILE"
 
             else
@@ -96,9 +107,14 @@ jobs:
 
       - name: Prepare Files
         shell: bash
+        env:
+          PASS: ${{ github.event.inputs.password }}
         run: |
-          PASS="${{ github.event.inputs.password }}"
-          LIMIT=$((2 * 1024 * 1024 * 1024))
+          if [ -n "$PASS" ]; then
+            echo "::add-mask::$PASS"
+          fi
+
+          LIMIT=$((1900 * 1024 * 1024))
 
           for FILE in tmp_downloads/*; do
             if [ ! -f "$FILE" ]; then
@@ -113,22 +129,20 @@ jobs:
             BASENAME=$(basename "$FILE")
 
             if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "Large file detected: $BASENAME"
+              echo "Large file detected: $BASENAME ($SIZE bytes)"
 
               if [ -n "$PASS" ]; then
-                zip -s 2g -P "$PASS" "upload/${BASENAME}.zip" -j "$FILE"
+                zip -s 1900m -P "$PASS" "upload/${BASENAME}.zip" -j "$FILE"
               else
-                zip -s 2g "upload/${BASENAME}.zip" -j "$FILE"
+                zip -s 1900m "upload/${BASENAME}.zip" -j "$FILE"
               fi
 
             else
               if [ -n "$PASS" ]; then
                 echo "Creating password protected zip: $BASENAME"
-
                 zip -P "$PASS" "upload/${BASENAME}.zip" -j "$FILE"
               else
                 echo "Keeping original file: $BASENAME"
-
                 cp "$FILE" "upload/$BASENAME"
               fi
             fi
@@ -154,32 +168,44 @@ jobs:
 
           echo "### Successful Downloads" >> body.md
 
-          if [ -f upload/success.txt ]; then
-            while read LINE; do
-              echo "- $LINE" >> body.md
-            done < upload/success.txt
+          if [ -f success.txt ] && [ -s success.txt ]; then
+            while IFS= read -r LINE; do
+              [ -n "$LINE" ] && echo "- $LINE" >> body.md
+            done < success.txt
+          else
+            echo "_None_" >> body.md
           fi
 
           echo "" >> body.md
 
           echo "### Failed Downloads" >> body.md
 
-          if [ -f upload/failed.txt ]; then
-            while read LINE; do
-              echo "- $LINE" >> body.md
-            done < upload/failed.txt
+          if [ -f failed.txt ] && [ -s failed.txt ]; then
+            while IFS= read -r LINE; do
+              [ -n "$LINE" ] && echo "- $LINE" >> body.md
+            done < failed.txt
+          else
+            echo "_None_" >> body.md
           fi
 
           echo "" >> body.md
 
           echo "### Uploaded Files" >> body.md
 
+          TOTAL_SIZE=0
           for FILE in upload/*; do
             if [ -f "$FILE" ]; then
               NAME=$(basename "$FILE")
-              echo "- $NAME" >> body.md
+              FSIZE=$(stat -c%s "$FILE")
+              FSIZE_MB=$((FSIZE / 1024 / 1024))
+              echo "- $NAME (${FSIZE_MB} MB)" >> body.md
+              TOTAL_SIZE=$((TOTAL_SIZE + FSIZE))
             fi
           done
+
+          TOTAL_MB=$((TOTAL_SIZE / 1024 / 1024))
+          echo "" >> body.md
+          echo "**Total: ${TOTAL_MB} MB**" >> body.md
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
