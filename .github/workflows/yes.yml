@@ -65,12 +65,18 @@ jobs:
 
             BEFORE_COUNT=$(find tmp_downloads -type f | wc -l)
 
-            aria2c \
-              --split=4 \
-              --max-connection-per-server=4 \
-              --dir="tmp_downloads" \
-              --header="User-Agent: Mozilla/5.0" \
-              "$URL"
+              aria2c \
+                --split=1 \
+                --max-connection-per-server=1 \
+                --max-tries=5 \
+                --retry-wait=10 \
+                --continue=true \
+                --timeout=60 \
+                --max-redirect=10 \
+                --referer="https://trafficdeposit.com/" \
+                --header="User-Agent: Mozilla/5.0" \
+                --dir="tmp_downloads" \
+                "$URL"
 
             STATUS=$?
 
