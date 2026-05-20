@@ -1,0 +1,134 @@
+name: Fast Download & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Direct URLs (space, comma, or newline separated)"
+        required: true
+        type: string
+      tag:
+        description: "Release tag name (optional, auto-generated if empty)"
+        required: false
+        type: string
+        default: ""
+      password:
+        description: "ZIP password (optional)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install aria2
+        run: sudo apt-get update -qq && sudo apt-get install -y aria2 zip
+
+      - name: Download files
+        shell: bash
+        run: |
+          set +e
+          mkdir -p downloads upload
+
+          RAW="${{ github.event.inputs.url }}"
+          URLS=$(printf '%s' "$RAW" | tr ',\n' '  ')
+
+          : > upload/ok.txt
+          : > upload/fail.txt
+          I=0
+
+          for URL in $URLS; do
+            [ -z "$URL" ] && continue
+            I=$((I + 1))
+            echo "--- [$I] $URL ---"
+
+            BEFORE=$(find downloads -maxdepth 1 -type f | wc -l)
+
+            aria2c -x16 -s16 -k1M -j1 \
+              --file-allocation=none \
+              --dir=downloads \
+              --auto-file-renaming=false \
+              --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              --header="Referer: https://www.google.com/" \
+              --check-certificate=false \
+              --retry-wait=3 --max-tries=5 \
+              --timeout=120 --connect-timeout=30 \
+              "$URL"
+
+            AFTER=$(find downloads -maxdepth 1 -type f | wc -l)
+
+            if [ $? -ne 0 ] || [ "$AFTER" -le "$BEFORE" ]; then
+              echo "FAIL: $URL"
+              echo "$URL" >> upload/fail.txt
+            else
+              echo "OK: $URL"
+              echo "$URL" >> upload/ok.txt
+            fi
+          done
+          set -e
+
+      - name: Prepare upload
+        shell: bash
+        run: |
+          PASS="${{ github.event.inputs.password }}"
+          LIMIT=$((2 * 1024 * 1024 * 1024))
+
+          for F in downloads/*; do
+            [ -f "$F" ] || continue
+            [ -s "$F" ] || continue
+            B=$(basename "$F")
+            S=$(stat -c%s "$F")
+
+            if [ "$S" -gt "$LIMIT" ]; then
+              if [ -n "$PASS" ]; then
+                zip -s 2g -P "$PASS" "upload/${B}.zip" -j "$F"
+              else
+                zip -s 2g "upload/${B}.zip" -j "$F"
+              fi
+            elif [ -n "$PASS" ]; then
+              zip -P "$PASS" "upload/${B}.zip" -j "$F"
+            else
+              cp "$F" "upload/$B"
+            fi
+          done
+
+          find upload -type f -empty -delete
+          rm -rf downloads
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT_TAG="${{ github.event.inputs.tag }}"
+          TAG="${INPUT_TAG:-dl-$(date +%Y%m%d-%H%M%S)}"
+
+          {
+            echo "## Download Report"
+            echo ""
+            echo "### OK"
+            [ -s upload/ok.txt ] && sed 's/^/- /' upload/ok.txt || echo "_none_"
+            echo ""
+            echo "### Failed"
+            [ -s upload/fail.txt ] && sed 's/^/- /' upload/fail.txt || echo "_none_"
+            echo ""
+            echo "### Files"
+            for F in upload/*; do
+              [ -f "$F" ] && echo "- $(basename "$F")"
+            done
+          } > body.md
+
+          rm -f upload/ok.txt upload/fail.txt
+
+          gh release create "$TAG" upload/* \
+            --title "Download $TAG" \
+            --notes-file body.md
