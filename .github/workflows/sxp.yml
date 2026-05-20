@@ -9,7 +9,7 @@ on:
         type: string
 
       cookie:
-        description: "Cookie Header (Optional)"
+        description: "Manual Cookie Header (Optional - overrides cookies.txt)"
         required: false
         type: string
         default: ""
@@ -74,7 +74,7 @@ jobs:
           set +e
 
           RAW_URLS="${{ github.event.inputs.url }}"
-          COOKIE="${{ github.event.inputs.cookie }}"
+          MANUAL_COOKIE="${{ github.event.inputs.cookie }}"
           REFERER="${{ github.event.inputs.referer }}"
 
           IFS=$'\n ,'
@@ -88,42 +88,41 @@ jobs:
               continue
             fi
 
-            echo ""
             echo "=================================================="
-            echo "DOWNLOAD [$INDEX]"
-            echo "$URL"
+            echo "DOWNLOAD [$INDEX]: $URL"
             echo "=================================================="
 
             SAFE_NAME="file_${INDEX}"
 
+            # ---------------- yt-dlp ----------------
             YTDLP_ARGS=(
               --no-part
               --no-playlist
               --restrict-filenames
-              --newline
               -o "tmp_downloads/${SAFE_NAME}.%(ext)s"
+              --add-header "User-Agent:Mozilla/5.0"
             )
 
             if [ -n "$REFERER" ]; then
               YTDLP_ARGS+=(--add-header "Referer:$REFERER")
             fi
 
-            if [ -n "$COOKIE" ]; then
-              YTDLP_ARGS+=(--add-header "Cookie:$COOKIE")
+            # Manual cookie overrides everything
+            if [ -n "$MANUAL_COOKIE" ]; then
+              YTDLP_ARGS+=(--add-header "Cookie:$MANUAL_COOKIE")
+            elif [ -f "cookies.txt" ]; then
+              YTDLP_ARGS+=(--cookies cookies.txt)
             fi
 
-            YTDLP_ARGS+=(--add-header "User-Agent:Mozilla/5.0")
-
             echo "Trying yt-dlp..."
-
             yt-dlp "${YTDLP_ARGS[@]}" "$URL"
 
             STATUS=$?
 
+            # ---------------- aria2 fallback ----------------
             if [ $STATUS -ne 0 ]; then
 
-              echo "yt-dlp failed"
-              echo "Trying aria2..."
+              echo "yt-dlp failed -> aria2 fallback"
 
               ARIA_ARGS=(
                 --split=1
@@ -134,15 +133,15 @@ jobs:
                 --timeout=60
                 --auto-file-renaming=true
                 --dir=tmp_downloads
-                --header=User-Agent:\ Mozilla/5.0
+                --header="User-Agent: Mozilla/5.0"
               )
 
               if [ -n "$REFERER" ]; then
                 ARIA_ARGS+=(--referer="$REFERER")
               fi
 
-              if [ -n "$COOKIE" ]; then
-                ARIA_ARGS+=(--header="Cookie: $COOKIE")
+              if [ -n "$MANUAL_COOKIE" ]; then
+                ARIA_ARGS+=(--header="Cookie: $MANUAL_COOKIE")
               fi
 
               aria2c "${ARIA_ARGS[@]}" "$URL"
@@ -150,13 +149,13 @@ jobs:
               STATUS=$?
             fi
 
+            # ---------------- curl fallback ----------------
             if [ $STATUS -ne 0 ]; then
 
-              echo "aria2 failed"
-              echo "Trying curl..."
+              echo "aria2 failed -> curl fallback"
 
-              FILE_EXT=$(echo "$URL" | awk -F. '{print $NF}')
-              OUTPUT_FILE="tmp_downloads/${SAFE_NAME}.${FILE_EXT}"
+              SAFE_EXT=$(echo "$URL" | awk -F. '{print $NF}' | cut -d'?' -f1)
+              OUTPUT_FILE="tmp_downloads/${SAFE_NAME}.${SAFE_EXT}"
 
               CURL_ARGS=(
                 -L
@@ -169,8 +168,8 @@ jobs:
                 CURL_ARGS+=(-e "$REFERER")
               fi
 
-              if [ -n "$COOKIE" ]; then
-                CURL_ARGS+=(-H "Cookie: $COOKIE")
+              if [ -n "$MANUAL_COOKIE" ]; then
+                CURL_ARGS+=(-H "Cookie: $MANUAL_COOKIE")
               fi
 
               curl "${CURL_ARGS[@]}" \
@@ -180,44 +179,30 @@ jobs:
               STATUS=$?
             fi
 
-            echo ""
-            echo "Checking downloaded files..."
-
-            VALID_FOUND=0
+            # ---------------- validation ----------------
+            VALID=0
 
             for FILE in tmp_downloads/*; do
 
-              if [ ! -f "$FILE" ]; then
-                continue
-              fi
-
-              if [ ! -s "$FILE" ]; then
-                rm -f "$FILE"
-                continue
-              fi
+              [ -f "$FILE" ] || continue
+              [ -s "$FILE" ] || { rm -f "$FILE"; continue; }
 
               MIME=$(file --mime-type -b "$FILE")
 
-              echo "FILE: $FILE"
-              echo "MIME: $MIME"
-
               case "$MIME" in
-                text/html|text/plain|application/json)
-                  echo "Fake file detected -> removing"
+                text/html|application/json|text/plain)
                   rm -f "$FILE"
                   ;;
                 *)
-                  VALID_FOUND=1
+                  VALID=1
                   ;;
               esac
 
             done
 
-            if [ "$VALID_FOUND" -eq 1 ]; then
-              echo "SUCCESS: $URL"
+            if [ "$VALID" -eq 1 ]; then
               echo "$URL" >> upload/success.txt
             else
-              echo "FAILED: $URL"
               echo "$URL" >> upload/failed.txt
             fi
 
@@ -227,131 +212,38 @@ jobs:
 
           set -e
 
-      - name: Show File Info
-        shell: bash
-        run: |
-          echo "================ FILE INFO ================"
-
-          for FILE in tmp_downloads/*; do
-
-            if [ ! -f "$FILE" ]; then
-              continue
-            fi
-
-            echo ""
-            echo "FILE: $FILE"
-
-            file "$FILE" || true
-
-            mediainfo "$FILE" || true
-
-          done
-
       - name: Prepare Uploads
         shell: bash
         run: |
           PASS="${{ github.event.inputs.password }}"
-          LIMIT=$((2 * 1024 * 1024 * 1024))
 
           for FILE in tmp_downloads/*; do
-
-            if [ ! -f "$FILE" ]; then
-              continue
-            fi
-
-            if [ ! -s "$FILE" ]; then
-              continue
-            fi
+            [ -f "$FILE" ] || continue
 
             BASENAME=$(basename "$FILE")
-            SIZE=$(stat -c%s "$FILE")
 
-            echo ""
-            echo "Preparing: $BASENAME"
-
-            if [ "$SIZE" -gt "$LIMIT" ]; then
-
-              echo "Large file -> split archive"
-
-              if [ -n "$PASS" ]; then
-
-                7z a \
-                  -v2g \
-                  -p"$PASS" \
-                  -mhe=on \
-                  "upload/${BASENAME}.7z" \
-                  "$FILE"
-
-              else
-
-                7z a \
-                  -v2g \
-                  "upload/${BASENAME}.7z" \
-                  "$FILE"
-
-              fi
-
+            if [ -n "$PASS" ]; then
+              7z a -p"$PASS" -mhe=on "upload/${BASENAME}.7z" "$FILE"
             else
-
-              if [ -n "$PASS" ]; then
-
-                echo "Password protected archive"
-
-                7z a \
-                  -p"$PASS" \
-                  -mhe=on \
-                  "upload/${BASENAME}.7z" \
-                  "$FILE"
-
-              else
-
-                cp "$FILE" "upload/$BASENAME"
-
-              fi
-
+              cp "$FILE" "upload/$BASENAME"
             fi
-
           done
 
-      - name: Cleanup Empty Files
-        shell: bash
-        run: |
-          find upload -type f -empty -delete
-
-      - name: Generate Release Info
+      - name: Generate Release
         id: meta
         shell: bash
         run: |
           TAG="run-$(date +%Y%m%d-%H%M%S)"
-
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
           {
-            echo "# Download Report"
-            echo ""
-
-            echo "## Successful Downloads"
-
-            while read LINE; do
-              [ -n "$LINE" ] && echo "- $LINE"
-            done < upload/success.txt
-
-            echo ""
-
-            echo "## Failed Downloads"
-
-            while read LINE; do
-              [ -n "$LINE" ] && echo "- $LINE"
-            done < upload/failed.txt
-
-            echo ""
-
-            echo "## Uploaded Files"
-
-            for FILE in upload/*; do
-              [ -f "$FILE" ] && echo "- $(basename "$FILE")"
-            done
-
+            echo "# Report"
+            echo "## Success"
+            cat upload/success.txt
+            echo "## Failed"
+            cat upload/failed.txt
+            echo "## Files"
+            ls upload
           } > body.md
 
       - name: Create Release
