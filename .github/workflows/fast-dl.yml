@@ -63,10 +63,11 @@ jobs:
               --retry-wait=3 --max-tries=5 \
               --timeout=120 --connect-timeout=30 \
               "$URL"
+            DL_STATUS=$?
 
             AFTER=$(find downloads -maxdepth 1 -type f | wc -l)
 
-            if [ $? -ne 0 ] || [ "$AFTER" -le "$BEFORE" ]; then
+            if [ $DL_STATUS -ne 0 ] || [ "$AFTER" -le "$BEFORE" ]; then
               echo "FAIL: $URL"
               echo "$URL" >> upload/fail.txt
             else
