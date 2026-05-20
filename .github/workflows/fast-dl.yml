@@ -1,4 +1,4 @@
-name: Fast Download & Release
+name: Fast Download & Release 1
 
 on:
   workflow_dispatch:
