@@ -73,7 +73,7 @@ jobs:
                 --continue=true \
                 --timeout=60 \
                 --max-redirect=10 \
-                --referer="https://trafficdeposit.com/" \
+                --referer="https://erome.com/" \
                 --header="User-Agent: Mozilla/5.0" \
                 --dir="tmp_downloads" \
                 "$URL"
