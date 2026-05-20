@@ -65,17 +65,18 @@ jobs:
 
             BEFORE_COUNT=$(find tmp_downloads -type f | wc -l)
 
-              aria2c \
-                --split=1 \
-                --max-connection-per-server=1 \
-                --max-tries=5 \
-                --retry-wait=10 \
-                --continue=true \
-                --timeout=60 \
-                --referer="https://sxyprn.com/" \
-                --header="User-Agent: Mozilla/5.0" \
-                --dir="tmp_downloads" \
-                "$URL"
+            aria2c \
+              --split=1 \
+              --max-connection-per-server=1 \
+              --max-tries=5 \
+              --retry-wait=10 \
+              --continue=true \
+              --timeout=120 \
+              --referer="https://trafficdeposit.com/" \
+              --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --header="Accept: */*" \
+              --dir="tmp_downloads" \
+              "$URL"
 
             STATUS=$?
 
