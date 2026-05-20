@@ -1,10 +1,10 @@
-name: s DL Release
+name: sxp DL Release PRO
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Direct URLs (Separate with space, comma, or new line)"
+        description: "URLs (space/comma/newline separated)"
         required: true
         type: string
 
@@ -18,10 +18,10 @@ on:
         description: "Referer (Optional)"
         required: false
         type: string
-        default: "https://trafficdeposit.com/"
+        default: ""
 
       password:
-        description: "ZIP Password (Optional)"
+        description: "Archive Password (Optional)"
         required: false
         type: string
         default: ""
@@ -37,10 +37,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install Tools
+        shell: bash
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y aria2 curl zip p7zip-full
+
+          sudo apt-get install -y \
+            aria2 \
+            curl \
+            ffmpeg \
+            p7zip-full \
+            mediainfo \
+            jq
+
+          sudo curl -L \
+            https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+            -o /usr/local/bin/yt-dlp
+
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+
+      - name: Prepare Workspace
+        shell: bash
+        run: |
+          rm -rf tmp_downloads
+          rm -rf upload
+
+          mkdir -p tmp_downloads
+          mkdir -p upload
+
+          touch upload/success.txt
+          touch upload/failed.txt
 
       - name: Download Files
         shell: bash
@@ -50,18 +76,6 @@ jobs:
           RAW_URLS="${{ github.event.inputs.url }}"
           COOKIE="${{ github.event.inputs.cookie }}"
           REFERER="${{ github.event.inputs.referer }}"
-
-          rm -rf tmp_downloads
-          rm -rf upload
-
-          mkdir -p tmp_downloads
-          mkdir -p upload
-
-          SUCCESS_FILE="upload/success.txt"
-          FAILED_FILE="upload/failed.txt"
-
-          > "$SUCCESS_FILE"
-          > "$FAILED_FILE"
 
           IFS=$'\n ,'
           read -ra URLS <<< "$RAW_URLS"
@@ -74,39 +88,75 @@ jobs:
               continue
             fi
 
-            echo "======================================"
-            echo "Downloading [$INDEX]: $URL"
-            echo "======================================"
+            echo ""
+            echo "=================================================="
+            echo "DOWNLOAD [$INDEX]"
+            echo "$URL"
+            echo "=================================================="
 
-            FILENAME=$(basename "$URL")
+            SAFE_NAME="file_${INDEX}"
 
-            ARIA_ARGS=(
-              --split=1
-              --max-connection-per-server=1
-              --max-tries=5
-              --retry-wait=10
-              --continue=true
-              --timeout=60
-              --auto-file-renaming=true
-              --dir=tmp_downloads
-              --header=User-Agent:\ Mozilla/5.0
+            YTDLP_ARGS=(
+              --no-part
+              --no-playlist
+              --restrict-filenames
+              --newline
+              -o "tmp_downloads/${SAFE_NAME}.%(ext)s"
             )
 
             if [ -n "$REFERER" ]; then
-              ARIA_ARGS+=(--referer="$REFERER")
+              YTDLP_ARGS+=(--add-header "Referer:$REFERER")
             fi
 
             if [ -n "$COOKIE" ]; then
-              ARIA_ARGS+=(--header="Cookie: $COOKIE")
+              YTDLP_ARGS+=(--add-header "Cookie:$COOKIE")
             fi
 
-            aria2c "${ARIA_ARGS[@]}" "$URL"
+            YTDLP_ARGS+=(--add-header "User-Agent:Mozilla/5.0")
+
+            echo "Trying yt-dlp..."
+
+            yt-dlp "${YTDLP_ARGS[@]}" "$URL"
 
             STATUS=$?
 
             if [ $STATUS -ne 0 ]; then
 
-              echo "aria2 failed, trying curl..."
+              echo "yt-dlp failed"
+              echo "Trying aria2..."
+
+              ARIA_ARGS=(
+                --split=1
+                --max-connection-per-server=1
+                --max-tries=5
+                --retry-wait=10
+                --continue=true
+                --timeout=60
+                --auto-file-renaming=true
+                --dir=tmp_downloads
+                --header=User-Agent:\ Mozilla/5.0
+              )
+
+              if [ -n "$REFERER" ]; then
+                ARIA_ARGS+=(--referer="$REFERER")
+              fi
+
+              if [ -n "$COOKIE" ]; then
+                ARIA_ARGS+=(--header="Cookie: $COOKIE")
+              fi
+
+              aria2c "${ARIA_ARGS[@]}" "$URL"
+
+              STATUS=$?
+            fi
+
+            if [ $STATUS -ne 0 ]; then
+
+              echo "aria2 failed"
+              echo "Trying curl..."
+
+              FILE_EXT=$(echo "$URL" | awk -F. '{print $NF}')
+              OUTPUT_FILE="tmp_downloads/${SAFE_NAME}.${FILE_EXT}"
 
               CURL_ARGS=(
                 -L
@@ -124,20 +174,51 @@ jobs:
               fi
 
               curl "${CURL_ARGS[@]}" \
-                -o "tmp_downloads/$FILENAME" \
+                -o "$OUTPUT_FILE" \
                 "$URL"
 
               STATUS=$?
             fi
 
-            FILE_PATH="tmp_downloads/$FILENAME"
+            echo ""
+            echo "Checking downloaded files..."
 
-            if [ $STATUS -eq 0 ] && [ -f "$FILE_PATH" ] && [ -s "$FILE_PATH" ]; then
+            VALID_FOUND=0
+
+            for FILE in tmp_downloads/*; do
+
+              if [ ! -f "$FILE" ]; then
+                continue
+              fi
+
+              if [ ! -s "$FILE" ]; then
+                rm -f "$FILE"
+                continue
+              fi
+
+              MIME=$(file --mime-type -b "$FILE")
+
+              echo "FILE: $FILE"
+              echo "MIME: $MIME"
+
+              case "$MIME" in
+                text/html|text/plain|application/json)
+                  echo "Fake file detected -> removing"
+                  rm -f "$FILE"
+                  ;;
+                *)
+                  VALID_FOUND=1
+                  ;;
+              esac
+
+            done
+
+            if [ "$VALID_FOUND" -eq 1 ]; then
               echo "SUCCESS: $URL"
-              echo "$URL" >> "$SUCCESS_FILE"
+              echo "$URL" >> upload/success.txt
             else
               echo "FAILED: $URL"
-              echo "$URL" >> "$FAILED_FILE"
+              echo "$URL" >> upload/failed.txt
             fi
 
             INDEX=$((INDEX + 1))
@@ -146,7 +227,27 @@ jobs:
 
           set -e
 
-      - name: Prepare Files
+      - name: Show File Info
+        shell: bash
+        run: |
+          echo "================ FILE INFO ================"
+
+          for FILE in tmp_downloads/*; do
+
+            if [ ! -f "$FILE" ]; then
+              continue
+            fi
+
+            echo ""
+            echo "FILE: $FILE"
+
+            file "$FILE" || true
+
+            mediainfo "$FILE" || true
+
+          done
+
+      - name: Prepare Uploads
         shell: bash
         run: |
           PASS="${{ github.event.inputs.password }}"
@@ -162,30 +263,47 @@ jobs:
               continue
             fi
 
-            SIZE=$(stat -c%s "$FILE")
             BASENAME=$(basename "$FILE")
+            SIZE=$(stat -c%s "$FILE")
+
+            echo ""
+            echo "Preparing: $BASENAME"
 
             if [ "$SIZE" -gt "$LIMIT" ]; then
 
-              echo "Large file detected: $BASENAME"
+              echo "Large file -> split archive"
 
               if [ -n "$PASS" ]; then
-                7z a -v2g -p"$PASS" -mhe=on "upload/${BASENAME}.7z" "$FILE"
+
+                7z a \
+                  -v2g \
+                  -p"$PASS" \
+                  -mhe=on \
+                  "upload/${BASENAME}.7z" \
+                  "$FILE"
+
               else
-                7z a -v2g "upload/${BASENAME}.7z" "$FILE"
+
+                7z a \
+                  -v2g \
+                  "upload/${BASENAME}.7z" \
+                  "$FILE"
+
               fi
 
             else
 
               if [ -n "$PASS" ]; then
 
-                echo "Creating password protected archive: $BASENAME"
+                echo "Password protected archive"
 
-                7z a -p"$PASS" -mhe=on "upload/${BASENAME}.7z" "$FILE"
+                7z a \
+                  -p"$PASS" \
+                  -mhe=on \
+                  "upload/${BASENAME}.7z" \
+                  "$FILE"
 
               else
-
-                echo "Keeping original file: $BASENAME"
 
                 cp "$FILE" "upload/$BASENAME"
 
@@ -195,9 +313,7 @@ jobs:
 
           done
 
-          rm -rf tmp_downloads
-
-      - name: Remove invalid files
+      - name: Cleanup Empty Files
         shell: bash
         run: |
           find upload -type f -empty -delete
@@ -210,37 +326,33 @@ jobs:
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-          echo "## Download Report" > body.md
-          echo "" >> body.md
+          {
+            echo "# Download Report"
+            echo ""
 
-          echo "### Successful Downloads" >> body.md
+            echo "## Successful Downloads"
 
-          if [ -f upload/success.txt ]; then
             while read LINE; do
-              echo "- $LINE" >> body.md
+              [ -n "$LINE" ] && echo "- $LINE"
             done < upload/success.txt
-          fi
 
-          echo "" >> body.md
+            echo ""
 
-          echo "### Failed Downloads" >> body.md
+            echo "## Failed Downloads"
 
-          if [ -f upload/failed.txt ]; then
             while read LINE; do
-              echo "- $LINE" >> body.md
+              [ -n "$LINE" ] && echo "- $LINE"
             done < upload/failed.txt
-          fi
 
-          echo "" >> body.md
+            echo ""
 
-          echo "### Uploaded Files" >> body.md
+            echo "## Uploaded Files"
 
-          for FILE in upload/*; do
-            if [ -f "$FILE" ]; then
-              NAME=$(basename "$FILE")
-              echo "- $NAME" >> body.md
-            fi
-          done
+            for FILE in upload/*; do
+              [ -f "$FILE" ] && echo "- $(basename "$FILE")"
+            done
+
+          } > body.md
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
