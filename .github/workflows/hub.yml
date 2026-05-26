@@ -103,35 +103,19 @@ jobs:
             echo "[$INDEX] Attempt $i: $URL"
             
             # ساخت command به صورت array برای handle کردن cookies
-            CMD=(yt-dlp -f "$FORMAT"
+            CMD=(yt-dlp
+              -f "$FORMAT"
               --merge-output-format mp4
               --no-playlist
-              --restrict-filenames
               --encoding utf-8
-              --user-agent "$USER_AGENT"
-              --referer "https://www.pornhub.com/"
-              --add-header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-              --add-header "Accept-Language: en-US,en;q=0.9"
-              --add-header "Cache-Control: no-cache"
-              --add-header "Sec-Ch-Ua: \"Google Chrome\";v=\"125\", \"Chromium\";v=\"125\", \"Not.A/Brand\";v=\"24\""
-              --add-header "Sec-Ch-Ua-Mobile: ?0"
-              --add-header "Sec-Ch-Ua-Platform: \"Windows\""
-              --add-header "Sec-Fetch-Dest: document"
-              --add-header "Sec-Fetch-Mode: navigate"
-              --add-header "Sec-Fetch-Site: none"
-              --add-header "Sec-Fetch-User: ?1"
-              --add-header "Upgrade-Insecure-Requests: 1"
-              --sleep-requests 2
-              --sleep-interval 3
-              --max-sleep-interval 8
+              --extractor-args "pornhub:client=web"
+              --cookies cookies.txt
+              --sleep-requests 3
+              --sleep-interval 5
+              --max-sleep-interval 10
               --retries 2
-              --fragment-retries 5
-              --extractor-retries 5
-              --no-check-certificates
-              --geo-bypass
-              --legacy-server-connect
-              --ignore-no-formats-error
-              -o "output/%(title)s.%(ext)s"
+              --fragment-retries 10
+              -o "output/%(title).150B [%(id)s].%(ext)s"
             )
             
             # اضافه کردن cookies اگر وجود داشت
