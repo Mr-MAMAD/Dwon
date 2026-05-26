@@ -124,14 +124,14 @@ jobs:
               --sleep-requests 2
               --sleep-interval 3
               --max-sleep-interval 8
-              --retries 5
+              --retries 2
               --fragment-retries 5
               --extractor-retries 5
               --no-check-certificates
               --geo-bypass
               --legacy-server-connect
               --ignore-no-formats-error
-              -o "output/%(id)s.%(ext)s"
+              -o "output/%(title)s.%(ext)s"
             )
             
             # اضافه کردن cookies اگر وجود داشت
