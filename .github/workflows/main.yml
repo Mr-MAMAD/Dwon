@@ -33,9 +33,13 @@ jobs:
 
       - name: Resolve PHP redirects and prepare download list
         id: resolve
+        env:
+          URLS: ${{ github.event.inputs.urls }}
         run: |
-          # تبدیل لینک‌ها به آرایه
-          mapfile -t URL_ARRAY <<< "${{ github.event.inputs.urls }}"
+          # تبدیل هر فاصله، تب، خط جدید به خط جدید و حذف خطوط خالی
+          CLEAN_URLS=$(echo "$URLS" | tr -s '[:space:]' '\n' | sed '/^$/d')
+          
+          mapfile -t URL_ARRAY <<< "$CLEAN_URLS"
           
           # فایل لیست نهایی برای aria2
           FINAL_LIST="/tmp/aria_final_list.txt"
