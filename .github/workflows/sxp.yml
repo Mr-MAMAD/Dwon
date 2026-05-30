@@ -27,7 +27,7 @@ jobs:
         id: download
         shell: bash
         run: |
-          set +e  # مهم: جلوگیری از توقف روی خطاهای grep
+          set +e
           
           mapfile -t URL_ARRAY <<< "${{ github.event.inputs.urls }}"
           
@@ -77,164 +77,160 @@ jobs:
             # ذخیره HTML برای دیباگ
             echo "$PAGE_HTML" > "/tmp/page_$INDEX.html"
             
-            # استخراج همه لینک‌ها
-            echo "🔍 استخراج همه لینک‌ها از صفحه..."
-            ALL_LINKS=$(echo "$PAGE_HTML" | grep -oP 'https?://[^"'\''<>\s]+' 2>/dev/null | sort -u)
-            
-            echo "📋 لینک‌های پیدا شده:"
-            echo "$ALL_LINKS" | head -50
-            echo ""
-            
             VIDEO_URL=""
             
-            # روش 1: لینک‌های trafficdeposit
-            VIDEO_URL=$(echo "$ALL_LINKS" | grep -i "trafficdeposit" | head -1)
-            [ -n "$VIDEO_URL" ] && echo "✅ روش 1: trafficdeposit link"
+            # ==========================================
+            # روش اصلی: استخراج src از تگ video
+            # ==========================================
+            echo "🔍 روش 1: استخراج src از تگ video..."
             
-            # روش 2: لینک‌های widi
-            if [ -z "$VIDEO_URL" ]; then
-              VIDEO_URL=$(echo "$ALL_LINKS" | grep -i "/widi/" | head -1)
-              [ -n "$VIDEO_URL" ] && echo "✅ روش 2: widi link"
-            fi
+            # استخراج src از تگ video
+            VIDEO_SRC=$(echo "$PAGE_HTML" | grep -oP '<video[^>]*src="([^"]*)"' 2>/dev/null | grep -oP 'src="\K[^"]*' 2>/dev/null | head -1)
             
-            # روش 3: لینک‌های .vid
-            if [ -z "$VIDEO_URL" ]; then
-              VIDEO_URL=$(echo "$ALL_LINKS" | grep -i "\.vid" | head -1)
-              [ -n "$VIDEO_URL" ] && echo "✅ روش 3: .vid link"
-            fi
-            
-            # روش 4: لینک‌های .mp4
-            if [ -z "$VIDEO_URL" ]; then
-              VIDEO_URL=$(echo "$ALL_LINKS" | grep -i "\.mp4" | head -1)
-              [ -n "$VIDEO_URL" ] && echo "✅ روش 4: .mp4 link"
-            fi
-            
-            # روش 5: src در تگ video (با grep بدون خطا)
-            if [ -z "$VIDEO_URL" ]; then
-              VIDEO_URL=$(echo "$PAGE_HTML" | grep -oP 'src="https?://[^"]*trafficdeposit[^"]*' 2>/dev/null | head -1 | sed 's/^src="//' 2>/dev/null)
-              [ -n "$VIDEO_URL" ] && echo "✅ روش 5: video src"
-            fi
-            
-            # روش 6: data-src
-            if [ -z "$VIDEO_URL" ]; then
-              VIDEO_URL=$(echo "$PAGE_HTML" | grep -oP 'data-src="https?://[^"]*trafficdeposit[^"]*' 2>/dev/null | head -1 | sed 's/^data-src="//' 2>/dev/null)
-              [ -n "$VIDEO_URL" ] && echo "✅ روش 6: data-src"
-            fi
-            
-            # روش 7: video_url در جاوااسکریپت
-            if [ -z "$VIDEO_URL" ]; then
-              VIDEO_URL=$(echo "$PAGE_HTML" | grep -oP "video_url[:\s]*'https?://[^']*'" 2>/dev/null | head -1 | grep -oP "'\K[^']*" 2>/dev/null)
-              [ -n "$VIDEO_URL" ] && echo "✅ روش 7: video_url in JS"
-            fi
-            
-            # روش 8: source tag
-            if [ -z "$VIDEO_URL" ]; then
-              VIDEO_URL=$(echo "$PAGE_HTML" | grep -oP '<source[^>]*src="https?://[^"]*' 2>/dev/null | head -1 | grep -oP 'src="\K[^"]*' 2>/dev/null)
-              [ -n "$VIDEO_URL" ] && echo "✅ روش 8: source tag"
-            fi
-            
-            # روش 9: iframe
-            if [ -z "$VIDEO_URL" ]; then
-              echo "🔍 روش 9: بررسی iframe..."
-              IFRAME_URL=$(echo "$PAGE_HTML" | grep -oP 'iframe[^>]*src="https?://[^"]*"' 2>/dev/null | head -1 | grep -oP 'src="\K[^"]*' 2>/dev/null)
+            if [ -n "$VIDEO_SRC" ]; then
+              echo "📄 src پیدا شده: $VIDEO_SRC"
               
-              if [ -n "$IFRAME_URL" ]; then
-                echo "📥 دانلود iframe: ${IFRAME_URL:0:100}..."
-                IFRAME_HTML=$(curl -s -L \
-                  -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                  -H "Referer: $page_url" \
-                  --connect-timeout 30 \
-                  --max-time 60 \
-                  "$IFRAME_URL" 2>/dev/null)
-                
-                if [ -n "$IFRAME_HTML" ]; then
-                  IFRAME_LINKS=$(echo "$IFRAME_HTML" | grep -oP 'https?://[^"'\''<>\s]+' 2>/dev/null | sort -u)
-                  VIDEO_URL=$(echo "$IFRAME_LINKS" | grep -iE "trafficdeposit|\.vid|\.mp4|/widi/" | head -1)
-                  [ -n "$VIDEO_URL" ] && echo "✅ روش 9: from iframe"
-                fi
+              # چک کردن نوع src
+              if echo "$VIDEO_SRC" | grep -qE '^https?://'; then
+                # لینک کامل - مستقیم استفاده کن
+                VIDEO_URL="$VIDEO_SRC"
+                echo "   ✅ لینک کامل"
+              elif echo "$VIDEO_SRC" | grep -qE '^/cdn[0-9]+/'; then
+                # لینک نسبی با /cdn - باید دامنه رو اضافه کنیم
+                # از دامنه trafficdeposit.com استفاده کن (CDN اصلی)
+                VIDEO_URL="https://c5.trafficdeposit.com${VIDEO_SRC}"
+                echo "   ✅ لینک cdn نسبی - اضافه کردن trafficdeposit.com"
+              elif echo "$VIDEO_SRC" | grep -qE '^/'; then
+                # لینک نسبی معمولی
+                VIDEO_URL="https://sxyprn.com${VIDEO_SRC}"
+                echo "   ✅ لینک نسبی - اضافه کردن sxyprn.com"
+              else
+                VIDEO_URL="$VIDEO_SRC"
+                echo "   ⚠️ فرمت ناشناخته"
+              fi
+              
+              echo "🎬 لینک نهایی: $VIDEO_URL"
+            fi
+            
+            # ==========================================
+            # روش 2: data-mgfs (احتمالاً لینک غیرمستقیم)
+            # ==========================================
+            if [ -z "$VIDEO_URL" ]; then
+              echo "🔍 روش 2: بررسی data-mgfs..."
+              MGFS=$(echo "$PAGE_HTML" | grep -oP 'data-mgfs="([^"]*)"' 2>/dev/null | grep -oP 'data-mgfs="\K[^"]*' 2>/dev/null | head -1)
+              if [ -n "$MGFS" ]; then
+                echo "📄 data-mgfs: $MGFS"
+                # این ممکنه ID باشه برای ساختن لینک
+                VIDEO_URL="https://c5.trafficdeposit.com/cdn/${MGFS}/video.vid"
+                echo "   ⚠️ لینک حدسی از mgfs"
               fi
             fi
             
-            # روش 10: API
+            # ==========================================
+            # روش 3: از IDM (لینک مستقیم trafficdeposit)
+            # ==========================================
             if [ -z "$VIDEO_URL" ]; then
-              echo "🔍 روش 10: بررسی API..."
-              VIDEO_ID=$(echo "$page_url" | grep -oP 'post/\K[^.?]+' 2>/dev/null)
+              echo "🔍 روش 3: جستجوی لینک‌های trafficdeposit..."
+              ALL_LINKS=$(echo "$PAGE_HTML" | grep -oP 'https?://[^"'\''<>\s]+' 2>/dev/null | sort -u)
+              VIDEO_URL=$(echo "$ALL_LINKS" | grep -i "trafficdeposit" | grep -iE "\.vid|\.mp4|/widi/" | head -1)
+              [ -n "$VIDEO_URL" ] && echo "   ✅ لینک trafficdeposit پیدا شد"
+            fi
+            
+            # ==========================================
+            # روش 4: بازسازی لینک از src تگ video با pattern IDM
+            # ==========================================
+            if [ -z "$VIDEO_URL" ] && [ -n "$VIDEO_SRC" ]; then
+              echo "🔍 روش 4: بازسازی لینک به فرمت IDM..."
               
-              if [ -n "$VIDEO_ID" ]; then
-                API_RESPONSE=$(curl -s -L \
-                  -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                  -H "Accept: application/json" \
-                  -H "Referer: $page_url" \
-                  -H "X-Requested-With: XMLHttpRequest" \
-                  --connect-timeout 30 \
-                  --max-time 30 \
-                  "https://sxyprn.com/api/video/$VIDEO_ID" 2>/dev/null)
+              # استخراج بخش‌های مسیر از src
+              # مثال: /cdn8/NDYtc3h5cHJu.../c5/9x174f66z.../1KXfwGZwqdf4.../1780176532/3w689hbifeep.../z06ka61b9g0k....vid
+              
+              # بخش c5 (ساب‌دامنه)
+              SUBDOMAIN=$(echo "$VIDEO_SRC" | grep -oP '/c\d+/' 2>/dev/null | head -1 | tr -d '/')
+              
+              # بخش آخر (نام فایل)
+              FILENAME_PART=$(echo "$VIDEO_SRC" | grep -oP '[^/]+\.vid$' 2>/dev/null)
+              
+              if [ -n "$SUBDOMAIN" ] && [ -n "$FILENAME_PART" ]; then
+                # ساخت لینک به فرمت widi
+                # الگو: https://c5.trafficdeposit.com/widi/[random]/[key]/[timestamp]/[hash]/[file].vid
                 
-                if [ -n "$API_RESPONSE" ]; then
-                  VIDEO_URL=$(echo "$API_RESPONSE" | grep -oP '"video_url":"[^"]*"' 2>/dev/null | cut -d'"' -f4 2>/dev/null | sed 's/\\//g')
-                  [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$API_RESPONSE" | grep -oP '"file":"[^"]*"' 2>/dev/null | cut -d'"' -f4 2>/dev/null)
-                  [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$API_RESPONSE" | grep -oP 'https?://[^"]*' 2>/dev/null | grep -iE "trafficdeposit|\.vid|\.mp4" | head -1)
-                  [ -n "$VIDEO_URL" ] && echo "✅ روش 10: from API"
-                fi
+                # استخراج بقیه بخش‌ها
+                PATH_PARTS=$(echo "$VIDEO_SRC" | sed 's|^/cdn[0-9]*/||' | sed 's|/[^/]*\.vid$||')
+                
+                VIDEO_URL="https://${SUBDOMAIN}.trafficdeposit.com/widi/${PATH_PARTS}/${FILENAME_PART}"
+                echo "   🔧 لینک بازسازی شده: $VIDEO_URL"
               fi
             fi
             
+            # ==========================================
+            # روش 5: جستجوی عمیق برای هر لینک vid
+            # ==========================================
+            if [ -z "$VIDEO_URL" ]; then
+              echo "🔍 روش 5: جستجوی عمیق..."
+              ALL_LINKS=$(echo "$PAGE_HTML" | grep -oP 'https?://[^"'\''<>\s]+' 2>/dev/null | sort -u)
+              VIDEO_URL=$(echo "$ALL_LINKS" | grep -iE "\.vid$|/widi/" | head -1)
+              [ -n "$VIDEO_URL" ] && echo "   ✅ پیدا شد"
+            fi
+            
+            # ==========================================
+            # بررسی نهایی
+            # ==========================================
             if [ -z "$VIDEO_URL" ]; then
               echo "❌ لینک ویدیو پیدا نشد!"
               echo ""
-              echo "📄 تمام لینک‌های غیرمعمول:"
-              echo "$ALL_LINKS" | grep -vE "google|facebook|twitter|schema|w3\.org|sxyprn\.com|cloudflare|cdnjs|jquery|fontawesome" | head -30
+              echo "📄 تگ video پیدا شده:"
+              echo "$PAGE_HTML" | grep -oP '<video[^>]*>' 2>/dev/null | head -3
               echo ""
-              echo "📄 بخش‌های مرتبط با video/iframe:"
-              echo "$PAGE_HTML" | grep -iE "video|iframe|source|trafficdeposit|widi|\.vid|\.mp4|embed" | head -15
+              echo "📄 src استخراج شده: ${VIDEO_SRC:-ندارد}"
+              echo ""
+              echo "📄 همه لینک‌های vid/mp4/trafficdeposit:"
+              echo "$ALL_LINKS" | grep -iE "\.vid|\.mp4|trafficdeposit|/widi/" | head -20
               echo ""
               FAILED_LIST="$FAILED_LIST\n- [$INDEX] $page_url (لینک ویدیو استخراج نشد)"
               continue
             fi
             
             echo ""
-            echo "🎬 لینک ویدیو: $VIDEO_URL"
+            echo "🎬 لینک نهایی: $VIDEO_URL"
             
-            # تمیز کردن لینک
+            # تمیز کردن
             VIDEO_URL=$(echo "$VIDEO_URL" | sed 's/\\//g' | xargs)
             
-            # تعیین نام فایل
+            # نام فایل
             FILENAME="${SLUG}.mp4"
-            echo "📁 ذخیره به عنوان: $FILENAME"
+            echo "📁 ذخیره: $FILENAME"
             echo ""
             echo "🚀 شروع دانلود..."
-            
-            # هدرها
-            HEADER_OPTS=(
-              --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-              --header="Accept: */*"
-              --header="Accept-Language: en-US,en;q=0.9"
-              --header="Accept-Encoding: identity"
-              --header="Connection: keep-alive"
-              --referer="$page_url"
-              --header="Referer: $page_url"
-              --header="Origin: https://sxyprn.com"
-            )
             
             # دانلود با aria2
             aria2c \
               "$VIDEO_URL" \
               --out="downloads/$FILENAME" \
-              --max-connection-per-server=8 \
-              --split=8 \
+              --max-connection-per-server=16 \
+              --split=16 \
               --min-split-size=1M \
               --connect-timeout=30 \
               --timeout=600 \
-              --max-tries=3 \
-              --retry-wait=5 \
+              --max-tries=5 \
+              --retry-wait=3 \
               --continue=true \
               --allow-overwrite=false \
               --auto-file-renaming=false \
               --file-allocation=none \
-              --disk-cache=64M \
+              --disk-cache=128M \
               --summary-interval=5 \
               --console-log-level=notice \
-              "${HEADER_OPTS[@]}" \
+              --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --header="Accept: */*" \
+              --header="Accept-Encoding: identity" \
+              --header="Connection: keep-alive" \
+              --referer="$page_url" \
+              --header="Referer: $page_url" \
+              --header="Origin: https://sxyprn.com" \
+              --header="Sec-Fetch-Dest: video" \
+              --header="Sec-Fetch-Mode: no-cors" \
+              --header="Sec-Fetch-Site: cross-site" \
               2>&1 | tee "/tmp/aria2_${INDEX}.log" || true
             
             # Fallback: curl
@@ -251,21 +247,6 @@ jobs:
                 "$VIDEO_URL" 2>&1 || true
             fi
             
-            # Fallback: wget
-            if [ ! -f "downloads/$FILENAME" ] || [ $(stat -c%s "downloads/$FILENAME" 2>/dev/null || echo 0) -lt 102400 ]; then
-              echo ""
-              echo "⚠️ تلاش با wget..."
-              wget \
-                --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                --referer="$page_url" \
-                --header="Origin: https://sxyprn.com" \
-                --tries=3 \
-                --timeout=60 \
-                --no-check-certificate \
-                -O "downloads/$FILENAME" \
-                "$VIDEO_URL" 2>&1 || true
-            fi
-            
             # بررسی نتیجه
             if [ -f "downloads/$FILENAME" ]; then
               SIZE=$(stat -c%s "downloads/$FILENAME" 2>/dev/null || echo 0)
@@ -279,7 +260,7 @@ jobs:
                 echo "❌ [$INDEX] حجم کم: $SIZE بایت"
                 head -c 200 "downloads/$FILENAME" 2>/dev/null | cat -v
                 rm -f "downloads/$FILENAME"
-                FAILED_LIST="$FAILED_LIST\n- [$INDEX] $page_url (حجم غیرعادی: ${SIZE} بایت)"
+                FAILED_LIST="$FAILED_LIST\n- [$INDEX] $page_url (حجم: ${SIZE} بایت)"
               fi
             else
               echo ""
@@ -293,7 +274,7 @@ jobs:
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
           echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
           
-          # بسته‌بندی فایل‌های دیباگ
+          # بسته‌بندی HTML برای دیباگ
           if ls /tmp/page_*.html 1> /dev/null 2>&1; then
             tar czf /tmp/pages_html.tar.gz /tmp/page_*.html 2>/dev/null || true
           fi
@@ -326,7 +307,7 @@ jobs:
               echo "## ❌ خطاها"
               echo -e "$FAILED_LIST"
               echo ""
-              echo "💡 فایل debug-data رو از Artifacts دانلود کن و HTML صفحه رو بررسی کن"
+              echo "💡 فایل debug-data رو از Artifacts دانلود کن"
             fi
           } > download_report.md
           
