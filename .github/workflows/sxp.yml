@@ -1,10 +1,10 @@
-name: dood download Videos
+name: Download Videos
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'One URL per line'
+        description: "One URL per line"
         required: true
         type: string
 
@@ -16,44 +16,65 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y ffmpeg
+          sudo apt install -y ffmpeg zip
           python3 -m pip install -U yt-dlp
 
-      - name: Download videos
+      - name: Prepare input
         run: |
           mkdir -p downloads
-
           cat << 'EOF' > urls.txt
           ${{ github.event.inputs.urls }}
           EOF
 
+      - name: Download videos sequentially
+        run: |
           counter=1
 
           while IFS= read -r url || [ -n "$url" ]; do
             [ -z "$url" ] && continue
 
+            echo "=============================="
             echo "Downloading: $url"
+            echo "=============================="
 
+            # try 1: normal impersonation
             yt-dlp \
               --merge-output-format mp4 \
+              --extractor-args "generic:impersonate" \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36" \
               -o "downloads/video_${counter}.%(ext)s" \
-              "$url"
+              "$url" || {
+
+              echo "Retrying with stronger mode..."
+
+              # try 2: more aggressive
+              yt-dlp \
+                --merge-output-format mp4 \
+                --extractor-args "generic:impersonate" \
+                --no-check-certificate \
+                --force-ipv4 \
+                -o "downloads/video_${counter}.%(ext)s" \
+                "$url"
+            }
 
             counter=$((counter+1))
           done < urls.txt
 
-      - name: Create archive
-        run: zip -r videos.zip downloads
+      - name: Create ZIP
+        run: |
+          zip -r videos.zip downloads
 
-      - name: Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: run-${{ github.run_number }}
+          name: "Video Batch ${{ github.run_number }}"
           files: videos.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
