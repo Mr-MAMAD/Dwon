@@ -7,193 +7,208 @@ on:
         description: 'Magnet links (one per line)'
         required: true
         type: string
-      split_size:
-        description: 'Split size (e.g., 1900M)'
-        required: false
-        default: '1900M'
-        type: string
+
       timeout:
-        description: 'Timeout minutes per magnet'
+        description: 'Download timeout per active magnet (minutes)'
         required: false
-        default: '15'
+        default: '60'
         type: string
-      connections:
-        description: 'Connections (1-16)'
+
+      peer_wait:
+        description: 'Wait for peers before skipping (seconds)'
         required: false
-        default: '8'
+        default: '180'
+        type: string
+
+      connections:
+        description: 'Connections'
+        required: false
+        default: '16'
         type: string
 
 jobs:
   download:
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
+
     timeout-minutes: 360
-    
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install aria2
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 curl
-      
-      - name: Download
+          sudo apt-get install -y -qq aria2 curl zip
+
+      - name: Download Magnets
         id: dl
         shell: bash
         run: |
           set +e
-          
+
           MAGNETS="${{ github.event.inputs.magnets }}"
-          SPLIT="${{ github.event.inputs.split_size }}"
           TIMEOUT_MIN="${{ github.event.inputs.timeout }}"
-          TIMEOUT_SEC=$((TIMEOUT_MIN * 60))
+          PEER_WAIT="${{ github.event.inputs.peer_wait }}"
           CONN="${{ github.event.inputs.connections }}"
-          
+
+          mkdir -p downloads
+          mkdir -p release
+
           SUCCESS=0
-          TOTAL=0
           INDEX=0
+          TOTAL=0
           FAILED=""
-          
-          mkdir -p downloads splitted
-          
+
           while IFS= read -r magnet; do
+
             magnet=$(echo "$magnet" | xargs)
+
             [ -z "$magnet" ] && continue
-            
-            INDEX=$((INDEX + 1))
-            
-            echo "=========================================="
-            echo "[$INDEX] Downloading..."
-            echo "=========================================="
-            
-            FILENAME=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys,urllib.parse;print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
-            [ -z "$FILENAME" ] && FILENAME="download_${INDEX}.mp4"
-            
-            CLEAN=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
-            BASE="${CLEAN%.*}"
-            
-            echo "File: $CLEAN"
-            echo "Timeout: ${TIMEOUT_MIN}min"
+
+            INDEX=$((INDEX+1))
+
             echo ""
-            
-            aria2c "$magnet" \
-              -d downloads \
-              -o "$CLEAN" \
+            echo "===================================="
+            echo "MAGNET #$INDEX"
+            echo "===================================="
+
+            touch "/tmp/log_${INDEX}.txt"
+
+            BEFORE=$(mktemp)
+            find downloads -type f > "$BEFORE"
+
+            timeout "${PEER_WAIT}" aria2c \
+              "$magnet" \
+              --dir=downloads \
               --seed-time=0 \
-              --bt-max-peers=100 \
+              --bt-max-peers=200 \
               --split="$CONN" \
               --enable-dht=true \
+              --enable-peer-exchange=true \
               --bt-stop-timeout=120 \
-              --timeout=60 \
               --max-tries=0 \
+              --summary-interval=10 \
               --console-log-level=notice \
-              --summary-interval=15 \
-              2>&1 | tee "/tmp/log_${INDEX}.txt" &
-            
-            PID=$!
-            START=$(date +%s)
-            LAST=0
-            STUCK=0
-            
-            while kill -0 $PID 2>/dev/null; do
-              NOW=$(date +%s)
-              ELAPSED=$((NOW - START))
-              
-              if [ "$ELAPSED" -gt "$TIMEOUT_SEC" ]; then
-                echo "Timeout!"
-                kill -9 $PID 2>/dev/null
-                break
-              fi
-              
-              if [ -f "downloads/$CLEAN" ]; then
-                SIZE=$(stat -c%s "downloads/$CLEAN" 2>/dev/null || echo 0)
-                if [ "$SIZE" -eq "$LAST" ] && [ "$ELAPSED" -gt 120 ] && [ "$SIZE" -gt 0 ]; then
-                  STUCK=$((STUCK + 1))
-                  [ "$STUCK" -gt 12 ] && { echo "Stuck!"; kill -9 $PID 2>/dev/null; break; }
-                else
-                  STUCK=0
-                fi
-                LAST=$SIZE
-              fi
-              
-              sleep 10
-            done
-            
-            wait $PID 2>/dev/null
-            
-            FILE="downloads/$CLEAN"
-            [ ! -f "$FILE" ] && FILE=$(find downloads -newer "/tmp/log_${INDEX}.txt" -size +100k 2>/dev/null | head -1)
-            
-            if [ -f "$FILE" ]; then
-              SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
-              
-              if [ "$SIZE" -gt 102400 ]; then
-                echo "✅ $(basename "$FILE") ($(numfmt --to=iec $SIZE))"
-                
-                if [ "$SIZE" -gt 2147483648 ]; then
-                  echo "Splitting..."
-                  DIR="splitted/${BASE}"
-                  mkdir -p "$DIR"
-                  split -d -b "$SPLIT" "$FILE" "${DIR}/${BASE}.part"
-                  md5sum "$FILE" > "$DIR/checksum.md5"
-                  
-                  cat > "$DIR/README.md" << EOF
-File: $CLEAN
-Size: $(numfmt --to=iec $SIZE)
-Parts: $(ls "$DIR"/*.part* | wc -l)
+              2>&1 | tee "/tmp/log_${INDEX}.txt"
 
-Join: cat part* > $CLEAN
-Verify: md5sum -c checksum.md5
-EOF
-                  rm -f "$FILE"
-                else
-                  cp "$FILE" "splitted/$CLEAN"
-                fi
-                
-                SUCCESS=$((SUCCESS + 1))
-                TOTAL=$((TOTAL + SIZE))
-              else
-                echo "❌ Too small: $SIZE bytes"
-                rm -f "$FILE"
-                FAILED="$FAILED\n- $CLEAN (${SIZE} bytes)"
-              fi
-            else
-              echo "❌ No seeders"
-              FAILED="$FAILED\n- $CLEAN (no seeders)"
+            AFTER=$(mktemp)
+            find downloads -type f > "$AFTER"
+
+            NEWFILE=$(
+              comm -13 "$BEFORE" "$AFTER" |
+              head -1
+            )
+
+            rm -f "$BEFORE" "$AFTER"
+
+            if [ -z "$NEWFILE" ]; then
+
+              echo "No metadata / peers found."
+              FAILED="${FAILED}\n- Magnet #${INDEX} (no peers)"
+
+              pkill aria2c || true
+
+              continue
+
             fi
-            
-            echo ""
+
+            echo "Peers detected. Starting full download..."
+
+            timeout "${TIMEOUT_MIN}m" aria2c \
+              "$magnet" \
+              --dir=downloads \
+              --seed-time=0 \
+              --bt-max-peers=200 \
+              --split="$CONN" \
+              --enable-dht=true \
+              --enable-peer-exchange=true \
+              --bt-stop-timeout=300 \
+              --max-tries=0 \
+              --summary-interval=30 \
+              --console-log-level=notice \
+              2>&1 | tee -a "/tmp/log_${INDEX}.txt"
+
+            FILE=$(
+              find downloads -type f \
+                -printf '%s %p\n' |
+                sort -nr |
+                head -1 |
+                cut -d' ' -f2-
+            )
+
+            if [ -z "$FILE" ]; then
+
+              FAILED="${FAILED}\n- Magnet #${INDEX} (download failed)"
+              continue
+
+            fi
+
+            SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
+
+            if [ "$SIZE" -lt 1048576 ]; then
+
+              FAILED="${FAILED}\n- $(basename "$FILE") (too small)"
+              rm -f "$FILE"
+
+              continue
+
+            fi
+
+            NAME=$(basename "$FILE")
+
+            cp "$FILE" "release/$NAME"
+
+            SUCCESS=$((SUCCESS+1))
+            TOTAL=$((TOTAL+SIZE))
+
+            echo "Downloaded: $NAME"
+            echo "Size: $(numfmt --to=iec "$SIZE")"
+
           done <<< "$MAGNETS"
-          
-          echo "SUCCESS=$SUCCESS" >> $GITHUB_OUTPUT
-          
+
+          echo "SUCCESS=$SUCCESS" >> "$GITHUB_OUTPUT"
+
           {
-            echo "# Report"
-            echo ""
+            echo "# Download Report"
+            echo
             echo "| Item | Value |"
             echo "|------|-------|"
-            echo "| Success | $SUCCESS/$INDEX |"
-            echo "| Size | $(numfmt --to=iec $TOTAL) |"
-            echo ""
-            
-            [ $SUCCESS -gt 0 ] && echo "## Files" && ls -lh splitted/
-            [ -n "$FAILED" ] && echo -e "\n## Failed\n$FAILED"
+            echo "| Successful | $SUCCESS/$INDEX |"
+            echo "| Total Size | $(numfmt --to=iec "$TOTAL") |"
+
+            if [ -n "$FAILED" ]; then
+              echo
+              echo "## Failed"
+              echo -e "$FAILED"
+            fi
+
           } > report.md
-          
-          [ "$SUCCESS" -eq 0 ] && exit 1
-      
-      - name: Release
+
+          if [ "$SUCCESS" -eq 0 ]; then
+            exit 1
+          fi
+
+      - name: Create Archive
+        if: steps.dl.outputs.SUCCESS != '0'
+        run: |
+          cd release
+          zip -r ../release.zip .
+          cd ..
+
+      - name: Create Release
         if: steps.dl.outputs.SUCCESS != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: dl-${{ github.run_number }}
-          files: splitted/**/*
+          files: release.zip
           body_path: report.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Logs
+
+      - name: Upload Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
