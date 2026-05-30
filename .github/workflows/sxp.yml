@@ -1,239 +1,186 @@
-name: sxp Download and Release
+name: sxp with Cookie Support
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'لینک‌های دانلود مستقیم (هر خط یک لینک)'
+        description: 'لینک‌های دانلود (هر خط یک لینک)'
         required: true
         type: string
+      cookies:
+        description: 'کوکی‌ها (مثلاً: session_id=abc; token=xyz)'
+        required: false
+        default: ''
+        type: string
+      referer:
+        description: 'رفرر (آدرس صفحه‌ای که لینک رو ازش گرفتی)'
+        required: false
+        default: ''
+        type: string
       connections:
-        description: 'تعداد اتصال موازی برای هر فایل (پیش‌فرض: 16)'
+        description: 'تعداد اتصال موازی (پیش‌فرض: 8)'
         required: false
-        default: '16'
-        type: string
-      custom_extension:
-        description: 'پسوند دلخواه برای فایل‌ها (مثلاً mp4) - خالی بذار تا از خود لینک تشخیص بده'
-        required: false
-        default: ''
-        type: string
-      custom_headers:
-        description: 'هدرهای اضافی (هر خط یک هدر، مثال: Referer: https://example.com)'
-        required: false
-        default: ''
+        default: '8'
         type: string
 
 jobs:
-  download-and-release:
+  download-with-cookie:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install aria2
+      - name: Install aria2 and curl
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2
-          echo "📦 نسخه aria2:"
-          aria2c --version | head -1
+          sudo apt-get install -y -qq aria2 curl
 
       - name: Create downloads directory
         run: mkdir -p downloads
 
-      - name: Download files directly with aria2
+      - name: Download files
         id: download
         run: |
-          # تبدیل لینک‌ها به آرایه (هر خط یک لینک)
           mapfile -t URL_ARRAY <<< "${{ github.event.inputs.urls }}"
           
+          COOKIES="${{ github.event.inputs.cookies }}"
+          REFERER="${{ github.event.inputs.referer }}"
           CONNECTIONS="${{ github.event.inputs.connections }}"
-          CUSTOM_EXT="${{ github.event.inputs.custom_extension }}"
-          CUSTOM_HEADERS="${{ github.event.inputs.custom_headers }}"
           
-          # ساخت آرایه هدرها برای aria2
-          HEADER_ARGS=()
+          SUCCESS_COUNT=0
+          FAILED_LIST=""
+          TOTAL_SIZE=0
           
-          # هدرهای پیش‌فرض
-          HEADER_ARGS+=(--header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-          HEADER_ARGS+=(--header="Accept: */*")
-          HEADER_ARGS+=(--header="Accept-Language: en-US,en;q=0.9")
-          HEADER_ARGS+=(--header="Accept-Encoding: gzip, deflate, br")
-          HEADER_ARGS+=(--header="Connection: keep-alive")
-          
-          # اضافه کردن هدرهای سفارشی
-          if [ -n "$CUSTOM_HEADERS" ]; then
-            echo "➕ هدرهای سفارشی:"
-            while IFS= read -r header; do
-              header=$(echo "$header" | xargs)
-              if [ -n "$header" ]; then
-                echo "   $header"
-                HEADER_ARGS+=(--header="$header")
-              fi
-            done <<< "$CUSTOM_HEADERS"
-          fi
-          
-          echo ""
-          echo "📋 هدرهای نهایی:"
-          for header_arg in "${HEADER_ARGS[@]}"; do
-            echo "   $header_arg"
-          done
-          
-          # فایل لیست aria2
-          ARIA_LIST="/tmp/aria_list.txt"
-          > "$ARIA_LIST"
-          
-          SUCCESS_EXPECTED=0
-          declare -a EXPECTED_FILES=()
-          
-          INDEX=0
           for url in "${URL_ARRAY[@]}"; do
             url=$(echo "$url" | xargs)
             if [ -z "$url" ]; then
               continue
             fi
             
-            echo "----------------------------------------"
-            echo "🔗 [$((INDEX+1))] پردازش لینک: ${url:0:100}..."
+            echo "=========================================="
+            echo "🔗 دانلود: ${url:0:100}..."
+            echo "=========================================="
             
-            # استخراج نام فایل از URL
-            raw_name=$(basename "$url" | cut -d'?' -f1 | cut -d'#' -f1)
+            # استخراج نام فایل
+            filename=$(basename "$url" | cut -d'?' -f1 | cut -d'#' -f1 | sed 's/[^a-zA-Z0-9._-]/_/g')
             
-            # اگر پسوند سفارشی داده شده
-            if [ -n "$CUSTOM_EXT" ]; then
-              ext="$CUSTOM_EXT"
-              # حذف نقطه از ابتدای پسوند اگر داره
-              ext="${ext#.}"
-              base_name="${raw_name%.*}"
-              if [ -z "$base_name" ] || [ "$base_name" = "$raw_name" ]; then
-                filename="${raw_name}.${ext}"
-              else
-                filename="${base_name}.${ext}"
-              fi
-            else
-              # استفاده از نام فایل اصلی
-              filename="$raw_name"
-              
-              # اگه پسوند نداره، mp4 پیش‌فرض بذار
-              if ! echo "$filename" | grep -qE '\.[a-zA-Z0-9]{2,5}$'; then
-                filename="${filename}.mp4"
-              fi
-            fi
-            
-            # تمیز کردن نام فایل
-            filename=$(echo "$filename" | sed 's/[^a-zA-Z0-9._-]/_/g')
-            
-            # اگه اسم فایل خیلی کوتاهه یا خالیه
             if [ -z "$filename" ] || [ ${#filename} -lt 5 ]; then
-              filename="download_$(date +%s%N | sha256sum | head -c 8).${ext:-mp4}"
+              filename="download_$(date +%s%N | sha256sum | head -c 8).mp4"
             fi
             
             # جلوگیری از overwrite
-            original_name="$filename"
+            original="$filename"
             counter=1
-            while [ -f "downloads/$filename" ] || [[ " ${EXPECTED_FILES[*]} " =~ " ${filename} " ]]; do
-              base="${original_name%.*}"
-              extension="${original_name##*.}"
-              filename="${base}_${counter}.${extension}"
+            while [ -f "downloads/$filename" ]; do
+              base="${original%.*}"
+              ext="${original##*.}"
+              filename="${base}_${counter}.${ext}"
               counter=$((counter + 1))
             done
             
             echo "📁 نام فایل: $filename"
             
-            # اضافه کردن به لیست aria2
-            echo "$url" >> "$ARIA_LIST"
-            echo "  out=downloads/$filename" >> "$ARIA_LIST"
+            # ساخت هدرها
+            HEADER_OPTS=(
+              --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+              --header="Accept: */*"
+              --header="Accept-Language: en-US,en;q=0.9"
+              --header="Accept-Encoding: identity;q=1, *;q=0"
+              --header="Connection: keep-alive"
+              --header="Cache-Control: no-cache"
+              --header="Pragma: no-cache"
+              --header="Sec-Fetch-Dest: video"
+              --header="Sec-Fetch-Mode: no-cors"
+              --header="Sec-Fetch-Site: cross-site"
+            )
             
-            EXPECTED_FILES+=("$filename")
-            SUCCESS_EXPECTED=$((SUCCESS_EXPECTED + 1))
-            INDEX=$((INDEX + 1))
-          done
-          
-          if [ "$SUCCESS_EXPECTED" -eq 0 ]; then
-            echo "❌ هیچ لینک معتبری وارد نشده!"
-            exit 1
-          fi
-          
-          echo ""
-          echo "=========================================="
-          echo "📥 شروع دانلود $SUCCESS_EXPECTED فایل"
-          echo "🔌 اتصالات موازی هر فایل: $CONNECTIONS"
-          echo "=========================================="
-          echo ""
-          
-          # دانلود با aria2 (استفاده از --header به جای --header-file)
-          aria2c \
-            --input-file="$ARIA_LIST" \
-            --max-concurrent-downloads=5 \
-            --max-connection-per-server="$CONNECTIONS" \
-            --split="$CONNECTIONS" \
-            --min-split-size=1M \
-            --connect-timeout=30 \
-            --timeout=600 \
-            --max-tries=5 \
-            --retry-wait=3 \
-            --continue=true \
-            --allow-overwrite=false \
-            --auto-file-renaming=false \
-            "${HEADER_ARGS[@]}" \
-            --summary-interval=0 \
-            --console-log-level=notice \
-            --file-allocation=none \
-            --disk-cache=128M \
-            2>&1 | tee /tmp/aria2_output.log
-          
-          ARIA_EXIT=${PIPESTATUS[0]}
-          echo "ARIA_EXIT=$ARIA_EXIT" >> $GITHUB_OUTPUT
-          
-          # ذخیره لیست فایل‌های مورد انتظار
-          printf '%s\n' "${EXPECTED_FILES[@]}" > /tmp/expected_files.txt
-
-      - name: Verify downloads
-        id: verify
-        run: |
-          SUCCESS_COUNT=0
-          FAILED_LIST=""
-          DOWNLOADED_LIST=""
-          TOTAL_SIZE=0
-          
-          echo "=========================================="
-          echo "🔍 بررسی فایل‌های دانلود شده:"
-          echo "=========================================="
-          
-          # بررسی فایل‌هایی که باید دانلود می‌شدن
-          while IFS= read -r expected_file; do
-            if [ -f "downloads/$expected_file" ]; then
-              size=$(stat -c%s "downloads/$expected_file" 2>/dev/null || echo 0)
-              if [ "$size" -gt 10240 ]; then
-                HUMAN_SIZE=$(numfmt --to=iec $size)
-                echo "✅ $expected_file ($HUMAN_SIZE)"
+            # اضافه کردن رفرر
+            if [ -n "$REFERER" ]; then
+              echo "🔗 رفرر: $REFERER"
+              HEADER_OPTS+=(--referer="$REFERER")
+              HEADER_OPTS+=(--header="Referer: $REFERER")
+            else
+              # رفرر خودکار
+              DOMAIN=$(echo "$url" | grep -oP '^https?://[^/]+')
+              HEADER_OPTS+=(--referer="$DOMAIN/")
+            fi
+            
+            # اضافه کردن کوکی
+            if [ -n "$COOKIES" ]; then
+              echo "🍪 کوکی: ${COOKIES:0:50}..."
+              HEADER_OPTS+=(--header="Cookie: $COOKIES")
+            fi
+            
+            echo "🚀 شروع دانلود با $CONNECTIONS اتصال..."
+            
+            # دانلود با aria2
+            aria2c \
+              "$url" \
+              --out="downloads/$filename" \
+              --max-connection-per-server="$CONNECTIONS" \
+              --split="$CONNECTIONS" \
+              --min-split-size=1M \
+              --connect-timeout=30 \
+              --timeout=600 \
+              --max-tries=3 \
+              --retry-wait=5 \
+              --continue=true \
+              --allow-overwrite=false \
+              --auto-file-renaming=false \
+              --file-allocation=none \
+              --disk-cache=64M \
+              --summary-interval=5 \
+              --console-log-level=notice \
+              "${HEADER_OPTS[@]}" \
+              2>&1 | tee "/tmp/aria2_$counter.log"
+            
+            ARIA_EXIT=${PIPESTATUS[0]}
+            
+            # اگر aria2 ناموفق بود، با curl امتحان کن
+            if [ $ARIA_EXIT -ne 0 ] || [ ! -f "downloads/$filename" ] || [ $(stat -c%s "downloads/$filename" 2>/dev/null || echo 0) -lt 10240 ]; then
+              echo "⚠️ aria2 ناموفق - تلاش با curl..."
+              
+              CURL_HEADERS=(
+                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                -H "Accept: */*"
+                -H "Connection: keep-alive"
+              )
+              
+              [ -n "$REFERER" ] && CURL_HEADERS+=(-H "Referer: $REFERER") && CURL_HEADERS+=(--referer "$REFERER")
+              [ -n "$COOKIES" ] && CURL_HEADERS+=(-H "Cookie: $COOKIES")
+              
+              curl -L \
+                "${CURL_HEADERS[@]}" \
+                --connect-timeout 30 \
+                --max-time 600 \
+                -o "downloads/$filename" \
+                "$url" 2>&1 | tail -5
+              
+              CURL_EXIT=$?
+            fi
+            
+            # بررسی نتیجه
+            if [ -f "downloads/$filename" ]; then
+              SIZE=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
+              if [ "$SIZE" -gt 10240 ]; then
+                echo "✅ موفق: $filename ($(numfmt --to=iec $SIZE))"
                 SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-                TOTAL_SIZE=$((TOTAL_SIZE + size))
-                DOWNLOADED_LIST="$DOWNLOADED_LIST,$expected_file"
+                TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
               else
-                echo "⚠️ $expected_file - حجم کم (${size} بایت) - احتمالاً خراب"
-                rm -f "downloads/$expected_file"
-                FAILED_LIST="$FAILED_LIST\n- $expected_file (حجم: ${size} بایت - فایل خراب)"
+                echo "❌ حجم کم: ${SIZE} بایت - حذف"
+                cat "downloads/$filename" 2>/dev/null | head -c 200
+                rm -f "downloads/$filename"
+                FAILED_LIST="$FAILED_LIST\n- $url (حجم غیرعادی: ${SIZE} بایت)"
               fi
             else
-              echo "❌ $expected_file - دانلود نشد"
-              FAILED_LIST="$FAILED_LIST\n- $expected_file (فایل وجود ندارد)"
+              echo "❌ دانلود نشد"
+              FAILED_LIST="$FAILED_LIST\n- $url (فایل ایجاد نشد)"
             fi
-          done < /tmp/expected_files.txt
-          
-          # نمایش فایل‌های اضافی (اگه باشه)
-          for file in downloads/*; do
-            if [ -f "$file" ]; then
-              fname=$(basename "$file")
-              if ! grep -q "^$fname$" /tmp/expected_files.txt 2>/dev/null; then
-                size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-                if [ "$size" -gt 10240 ]; then
-                  echo "ℹ️ فایل اضافی: $fname ($(numfmt --to=iec $size))"
-                fi
-              fi
-            fi
+            
+            echo ""
           done
           
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
@@ -241,87 +188,56 @@ jobs:
           
           # ایجاد گزارش
           {
-            echo "# 📊 گزارش دانلود مستقیم"
+            echo "# 📊 گزارش دانلود با کوکی"
             echo ""
-            echo "**تاریخ:** $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "**زمان:** $(date '+%Y-%m-%d %H:%M:%S')"
             echo ""
-            echo "**اتصالات موازی:** ${{ github.event.inputs.connections }}"
-            echo ""
-            echo "| مورد | تعداد |"
+            echo "| مورد | مقدار |"
             echo "|------|-------|"
-            echo "| کل لینک‌ها | $SUCCESS_EXPECTED |"
             echo "| دانلود موفق | $SUCCESS_COUNT |"
-            echo "| ناموفق | $((SUCCESS_EXPECTED - SUCCESS_COUNT)) |"
             echo "| حجم کل | $(numfmt --to=iec $TOTAL_SIZE) |"
+            echo "| رفرر | ${REFERER:-خودکار} |"
+            echo "| کوکی | $([ -n "$COOKIES" ] && echo "✅ تنظیم شده" || echo "❌ وارد نشده") |"
             echo ""
             
             if [ $SUCCESS_COUNT -gt 0 ]; then
-              echo "## ✅ فایل‌های دانلود شده"
+              echo "## ✅ فایل‌ها"
               echo ""
-              echo "| # | نام فایل | حجم |"
-              echo "|---|----------|-----|"
-              counter=1
-              for file in downloads/*; do
-                if [ -f "$file" ]; then
-                  fname=$(basename "$file")
-                  fsize=$(stat -c%s "$file")
-                  echo "| $counter | \`$fname\` | $(numfmt --to=iec $fsize) |"
-                  counter=$((counter + 1))
-                fi
+              for f in downloads/*; do
+                [ -f "$f" ] && echo "- 📁 \`$(basename "$f")\` ($(numfmt --to=iec $(stat -c%s "$f")))"
               done
-              echo ""
             fi
             
             if [ -n "$FAILED_LIST" ]; then
-              echo "## ❌ دانلودهای ناموفق"
               echo ""
+              echo "## ❌ خطاها"
               echo -e "$FAILED_LIST"
-              echo ""
             fi
-            
-            echo "## ⚙️ تنظیمات"
-            echo ""
-            echo "- **حداکثر اتصال:** ${{ github.event.inputs.connections }}"
-            echo "- **پسوند سفارشی:** $([ -n "${{ github.event.inputs.custom_extension }}" ] && echo "${{ github.event.inputs.custom_extension }}" || echo "تشخیص خودکار")"
-            echo ""
-            echo "---"
-            echo "*دانلود مستقیم با aria2*"
           } > download_report.md
           
-          echo ""
-          echo "=========================================="
-          echo "📈 خلاصه: $SUCCESS_COUNT از $SUCCESS_EXPECTED دانلود موفق"
-          echo "💾 حجم کل: $(numfmt --to=iec $TOTAL_SIZE)"
-          echo "=========================================="
-          
           if [ "$SUCCESS_COUNT" -eq 0 ]; then
-            echo "❌ هیچ فایلی با موفقیت دانلود نشد!"
+            echo "❌ هیچ فایلی دانلود نشد!"
             exit 1
           fi
 
-      - name: Show downloads
-        run: |
-          echo "📁 محتویات پوشه downloads:"
-          du -sh downloads/ 2>/dev/null || echo "خالی"
-          ls -lh downloads/ 2>/dev/null || echo "بدون فایل"
-
       - name: Create Release
-        if: steps.verify.outputs.SUCCESS_COUNT != '0'
+        if: steps.download.outputs.SUCCESS_COUNT != '0'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: direct-release-${{ github.run_number }}-${{ github.run_attempt }}
-          name: 📥 Direct Download Release #${{ github.run_number }}
+          tag_name: cookie-download-${{ github.run_number }}
+          name: 🍪 Download with Cookie #${{ github.run_number }}
           body_path: download_report.md
           files: |
             downloads/*
-          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload Report
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: direct-download-report-${{ github.run_number }}
-          path: download_report.md
-          retention-days: 7
+          name: cookie-download-logs-${{ github.run_number }}
+          path: |
+            /tmp/aria2_*.log
+            download_report.md
+          retention-days: 3
