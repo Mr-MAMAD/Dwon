@@ -1,4 +1,4 @@
-name: Video Downloader
+name: Video Downloader Pro
 
 on:
   workflow_dispatch:
@@ -13,131 +13,183 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    
     steps:
       - name: Setup
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq curl wget jq
-          mkdir -p downloads
+          mkdir -p downloads debug
 
       - name: Download
+        id: dl
         shell: bash
         run: |
           set +e
+          success=0
+          total=0
+          report=""
           
-          echo "${{ github.event.inputs.urls }}" | while IFS= read -r url; do
+          while IFS= read -r url; do
             url=$(echo "$url" | xargs)
             [ -z "$url" ] && continue
+            total=$((total+1))
             
             echo "=========================================="
             echo "Processing: $url"
             echo "=========================================="
             
+            # Fetch page with proper headers
+            PAGE=$(curl -s -L "$url" \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+              -H "Accept-Language: en-US,en;q=0.5" \
+              -H "Referer: $url")
+            
+            # Save page for debugging
+            echo "$PAGE" > "debug/page_${total}.html"
+            
+            VIDEO_URL=""
+            FILENAME=""
+            
+            # === vidara.so specific ===
             if echo "$url" | grep -q "vidara.so"; then
               echo "Site: vidara.so"
               
-              PAGE=$(curl -s -L "$url" \
-                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                -H "Referer: https://vidara.so/")
+              # Method 1: Look for JSON data with video info
+              VIDEO_URL=$(echo "$PAGE" | grep -oP '"[^"]*(?:mp4|m3u8)[^"]*"' | head -1 | tr -d '"')
               
-              # Extract video source
-              VIDEO_URL=$(echo "$PAGE" | grep -oP 'src="https?://[^"]*(?:mp4|m3u8)[^"]*"' | head -1 | grep -oP 'src="\K[^"]*')
-              [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$PAGE" | grep -oP "source src='([^']*)'" | head -1 | grep -oP "'\K[^']*")
-              [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$PAGE" | grep -oP 'https?://[^"'"'"'<>]*\.(mp4|m3u8)[^"'"'"'<>]*' | head -1)
-              
+              # Method 2: iframe source
               if [ -z "$VIDEO_URL" ]; then
-                echo "Trying to extract from script..."
-                VIDEO_URL=$(echo "$PAGE" | grep -oP 'file:\s*"([^"]*)"' | head -1 | grep -oP '"([^"]*)"' | tr -d '"')
+                IFRAME=$(echo "$PAGE" | grep -oP 'iframe[^>]+src="([^"]+)"' | head -1 | grep -oP 'src="\K[^"]+')
+                if [ -n "$IFRAME" ]; then
+                  echo "Found iframe: $IFRAME"
+                  IFRAME_PAGE=$(curl -s -L "$IFRAME" \
+                    -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                    -H "Referer: $url")
+                  VIDEO_URL=$(echo "$IFRAME_PAGE" | grep -oP '"(https?://[^"]*(?:mp4|m3u8)[^"]*)"' | head -1 | tr -d '"')
+                  [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$IFRAME_PAGE" | grep -oP 'file:\s*"([^"]+)"' | head -1 | sed 's/file:\s*"//;s/"//')
+                fi
               fi
               
-              [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$PAGE" | grep -oP 'videoUrl["\s:=]+["\s]*([^"'\''\s]+)' | head -1 | grep -oP '["\s]*\K[^"'\''\s]+' | tail -1)
+              # Method 3: JavaScript variables
+              if [ -z "$VIDEO_URL" ]; then
+                VIDEO_URL=$(echo "$PAGE" | grep -oP 'var\s+videoUrl\s*=\s*"([^"]+)"' | head -1 | sed 's/.*"\(.*\)".*/\1/')
+                [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$PAGE" | grep -oP 'video_url["\s:=]+["\s]+([^"'\''\s]+)' | head -1 | grep -oP '["\s]+\K[^"'\''\s]+' | tail -1)
+              fi
               
-              NAME=$(echo "$url" | grep -oP '/v/\K[^?]+' | head -1)
-              [ -z "$NAME" ] && NAME="vidara_$(date +%s)"
-              FILENAME="${NAME}.mp4"
+              # Method 4: video/source tags
+              if [ -z "$VIDEO_URL" ]; then
+                VIDEO_URL=$(echo "$PAGE" | grep -oP '<video[^>]+src="([^"]+)"' | head -1 | grep -oP 'src="\K[^"]+')
+                [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$PAGE" | grep -oP '<source[^>]+src="([^"]+)"' | head -1 | grep -oP 'src="\K[^"]+')
+              fi
               
+              # Method 5: data attributes
+              if [ -z "$VIDEO_URL" ]; then
+                VIDEO_URL=$(echo "$PAGE" | grep -oP 'data-file="([^"]+)"' | head -1 | grep -oP 'data-file="\K[^"]+')
+              fi
+              
+              ID=$(echo "$url" | grep -oP '/v/\K[^?/]+' | head -1)
+              [ -z "$ID" ] && ID="vidara_${total}"
+              FILENAME="${ID}.mp4"
+              
+            # === playmogo.com specific ===
             elif echo "$url" | grep -q "playmogo.com"; then
               echo "Site: playmogo.com"
               
-              PAGE=$(curl -s -L "$url" \
-                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                -H "Referer: https://playmogo.com/")
+              # Similar extraction methods
+              VIDEO_URL=$(echo "$PAGE" | grep -oP '"(https?://[^"]*(?:mp4|m3u8)[^"]*)"' | head -1 | tr -d '"')
               
-              # Extract video source
-              VIDEO_URL=$(echo "$PAGE" | grep -oP 'src="https?://[^"]*(?:mp4|m3u8)[^"]*"' | head -1 | grep -oP 'src="\K[^"]*')
-              [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$PAGE" | grep -oP "source src='([^']*)'" | head -1 | grep -oP "'\K[^']*")
-              [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$PAGE" | grep -oP 'https?://[^"'"'"'<>]*\.(mp4|m3u8)[^"'"'"'<>]*' | head -1)
-              [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$PAGE" | grep -oP 'file:\s*"([^"]*)"' | head -1 | grep -oP '"([^"]*)"' | tr -d '"')
+              if [ -z "$VIDEO_URL" ]; then
+                IFRAME=$(echo "$PAGE" | grep -oP 'iframe[^>]+src="([^"]+)"' | head -1 | grep -oP 'src="\K[^"]+')
+                if [ -n "$IFRAME" ]; then
+                  IFRAME_PAGE=$(curl -s -L "$IFRAME" \
+                    -H "User-Agent: Mozilla/5.0" \
+                    -H "Referer: $url")
+                  VIDEO_URL=$(echo "$IFRAME_PAGE" | grep -oP '"(https?://[^"]*(?:mp4|m3u8)[^"]*)"' | head -1 | tr -d '"')
+                fi
+              fi
               
-              NAME=$(echo "$url" | grep -oP '/d/\K[^?]+' | head -1)
-              [ -z "$NAME" ] && NAME="playmogo_$(date +%s)"
-              FILENAME="${NAME}.mp4"
+              [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$PAGE" | grep -oP 'file:\s*"([^"]+)"' | head -1 | sed 's/file:\s*"//;s/"//')
               
-            else
-              echo "Unknown site!"
-              continue
+              ID=$(echo "$url" | grep -oP '/d/\K[^?/]+' | head -1)
+              [ -z "$ID" ] && ID="playmogo_${total}"
+              FILENAME="${ID}.mp4"
+            fi
+            
+            # Fallback: any mp4/m3u8 link in the whole page
+            if [ -z "$VIDEO_URL" ]; then
+              echo "Trying generic extraction..."
+              VIDEO_URL=$(echo "$PAGE" | grep -oP 'https?://[^"'"'"'<> ]+\.(mp4|m3u8)[^"'"'"'<> ]*' | head -1)
             fi
             
             if [ -z "$VIDEO_URL" ]; then
-              echo "ERROR: Could not find video URL"
-              echo "Page snippet:"
-              echo "$PAGE" | grep -iE "video|source|mp4|m3u8|file" | head -20
+              echo "❌ Could not extract video URL!"
+              echo "Page saved to debug/page_${total}.html"
+              report="$report\n- $url (extraction failed)"
               continue
             fi
             
-            echo "Video URL: $VIDEO_URL"
+            echo "✅ Video URL: $VIDEO_URL"
             echo "Saving as: $FILENAME"
-            echo ""
-            echo "Downloading..."
             
-            if echo "$VIDEO_URL" | grep -q "\.m3u8"; then
-              # HLS stream - use ffmpeg
-              echo "HLS stream detected..."
-              ffmpeg -i "$VIDEO_URL" \
-                -c copy \
-                -bsf:a aac_adtstoasc \
-                "downloads/$FILENAME" 2>&1 || {
-                  # Fallback with curl
-                  curl -L "$VIDEO_URL" \
-                    -H "User-Agent: Mozilla/5.0" \
-                    -H "Referer: $url" \
-                    -o "downloads/${NAME}.m3u8" 2>&1
-                }
+            # Download
+            if [[ "$VIDEO_URL" == *.m3u8 ]]; then
+              echo "HLS stream - downloading with ffmpeg..."
+              sudo apt-get install -y -qq ffmpeg 2>/dev/null
+              ffmpeg -y -i "$VIDEO_URL" -c copy "downloads/$FILENAME" 2>&1 || {
+                curl -L "$VIDEO_URL" -o "downloads/${FILENAME}.m3u8"
+              }
             else
-              # Direct download
               curl -L "$VIDEO_URL" \
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
                 -H "Referer: $url" \
                 -o "downloads/$FILENAME" \
-                --progress-bar \
-                2>&1
+                --progress-bar 2>&1
             fi
             
             if [ -f "downloads/$FILENAME" ]; then
               SIZE=$(stat -c%s "downloads/$FILENAME" 2>/dev/null || echo 0)
               if [ "$SIZE" -gt 102400 ]; then
-                echo "SUCCESS: $FILENAME ($(numfmt --to=iec $SIZE))"
+                echo "✅ Downloaded: $FILENAME ($(numfmt --to=iec $SIZE))"
+                success=$((success+1))
+                report="$report\n- $url → $FILENAME ($(numfmt --to=iec $SIZE))"
               else
-                echo "FAILED: File too small ($SIZE bytes)"
+                echo "❌ File too small ($SIZE bytes)"
                 rm -f "downloads/$FILENAME"
+                report="$report\n- $url (download failed, size: $SIZE)"
               fi
+            else
+              echo "❌ Download failed"
+              report="$report\n- $url (download error)"
             fi
             
             echo ""
-            echo "Done!"
-            echo ""
-          done
+          done <<< "${{ github.event.inputs.urls }}"
           
-          echo ""
-          echo "=========================================="
-          echo "All downloads:"
-          ls -lh downloads/ 2>/dev/null || echo "No files"
-      
-      - name: Release
+          echo "success=$success" >> $GITHUB_OUTPUT
+          echo "total=$total" >> $GITHUB_OUTPUT
+          
+          # Write report
+          echo -e "## Download Report\n\n| Status | Count |\n|--------|-------|\n| Success | $success |\n| Total | $total |\n\n### Details\n$report" > report.md
+          if [ $success -eq 0 ]; then
+            echo "No files downloaded!"
+            exit 1
+          fi
+
+      - name: Upload debug HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-pages
+          path: debug/
+          retention-days: 3
+
+      - name: Create Release
+        if: steps.dl.outputs.success != '0'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: video-${{ github.run_number }}
+          tag_name: vid-${{ github.run_number }}
           files: downloads/*
+          body_path: report.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
