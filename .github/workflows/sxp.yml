@@ -1,4 +1,4 @@
-name: Video Downloader (v2)
+name: Video Downloader - Cloudflare Fixed
 
 on:
   workflow_dispatch:
@@ -18,12 +18,14 @@ jobs:
       - name: Setup
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq python3 python3-pip ffmpeg
-          # Force reinstall latest versions with full dependencies
-          pip3 install --upgrade --force-reinstall yt-dlp curl-cffi
+          sudo apt-get install -y -qq python3 python3-pip python3-dev build-essential ffmpeg
+          pip3 install --upgrade pip setuptools wheel
+          # Install curl_cffi with build deps (this is the key part)
+          pip3 install curl-cffi --verbose
+          # Now install yt-dlp (will detect curl_cffi)
+          pip3 install yt-dlp
           mkdir -p downloads
-          
-          # Debug: show available impersonation targets
+          echo "Available impersonation targets:"
           python3 -m yt_dlp --list-impersonate-targets
 
       - name: Download videos
@@ -42,12 +44,10 @@ jobs:
             echo "[$total] Downloading: $url"
             echo "=========================================="
             
-            # Try with impersonation (use generic 'chrome' instead of 'chrome:120')
+            # Use impersonation to bypass Cloudflare
             python3 -m yt_dlp \
               --no-playlist \
               --merge-output-format mp4 \
-              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              --extractor-args "generic:impersonate" \
               --impersonate chrome \
               -o "downloads/%(title)s.%(ext)s" \
               "$url" 2>&1 || {
@@ -56,7 +56,7 @@ jobs:
                 continue
               }
             
-            # Check downloaded file
+            # Verify downloaded file
             file=$(ls -t downloads/ | head -1)
             if [ -n "$file" ]; then
               size=$(stat -c%s "downloads/$file" 2>/dev/null || echo 0)
@@ -76,7 +76,6 @@ jobs:
           
           # Write report
           echo "## Download Report" > report.md
-          echo "" >> report.md
           echo "| Success | Total |" >> report.md
           echo "|---------|-------|" >> report.md
           echo "| $success | $total |" >> report.md
