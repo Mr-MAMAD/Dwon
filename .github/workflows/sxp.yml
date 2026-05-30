@@ -1,4 +1,4 @@
-name: sxp Direct Download and Release
+name: sxp Download and Release
 
 on:
   workflow_dispatch:
@@ -37,6 +37,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2
+          echo "📦 نسخه aria2:"
+          aria2c --version | head -1
 
       - name: Create downloads directory
         run: mkdir -p downloads
@@ -51,27 +53,33 @@ jobs:
           CUSTOM_EXT="${{ github.event.inputs.custom_extension }}"
           CUSTOM_HEADERS="${{ github.event.inputs.custom_headers }}"
           
-          # آماده‌سازی هدرهای اضافی
-          HEADER_FILE="/tmp/custom_headers.txt"
-          > "$HEADER_FILE"
+          # ساخت آرایه هدرها برای aria2
+          HEADER_ARGS=()
           
           # هدرهای پیش‌فرض
-          echo "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" >> "$HEADER_FILE"
-          echo "Accept: */*" >> "$HEADER_FILE"
-          echo "Accept-Language: en-US,en;q=0.9" >> "$HEADER_FILE"
-          echo "Accept-Encoding: gzip, deflate, br" >> "$HEADER_FILE"
-          echo "Connection: keep-alive" >> "$HEADER_FILE"
+          HEADER_ARGS+=(--header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+          HEADER_ARGS+=(--header="Accept: */*")
+          HEADER_ARGS+=(--header="Accept-Language: en-US,en;q=0.9")
+          HEADER_ARGS+=(--header="Accept-Encoding: gzip, deflate, br")
+          HEADER_ARGS+=(--header="Connection: keep-alive")
           
           # اضافه کردن هدرهای سفارشی
           if [ -n "$CUSTOM_HEADERS" ]; then
-            echo "➕ اضافه کردن هدرهای سفارشی:"
+            echo "➕ هدرهای سفارشی:"
             while IFS= read -r header; do
+              header=$(echo "$header" | xargs)
               if [ -n "$header" ]; then
                 echo "   $header"
-                echo "$header" >> "$HEADER_FILE"
+                HEADER_ARGS+=(--header="$header")
               fi
             done <<< "$CUSTOM_HEADERS"
           fi
+          
+          echo ""
+          echo "📋 هدرهای نهایی:"
+          for header_arg in "${HEADER_ARGS[@]}"; do
+            echo "   $header_arg"
+          done
           
           # فایل لیست aria2
           ARIA_LIST="/tmp/aria_list.txt"
@@ -152,12 +160,10 @@ jobs:
           echo "=========================================="
           echo "📥 شروع دانلود $SUCCESS_EXPECTED فایل"
           echo "🔌 اتصالات موازی هر فایل: $CONNECTIONS"
-          echo "📋 هدرهای تنظیم شده:"
-          cat "$HEADER_FILE" | grep -v "^$" | sed 's/^/   /'
           echo "=========================================="
           echo ""
           
-          # دانلود با aria2
+          # دانلود با aria2 (استفاده از --header به جای --header-file)
           aria2c \
             --input-file="$ARIA_LIST" \
             --max-concurrent-downloads=5 \
@@ -171,13 +177,11 @@ jobs:
             --continue=true \
             --allow-overwrite=false \
             --auto-file-renaming=false \
-            --header-file="$HEADER_FILE" \
+            "${HEADER_ARGS[@]}" \
             --summary-interval=0 \
             --console-log-level=notice \
             --file-allocation=none \
             --disk-cache=128M \
-            --max-overall-download-limit=0 \
-            --max-download-limit=0 \
             2>&1 | tee /tmp/aria2_output.log
           
           ARIA_EXIT=${PIPESTATUS[0]}
@@ -281,7 +285,7 @@ jobs:
             echo "- **پسوند سفارشی:** $([ -n "${{ github.event.inputs.custom_extension }}" ] && echo "${{ github.event.inputs.custom_extension }}" || echo "تشخیص خودکار")"
             echo ""
             echo "---"
-            echo "*دانلود مستقیم با aria2 - بدون نیاز به رزولوشن ریدایرکت*"
+            echo "*دانلود مستقیم با aria2*"
           } > download_report.md
           
           echo ""
