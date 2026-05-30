@@ -1,4 +1,4 @@
-name: Magnet Downloader
+name: Advanced Magnet Torrent Downloader
 
 on:
   workflow_dispatch:
@@ -6,6 +6,26 @@ on:
       magnets:
         description: 'Magnet links (one per line)'
         required: true
+        type: string
+      split_size:
+        description: 'Split size for large files (e.g., 1900M, 1G)'
+        required: false
+        default: '1900M'
+        type: string
+      timeout_minutes:
+        description: 'Max wait time per magnet (minutes)'
+        required: false
+        default: '15'
+        type: string
+      max_connections:
+        description: 'Max connections per file (1-16)'
+        required: false
+        default: '8'
+        type: string
+      custom_trackers:
+        description: 'Additional trackers (one per line, optional)'
+        required: false
+        default: ''
         type: string
 
 jobs:
@@ -18,39 +38,374 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install aria2
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq aria2
-      
-      - name: Download
+      - name: Install tools
         run: |
-          mkdir -p downloads
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl p7zip-full
+
+      - name: Download torrents
+        id: download
+        shell: bash
+        run: |
+          set +e
           
-          echo "${{ github.event.inputs.magnets }}" | while IFS= read -r magnet; do
+          MAGNETS="${{ github.event.inputs.magnets }}"
+          SPLIT_SIZE="${{ github.event.inputs.split_size }}"
+          TIMEOUT_MINUTES="${{ github.event.inputs.timeout_minutes }}"
+          TIMEOUT_SECONDS=$((TIMEOUT_MINUTES * 60))
+          MAX_CONN="${{ github.event.inputs.max_connections }}"
+          CUSTOM_TRACKERS="${{ github.event.inputs.custom_trackers }}"
+          
+          SUCCESS=0
+          FAILED=""
+          TOTAL_SIZE=0
+          INDEX=0
+          
+          mkdir -p downloads splitted
+          
+          # Build tracker list
+          TRACKER_LIST="/tmp/trackers.txt"
+          cat > "$TRACKER_LIST" << 'EOF'
+          udp://tracker.opentrackr.org:1337/announce
+          udp://tracker.torrent.eu.org:451/announce
+          udp://tracker.moeking.me:6969/announce
+          udp://tracker.bitsearch.to:1337/announce
+          udp://tracker.tiny-vps.com:6969/announce
+          udp://tracker.coppersurfer.tk:6969/announce
+          udp://open.stealth.si:80/announce
+          udp://p4p.arenabg.com:1337/announce
+          udp://explodie.org:6969/announce
+          udp://tracker.dler.org:6969/announce
+          udp://9.rarbg.me:2970/announce
+          udp://9.rarbg.to:2840/announce
+          http://tracker.opentrackr.org:1337/announce
+          http://tracker.torrent.eu.org:451/announce
+          EOF
+          
+          # Add custom trackers
+          if [ -n "$CUSTOM_TRACKERS" ]; then
+            echo "Adding custom trackers..."
+            echo "$CUSTOM_TRACKERS" >> "$TRACKER_LIST"
+          fi
+          
+          TRACKER_COUNT=$(wc -l < "$TRACKER_LIST")
+          echo "Using $TRACKER_COUNT trackers"
+          echo ""
+          
+          while IFS= read -r magnet; do
+            magnet=$(echo "$magnet" | xargs)
             [ -z "$magnet" ] && continue
             
-            echo "Downloading: ${magnet:0:80}..."
+            INDEX=$((INDEX + 1))
             
+            echo "=========================================="
+            echo "[$INDEX] ${magnet:0:80}..."
+            echo "=========================================="
+            
+            # Extract filename
+            FILENAME=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "
+import sys, urllib.parse
+try:
+    print(urllib.parse.unquote(sys.stdin.read().strip()))
+except:
+    print('')
+" 2>/dev/null)
+            
+            if [ -z "$FILENAME" ]; then
+              HASH=$(echo "$magnet" | grep -oP 'btih:\K[^&]+' 2>/dev/null)
+              FILENAME="torrent_${HASH:0:10}.mp4"
+            fi
+            
+            CLEAN_NAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__\+/_/g')
+            BASE_NAME="${CLEAN_NAME%.*}"
+            
+            echo "📁 $CLEAN_NAME"
+            echo "⏱️ Timeout: ${TIMEOUT_MINUTES}min"
+            echo "🔌 Connections: $MAX_CONN"
+            echo "📡 Trackers: $TRACKER_COUNT"
+            echo ""
+            echo "Starting download..."
+            
+            # Download with aria2
             aria2c \
               "$magnet" \
-              --dir=downloads \
+              --dir="downloads" \
+              --out="$CLEAN_NAME" \
               --seed-time=0 \
               --max-upload-limit=10K \
-              --bt-max-peers=50 \
-              --split=8 \
+              --max-overall-upload-limit=50K \
+              --bt-max-peers=100 \
+              --bt-request-peer-speed-limit=100M \
+              --max-concurrent-downloads=5 \
+              --max-connection-per-server="$MAX_CONN" \
+              --split="$MAX_CONN" \
+              --min-split-size=1M \
+              --connect-timeout=30 \
+              --timeout=60 \
+              --max-tries=0 \
+              --retry-wait=5 \
+              --continue=true \
+              --allow-overwrite=false \
+              --auto-file-renaming=false \
+              --file-allocation=none \
+              --disk-cache=256M \
+              --summary-interval=15 \
+              --console-log-level=notice \
               --enable-dht=true \
-              --bt-stop-timeout=300 \
-              --timeout=300 \
-              2>&1 || echo "Failed, moving to next..."
+              --enable-dht6=false \
+              --enable-peer-exchange=true \
+              --bt-enable-lpd=true \
+              --bt-tracker-connect-timeout=10 \
+              --bt-tracker-timeout=10 \
+              --bt-stop-timeout=120 \
+              --dht-entry-point="dht.transmissionbt.com:6881" \
+              --dht-entry-point="router.bittorrent.com:6881" \
+              2>&1 | tee "/tmp/aria2_${INDEX}.log" &
             
-            echo "Done, next..."
-          done
+            ARIA_PID=$!
+            
+            # Monitor with timeout
+            START_TIME=$(date +%s)
+            LAST_SIZE=0
+            STUCK_COUNT=0
+            DOWNLOAD_STARTED=0
+            
+            while kill -0 $ARIA_PID 2>/dev/null; do
+              CURRENT_TIME=$(date +%s)
+              ELAPSED=$((CURRENT_TIME - START_TIME))
+              
+              # Check timeout
+              if [ "$ELAPSED" -gt "$TIMEOUT_SECONDS" ]; then
+                echo ""
+                echo "⏰ Timeout after ${TIMEOUT_MINUTES} minutes"
+                
+                if [ -f "downloads/$CLEAN_NAME" ]; then
+                  SIZE=$(stat -c%s "downloads/$CLEAN_NAME" 2>/dev/null || echo 0)
+                  if [ "$SIZE" -gt 1048576 ]; then
+                    echo "⚠️ Partial: $(numfmt --to=iec $SIZE)"
+                    DOWNLOAD_STARTED=1
+                  else
+                    echo "❌ No data"
+                    rm -f "downloads/$CLEAN_NAME"
+                  fi
+                fi
+                
+                kill -9 $ARIA_PID 2>/dev/null
+                break
+              fi
+              
+              # Check stuck
+              if [ -f "downloads/$CLEAN_NAME" ]; then
+                CURRENT_SIZE=$(stat -c%s "downloads/$CLEAN_NAME" 2>/dev/null || echo 0)
+                if [ "$CURRENT_SIZE" -gt 0 ]; then
+                  DOWNLOAD_STARTED=1
+                fi
+                if [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ] && [ "$DOWNLOAD_STARTED" -eq 1 ] && [ "$ELAPSED" -gt 120 ]; then
+                  STUCK_COUNT=$((STUCK_COUNT + 1))
+                  if [ "$STUCK_COUNT" -gt 12 ]; then
+                    echo ""
+                    echo "🔴 Stuck - no progress for 2 minutes"
+                    kill -9 $ARIA_PID 2>/dev/null
+                    break
+                  fi
+                else
+                  STUCK_COUNT=0
+                fi
+                LAST_SIZE=$CURRENT_SIZE
+              fi
+              
+              # Progress every 30s
+              if [ $((ELAPSED % 30)) -eq 0 ] && [ "$DOWNLOAD_STARTED" -eq 1 ]; then
+                CS=$(numfmt --to=iec $CURRENT_SIZE 2>/dev/null)
+                echo "  ⏳ ${ELAPSED}s | Downloaded: $CS"
+              elif [ $((ELAPSED % 30)) -eq 0 ]; then
+                echo "  🔍 ${ELAPSED}s | Finding peers..."
+              fi
+              
+              sleep 10
+            done
+            
+            wait $ARIA_PID 2>/dev/null
+            
+            # Verify download
+            DOWNLOADED_FILE="downloads/$CLEAN_NAME"
+            
+            if [ ! -f "$DOWNLOADED_FILE" ]; then
+              DOWNLOADED_FILE=$(find downloads -type f -newer "/tmp/aria2_${INDEX}.log" -size +100k 2>/dev/null | head -1)
+            fi
+            
+            if [ -f "$DOWNLOADED_FILE" ]; then
+              SIZE=$(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || echo 0)
+              HUMAN_SIZE=$(numfmt --to=iec $SIZE 2>/dev/null)
+              
+              if [ "$SIZE" -gt 102400 ]; then
+                echo ""
+                echo "✅ Downloaded: $(basename "$DOWNLOADED_FILE") ($HUMAN_SIZE)"
+                
+                MAX_SIZE=$((2 * 1024 * 1024 * 1024))
+                
+                if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+                  echo ""
+                  echo "✂️ File > 2GB - splitting into ${SPLIT_SIZE} parts..."
+                  
+                  SPLIT_DIR="splitted/${BASE_NAME}"
+                  mkdir -p "$SPLIT_DIR"
+                  
+                  split -d -b "$SPLIT_SIZE" "$DOWNLOADED_FILE" "${SPLIT_DIR}/${BASE_NAME}.part"
+                  PARTS=$(ls "${SPLIT_DIR}"/*.part* 2>/dev/null | wc -l)
+                  
+                  # Checksums
+                  md5sum "$DOWNLOADED_FILE" > "${SPLIT_DIR}/checksum.md5"
+                  sha256sum "$DOWNLOADED_FILE" > "${SPLIT_DIR}/checksum.sha256"
+                  
+                  # Info file
+                  cat > "${SPLIT_DIR}/README.md" << EOF
+# 📦 Split File Information
+
+| Detail | Value |
+|--------|-------|
+| Original | \`$CLEAN_NAME\` |
+| Size | $HUMAN_SIZE |
+| Parts | $PARTS |
+| Split Size | $SPLIT_SIZE |
+
+## 🔧 How to Join
+
+### Windows (CMD):
+\`\`\`cmd
+copy /b part00 + part01 + part02 + ... $CLEAN_NAME
+\`\`\`
+
+### Linux/Mac:
+\`\`\`bash
+cat part* > $CLEAN_NAME
+md5sum -c checksum.md5
+\`\`\`
+
+### Verify:
+\`\`\`bash
+md5sum -c checksum.md5
+sha256sum -c checksum.sha256
+\`\`\`
+EOF
+                  
+                  echo ""
+                  echo "📦 Parts created:"
+                  ls -lh "$SPLIT_DIR"/ | grep -v README
+                  
+                  rm -f "$DOWNLOADED_FILE"
+                else
+                  cp "$DOWNLOADED_FILE" "splitted/$CLEAN_NAME"
+                fi
+                
+                SUCCESS=$((SUCCESS + 1))
+                TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
+                
+              else
+                echo ""
+                echo "❌ Too small: $SIZE bytes"
+                head -c 100 "$DOWNLOADED_FILE" 2>/dev/null | cat -v
+                rm -f "$DOWNLOADED_FILE"
+                FAILED="$FAILED\n- $CLEAN_NAME ($SIZE bytes - corrupted)"
+              fi
+            else
+              echo ""
+              echo "❌ Failed - no seeders found"
+              FAILED="$FAILED\n- $CLEAN_NAME (no seeders)"
+            fi
+            
+            echo ""
+            echo "--- Next ---"
+            echo ""
+            
+          done <<< "$MAGNETS"
           
-          ls -lh downloads/
+          # Summary
+          echo "SUCCESS=$SUCCESS" >> $GITHUB_OUTPUT
+          echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
           
-      - name: Release
+          {
+            echo "# 📊 Torrent Download Report"
+            echo ""
+            echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Total | $INDEX |"
+            echo "| Success | $SUCCESS |"
+            echo "| Failed | $((INDEX - SUCCESS)) |"
+            echo "| Total Size | $(numfmt --to=iec $TOTAL_SIZE) |"
+            echo "| Timeout | ${TIMEOUT_MINUTES}min |"
+            echo "| Connections | $MAX_CONN |"
+            echo ""
+            
+            if [ $SUCCESS -gt 0 ]; then
+              echo "## ✅ Downloaded"
+              echo ""
+              echo "| # | File | Size | Type |"
+              echo "|---|------|------|------|"
+              COUNT=1
+              for item in splitted/*; do
+                if [ -f "$item" ]; then
+                  NAME=$(basename "$item")
+                  SIZE=$(numfmt --to=iec $(stat -c%s "$item"))
+                  echo "| $COUNT | \`$NAME\` | $SIZE | Single |"
+                elif [ -d "$item" ]; then
+                  NAME=$(basename "$item")
+                  PARTS=$(ls "$item"/*.part* 2>/dev/null | wc -l)
+                  SIZE=$(du -sh "$item" 2>/dev/null | cut -f1)
+                  echo "| $COUNT | \`$NAME\` | $SIZE | $PARTS parts |"
+                fi
+                COUNT=$((COUNT + 1))
+              done
+            fi
+            
+            if [ -n "$FAILED" ]; then
+              echo ""
+              echo "## ❌ Failed"
+              echo -e "$FAILED"
+            fi
+            
+            echo ""
+            echo "---"
+            echo "*Downloaded with aria2 + $(echo "$TRACKER_COUNT") trackers*"
+          } > download_report.md
+          
+          if [ $SUCCESS -eq 0 ]; then
+            echo "No files downloaded!"
+            exit 1
+          fi
+
+      - name: Show results
+        run: |
+          echo "=========================================="
+          echo "Downloads:"
+          du -sh downloads/ 2>/dev/null || echo "Empty"
+          echo ""
+          echo "Splitted:"
+          du -sh splitted/ 2>/dev/null || echo "Empty"
+          echo ""
+          find splitted/ -type f -exec ls -lh {} \; 2>/dev/null
+
+      - name: Create Release
+        if: steps.download.outputs.SUCCESS != '0'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: download-${{ github.run_number }}
-          files: downloads/*
+          tag_name: torrent-${{ github.run_number }}-${{ github.run_attempt }}
+          name: "🧲 Torrent Download #${{ github.run_number }}"
+          body_path: download_report.md
+          files: |
+            splitted/**/*
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_number }}
+          path: |
+            /tmp/aria2_*.log
+            download_report.md
+          retention-days: 7
