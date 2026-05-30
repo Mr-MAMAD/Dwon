@@ -1,12 +1,17 @@
-name: Download and Release
+name: Fast Parallel Download and Release
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'لینک‌های دانلود (با کاما جدا کن)'
+        description: 'لینک‌های دانلود (هر خط یک لینک)'
         required: true
-        default: 'https://cdn5.yesporn.vip/remote_control.php?time=1780168713&cv=2a963ddaceba7ad2b6e30c155403c0fc&lr=0&cv2=042115bccb6a5549ab7828a289c2b98c&file=%2F69000%2F69951%2F69951.mp4&cv3=c8e86ed5d98c30026dd57f5a89acbdad&cv4=b05adadd731ded162e2c96b36258fae1'
+        type: string
+      connections:
+        description: 'تعداد اتصال موازی برای هر فایل (پیش‌فرض: 8)'
+        required: false
+        default: '8'
+        type: string
 
 jobs:
   download-and-release:
@@ -18,115 +23,302 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install aria2 and curl
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl
+
       - name: Create downloads directory
         run: mkdir -p downloads
 
-      - name: Download files
-        id: download
+      - name: Resolve PHP redirects and prepare download list
+        id: resolve
         run: |
-          IFS=',' read -ra URL_ARRAY <<< "${{ github.event.inputs.urls }}"
+          # تبدیل لینک‌ها به آرایه
+          mapfile -t URL_ARRAY <<< "${{ github.event.inputs.urls }}"
           
-          SUCCESS_COUNT=0
-          FAILED_URLS=""
-          DOWNLOADED_FILES=""
+          # فایل لیست نهایی برای aria2
+          FINAL_LIST="/tmp/aria_final_list.txt"
+          > "$FINAL_LIST"
+          
+          # فایل‌های خراب
+          FAILED_FILE="/tmp/failed_urls.txt"
+          > "$FAILED_FILE"
+          
+          RESOLVED_COUNT=0
+          FAILED_COUNT=0
           
           for url in "${URL_ARRAY[@]}"; do
-            # حذف فاصله‌های اضافی
             url=$(echo "$url" | xargs)
+            if [ -z "$url" ]; then
+              continue
+            fi
             
             echo "----------------------------------------"
-            echo "تلاش برای دانلود: $url"
+            echo "🔍 بررسی لینک: $url"
             
-            # استخراج نام فایل از URL
-            filename=$(basename "$url" | cut -d'?' -f1)
-            if [ -z "$filename" ] || [ "$filename" = "/" ]; then
-              filename="file_$(date +%s)_$((RANDOM % 1000)).mp4"
-            fi
+            # استخراج نام فایل از URL اصلی
+            raw_filename=$(basename "$url" | cut -d'?' -f1)
             
-            # جلوگیری از overwrite با اضافه کردن شمارنده
-            if [ -f "downloads/$filename" ]; then
-              base="${filename%.*}"
-              ext="${filename##*.}"
-              counter=1
-              while [ -f "downloads/${base}_${counter}.${ext}" ]; do
-                counter=$((counter + 1))
-              done
-              filename="${base}_${counter}.${ext}"
-            fi
+            # مرحله 1: دنبال کردن ریدایرکت‌ها با curl
+            echo "📡 دنبال کردن ریدایرکت‌ها..."
             
-            # دانلود با تنظیم User-Agent و دنبال کردن redirectها
-            if curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                    --connect-timeout 30 \
-                    --max-time 600 \
-                    -o "downloads/$filename" \
-                    -w "\nHTTP_CODE:%{http_code}\n" \
-                    "$url" 2>&1 | tee /tmp/curl_output.txt; then
-              
-              HTTP_CODE=$(grep "HTTP_CODE:" /tmp/curl_output.txt | cut -d':' -f2)
-              
-              # بررسی HTTP status
-              if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "206" ]; then
-                # بررسی سایز فایل
-                FILE_SIZE=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
-                if [ "$FILE_SIZE" -gt 10240 ]; then
-                  echo "✅ دانلود موفق: $filename (سایز: $(numfmt --to=iec $FILE_SIZE))"
-                  SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-                  DOWNLOADED_FILES="$DOWNLOADED_FILES,$filename"
-                else
-                  echo "⚠️ فایل خیلی کوچک است (${FILE_SIZE} بایت) - احتمالاً خراب"
-                  rm -f "downloads/$filename"
-                  FAILED_URLS="$FAILED_URLS\n- $url (فایل خیلی کوچک)"
-                fi
-              else
-                echo "❌ خطای HTTP: $HTTP_CODE"
-                rm -f "downloads/$filename"
-                FAILED_URLS="$FAILED_URLS\n- $url (HTTP $HTTP_CODE)"
-              fi
+            # گرفتن URL نهایی بعد از ریدایرکت‌ها
+            FINAL_URL=$(curl -Ls -o /dev/null -w "%{url_effective}" \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --connect-timeout 30 \
+              --max-time 60 \
+              "$url" 2>/dev/null)
+            
+            CURL_EXIT=$?
+            
+            # گرفتن هدرهای پاسخ
+            HEADERS=$(curl -sI -L \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              --connect-timeout 30 \
+              --max-time 60 \
+              "$url" 2>/dev/null)
+            
+            # بررسی Content-Type
+            CONTENT_TYPE=$(echo "$HEADERS" | grep -i "content-type:" | tail -1 | sed 's/.*: //' | tr -d '\r')
+            
+            # تشخیص پسوند از Content-Type
+            case "$CONTENT_TYPE" in
+              *video/mp4*)   ext="mp4" ;;
+              *video/webm*)  ext="webm" ;;
+              *video/x-flv*) ext="flv" ;;
+              *video/x-msvideo*) ext="avi" ;;
+              *video/quicktime*) ext="mov" ;;
+              *audio/mpeg*)  ext="mp3" ;;
+              *audio/mp4*)   ext="m4a" ;;
+              *application/zip*) ext="zip" ;;
+              *application/x-rar*) ext="rar" ;;
+              *)             ext="mp4" ;; # پیش‌فرض
+            esac
+            
+            # استخراج Content-Disposition اگر وجود داره
+            if echo "$HEADERS" | grep -qi "Content-Disposition.*filename="; then
+              filename=$(echo "$HEADERS" | grep -i "Content-Disposition.*filename=" | sed 's/.*filename="\{0,1\}\([^"]*\)"\{0,1\}.*/\1/' | tr -d '\r')
+              # تمیز کردن نام فایل
+              filename=$(echo "$filename" | sed 's/[^a-zA-Z0-9._-]/_/g')
             else
-              echo "❌ دانلود ناموفق"
-              rm -f "downloads/$filename"
-              FAILED_URLS="$FAILED_URLS\n- $url (خطای دانلود)"
+              # استفاده از URL نهایی برای نام فایل
+              filename=$(basename "$FINAL_URL" | cut -d'?' -f1 | sed 's/[^a-zA-Z0-9._-]/_/g')
+              if [ -z "$filename" ] || [ ${#filename} -lt 4 ]; then
+                filename="download_$(date +%s%N | sha256sum | head -c 8).$ext"
+              fi
+              
+              # اگر پسوند نداره، از Content-Type اضافه کن
+              if ! echo "$filename" | grep -qE '\.[a-zA-Z0-9]{2,4}$'; then
+                filename="${filename}.${ext}"
+              fi
+            fi
+            
+            # جلوگیری از overwrite
+            original_filename="$filename"
+            counter=1
+            while [ -f "downloads/$filename" ]; do
+              base="${original_filename%.*}"
+              file_ext="${original_filename##*.}"
+              filename="${base}_${counter}.${file_ext}"
+              counter=$((counter + 1))
+            done
+            
+            if [ $CURL_EXIT -eq 0 ] && [ -n "$FINAL_URL" ] && [ "$FINAL_URL" != "$url" ]; then
+              echo "✅ ریدایرکت به: $FINAL_URL"
+              echo "📁 نام فایل: $filename"
+              echo "📦 نوع محتوا: $CONTENT_TYPE"
+              
+              # اضافه کردن به لیست aria2
+              echo "$FINAL_URL" >> "$FINAL_LIST"
+              echo "  out=downloads/$filename" >> "$FINAL_LIST"
+              echo "  referer=$url" >> "$FINAL_LIST"
+              
+              RESOLVED_COUNT=$((RESOLVED_COUNT + 1))
+            elif [ $CURL_EXIT -eq 0 ] && [ -n "$FINAL_URL" ]; then
+              echo "ℹ️ بدون ریدایرکت - استفاده از لینک اصلی"
+              echo "📁 نام فایل: $filename"
+              
+              echo "$url" >> "$FINAL_LIST"
+              echo "  out=downloads/$filename" >> "$FINAL_LIST"
+              
+              RESOLVED_COUNT=$((RESOLVED_COUNT + 1))
+            else
+              echo "❌ خطا در رزولوشن لینک"
+              echo "$url|$raw_filename|خطا در دسترسی به لینک" >> "$FAILED_FILE"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
             fi
           done
           
-          echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
-          echo "DOWNLOADED_FILES=$DOWNLOADED_FILES" >> $GITHUB_OUTPUT
+          echo "RESOLVED_COUNT=$RESOLVED_COUNT" >> $GITHUB_OUTPUT
+          echo "FAILED_COUNT=$FAILED_COUNT" >> $GITHUB_OUTPUT
           
-          # ذخیره گزارش خطاها
-          if [ -n "$FAILED_URLS" ]; then
-            echo -e "## گزارش خطاها\n$FAILED_URLS" > download_report.md
-          else
-            echo "## همه دانلودها موفق بودند ✅" > download_report.md
+          echo "=========================================="
+          echo "📊 نتیجه رزولوشن:"
+          echo "✅ لینک‌های سالم: $RESOLVED_COUNT"
+          echo "❌ لینک‌های خراب: $FAILED_COUNT"
+          echo "=========================================="
+          
+          if [ "$RESOLVED_COUNT" -eq 0 ]; then
+            echo "❌ هیچ لینک سالمی پیدا نشد!"
+            exit 1
           fi
           
-          echo "----------------------------------------"
-          echo "تعداد دانلود موفق: $SUCCESS_COUNT"
+          # نمایش لیست نهایی
+          echo "📋 لیست دانلود:"
+          cat "$FINAL_LIST"
+
+      - name: Download files with aria2
+        id: download
+        if: steps.resolve.outputs.RESOLVED_COUNT != '0'
+        run: |
+          CONNECTIONS="${{ github.event.inputs.connections }}"
+          FINAL_LIST="/tmp/aria_final_list.txt"
+          
+          echo "=========================================="
+          echo "📥 شروع دانلود با $CONNECTIONS اتصال موازی..."
+          echo "=========================================="
+          
+          # دانلود با تنظیمات بهینه
+          aria2c \
+            --input-file="$FINAL_LIST" \
+            --max-concurrent-downloads=3 \
+            --max-connection-per-server="$CONNECTIONS" \
+            --split="$CONNECTIONS" \
+            --min-split-size=1M \
+            --connect-timeout=30 \
+            --timeout=600 \
+            --max-tries=5 \
+            --retry-wait=3 \
+            --continue=true \
+            --allow-overwrite=false \
+            --auto-file-renaming=false \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            --header="Accept: */*" \
+            --header="Accept-Language: en-US,en;q=0.9" \
+            --header="Cache-Control: no-cache" \
+            --summary-interval=0 \
+            --console-log-level=notice \
+            --file-allocation=none \
+            --disk-cache=64M \
+            2>&1 | tee /tmp/aria2_output.log
+          
+          ARIA_EXIT=${PIPESTATUS[0]}
+          echo "ARIA_EXIT=$ARIA_EXIT" >> $GITHUB_OUTPUT
+
+      - name: Verify and report
+        id: verify
+        run: |
+          SUCCESS_COUNT=0
+          FAILED_LIST=""
+          TOTAL_SIZE=0
+          
+          echo "=========================================="
+          echo "📊 بررسی فایل‌های دانلود شده:"
+          echo "=========================================="
+          
+          for file in downloads/*; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+              
+              if [ "$size" -gt 10240 ]; then
+                HUMAN_SIZE=$(numfmt --to=iec $size)
+                echo "✅ $filename ($HUMAN_SIZE)"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                TOTAL_SIZE=$((TOTAL_SIZE + size))
+                DOWNLOADED="$DOWNLOADED,$filename"
+              else
+                echo "⚠️ $filename - حجم کم (${size} بایت) - حذف شد"
+                rm -f "$file"
+                FAILED_LIST="$FAILED_LIST\n- $filename (حجم: ${size} بایت)"
+              fi
+            fi
+          done
+          
+          # خواندن خطاهای مرحله رزولوشن
+          if [ -f "/tmp/failed_urls.txt" ] && [ -s "/tmp/failed_urls.txt" ]; then
+            while IFS='|' read -r url name reason; do
+              FAILED_LIST="$FAILED_LIST\n- $url ($reason)"
+            done < "/tmp/failed_urls.txt"
+          fi
+          
+          echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
+          echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
+          
+          # ایجاد گزارش
+          {
+            echo "# 📊 گزارش دانلود"
+            echo ""
+            echo "**زمان:** $(date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            echo "**اتصالات موازی:** ${{ github.event.inputs.connections }}"
+            echo ""
+            echo "**لینک‌های سالم:** ${{ steps.resolve.outputs.RESOLVED_COUNT }}"
+            echo "**دانلود موفق:** $SUCCESS_COUNT"
+            echo "**حجم کل:** $(numfmt --to=iec $TOTAL_SIZE)"
+            echo ""
+            
+            if [ $SUCCESS_COUNT -gt 0 ]; then
+              echo "## ✅ فایل‌های دانلود شده"
+              echo ""
+              echo "| نام فایل | حجم |"
+              echo "|----------|-----|"
+              for file in downloads/*; do
+                if [ -f "$file" ]; then
+                  fname=$(basename "$file")
+                  fsize=$(stat -c%s "$file")
+                  echo "| \`$fname\` | $(numfmt --to=iec $fsize) |"
+                fi
+              done
+              echo ""
+            fi
+            
+            if [ -n "$FAILED_LIST" ]; then
+              echo "## ❌ خطاها"
+              echo ""
+              echo -e "$FAILED_LIST"
+              echo ""
+            fi
+            
+            echo "---"
+            echo "*از aria2 با قابلیت دنبال کردن ریدایرکت‌های PHP استفاده شده*"
+          } > download_report.md
+          
+          echo "=========================================="
+          echo "📈 خلاصه: $SUCCESS_COUNT فایل دانلود شد ($(numfmt --to=iec $TOTAL_SIZE))"
+          echo "=========================================="
           
           if [ "$SUCCESS_COUNT" -eq 0 ]; then
-            echo "هیچ فایلی دانلود نشد!"
+            echo "❌ هیچ فایلی دانلود نشد!"
             exit 1
           fi
 
-      - name: List downloaded files
+      - name: Show downloads summary
         run: |
-          echo "فایل‌های دانلود شده:"
+          echo "📁 محتویات پوشه downloads:"
+          echo "============================"
+          du -sh downloads/
+          echo ""
           ls -lh downloads/
 
       - name: Create Release
-        if: steps.download.outputs.SUCCESS_COUNT != '0'
+        if: steps.verify.outputs.SUCCESS_COUNT != '0'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: release-${{ github.run_number }}-${{ github.run_attempt }}
-          name: Release ${{ github.run_number }} (Attempt ${{ github.run_attempt }})
+          tag_name: release-${{ github.run_number }}-attempt-${{ github.run_attempt }}
+          name: 🚀 Release #${{ github.run_number }} - ${{ steps.verify.outputs.SUCCESS_COUNT }} Files ($(numfmt --to=iec ${{ steps.verify.outputs.TOTAL_SIZE }}))
           body_path: download_report.md
           files: |
             downloads/*
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload Report as Artifact
+      - name: Upload Report Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: download-report
+          name: download-report-${{ github.run_number }}
           path: download_report.md
+          retention-days: 7
