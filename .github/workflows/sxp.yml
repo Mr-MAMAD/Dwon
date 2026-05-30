@@ -1,15 +1,15 @@
-name: SxyPrn Video Downloader
+name: Magnet Torrent Downloader
 
 on:
   workflow_dispatch:
     inputs:
-      urls:
-        description: 'لینک صفحات SxyPrn (هر خط یک لینک)'
+      magnets:
+        description: 'لینک‌های مگنت (هر خط یک لینک)'
         required: true
         type: string
 
 jobs:
-  download-videos:
+  download-torrents:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -21,15 +21,15 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl wget aria2
+          sudo apt-get install -y -qq aria2 curl
 
-      - name: Download videos
+      - name: Download torrents
         id: download
         shell: bash
         run: |
           set +e
           
-          mapfile -t URL_ARRAY <<< "${{ github.event.inputs.urls }}"
+          mapfile -t MAGNET_ARRAY <<< "${{ github.event.inputs.magnets }}"
           
           SUCCESS_COUNT=0
           FAILED_LIST=""
@@ -38,234 +38,106 @@ jobs:
           mkdir -p downloads
           
           INDEX=0
-          for page_url in "${URL_ARRAY[@]}"; do
-            page_url=$(echo "$page_url" | xargs)
-            if [ -z "$page_url" ]; then
+          for magnet in "${MAGNET_ARRAY[@]}"; do
+            magnet=$(echo "$magnet" | xargs)
+            if [ -z "$magnet" ]; then
               continue
             fi
             
             INDEX=$((INDEX + 1))
             
             echo "=========================================="
-            echo "[$INDEX] 🌐 صفحه: $page_url"
+            echo "[$INDEX] 🧲 مگنت: ${magnet:0:100}..."
             echo "=========================================="
             
-            # استخراج slug
-            SLUG=$(echo "$page_url" | grep -oP 'post/\K[^?]+' 2>/dev/null | sed 's/\.html$//' 2>/dev/null)
-            if [ -z "$SLUG" ]; then
-              SLUG="video_$INDEX"
+            # استخراج نام فایل از magnet link
+            FILENAME=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
+            
+            # اگر نام پیدا نشد از hash استفاده کن
+            if [ -z "$FILENAME" ]; then
+              HASH=$(echo "$magnet" | grep -oP 'btih:\K[^&]+' 2>/dev/null)
+              FILENAME="torrent_${HASH:0:10}.mp4"
             fi
             
-            # دانلود صفحه
-            echo "📥 دانلود صفحه..."
-            PAGE_HTML=$(curl -s -L \
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
-              -H "Accept-Language: en-US,en;q=0.5" \
-              --connect-timeout 30 \
-              --max-time 60 \
-              "$page_url" 2>/dev/null)
+            # تمیز کردن نام فایل
+            FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__\+/_/g')
             
-            if [ -z "$PAGE_HTML" ]; then
-              echo "❌ صفحه دانلود نشد"
-              FAILED_LIST="$FAILED_LIST\n- [$INDEX] $page_url (صفحه لود نشد)"
-              continue
-            fi
+            echo "📁 نام فایل: $FILENAME"
             
-            echo "✅ صفحه دانلود شد ($(echo "$PAGE_HTML" | wc -c) بایت)"
-            
-            # ذخیره HTML برای دیباگ
-            echo "$PAGE_HTML" > "/tmp/page_$INDEX.html"
-            
-            VIDEO_URL=""
-            
-            # ==========================================
-            # روش اصلی: استخراج src از تگ video
-            # ==========================================
-            echo "🔍 روش 1: استخراج src از تگ video..."
-            
-            # استخراج src از تگ video
-            VIDEO_SRC=$(echo "$PAGE_HTML" | grep -oP '<video[^>]*src="([^"]*)"' 2>/dev/null | grep -oP 'src="\K[^"]*' 2>/dev/null | head -1)
-            
-            if [ -n "$VIDEO_SRC" ]; then
-              echo "📄 src پیدا شده: $VIDEO_SRC"
-              
-              # چک کردن نوع src
-              if echo "$VIDEO_SRC" | grep -qE '^https?://'; then
-                # لینک کامل - مستقیم استفاده کن
-                VIDEO_URL="$VIDEO_SRC"
-                echo "   ✅ لینک کامل"
-              elif echo "$VIDEO_SRC" | grep -qE '^/cdn[0-9]+/'; then
-                # لینک نسبی با /cdn - باید دامنه رو اضافه کنیم
-                # از دامنه trafficdeposit.com استفاده کن (CDN اصلی)
-                VIDEO_URL="https://c5.trafficdeposit.com${VIDEO_SRC}"
-                echo "   ✅ لینک cdn نسبی - اضافه کردن trafficdeposit.com"
-              elif echo "$VIDEO_SRC" | grep -qE '^/'; then
-                # لینک نسبی معمولی
-                VIDEO_URL="https://sxyprn.com${VIDEO_SRC}"
-                echo "   ✅ لینک نسبی - اضافه کردن sxyprn.com"
-              else
-                VIDEO_URL="$VIDEO_SRC"
-                echo "   ⚠️ فرمت ناشناخته"
-              fi
-              
-              echo "🎬 لینک نهایی: $VIDEO_URL"
-            fi
-            
-            # ==========================================
-            # روش 2: data-mgfs (احتمالاً لینک غیرمستقیم)
-            # ==========================================
-            if [ -z "$VIDEO_URL" ]; then
-              echo "🔍 روش 2: بررسی data-mgfs..."
-              MGFS=$(echo "$PAGE_HTML" | grep -oP 'data-mgfs="([^"]*)"' 2>/dev/null | grep -oP 'data-mgfs="\K[^"]*' 2>/dev/null | head -1)
-              if [ -n "$MGFS" ]; then
-                echo "📄 data-mgfs: $MGFS"
-                # این ممکنه ID باشه برای ساختن لینک
-                VIDEO_URL="https://c5.trafficdeposit.com/cdn/${MGFS}/video.vid"
-                echo "   ⚠️ لینک حدسی از mgfs"
-              fi
-            fi
-            
-            # ==========================================
-            # روش 3: از IDM (لینک مستقیم trafficdeposit)
-            # ==========================================
-            if [ -z "$VIDEO_URL" ]; then
-              echo "🔍 روش 3: جستجوی لینک‌های trafficdeposit..."
-              ALL_LINKS=$(echo "$PAGE_HTML" | grep -oP 'https?://[^"'\''<>\s]+' 2>/dev/null | sort -u)
-              VIDEO_URL=$(echo "$ALL_LINKS" | grep -i "trafficdeposit" | grep -iE "\.vid|\.mp4|/widi/" | head -1)
-              [ -n "$VIDEO_URL" ] && echo "   ✅ لینک trafficdeposit پیدا شد"
-            fi
-            
-            # ==========================================
-            # روش 4: بازسازی لینک از src تگ video با pattern IDM
-            # ==========================================
-            if [ -z "$VIDEO_URL" ] && [ -n "$VIDEO_SRC" ]; then
-              echo "🔍 روش 4: بازسازی لینک به فرمت IDM..."
-              
-              # استخراج بخش‌های مسیر از src
-              # مثال: /cdn8/NDYtc3h5cHJu.../c5/9x174f66z.../1KXfwGZwqdf4.../1780176532/3w689hbifeep.../z06ka61b9g0k....vid
-              
-              # بخش c5 (ساب‌دامنه)
-              SUBDOMAIN=$(echo "$VIDEO_SRC" | grep -oP '/c\d+/' 2>/dev/null | head -1 | tr -d '/')
-              
-              # بخش آخر (نام فایل)
-              FILENAME_PART=$(echo "$VIDEO_SRC" | grep -oP '[^/]+\.vid$' 2>/dev/null)
-              
-              if [ -n "$SUBDOMAIN" ] && [ -n "$FILENAME_PART" ]; then
-                # ساخت لینک به فرمت widi
-                # الگو: https://c5.trafficdeposit.com/widi/[random]/[key]/[timestamp]/[hash]/[file].vid
-                
-                # استخراج بقیه بخش‌ها
-                PATH_PARTS=$(echo "$VIDEO_SRC" | sed 's|^/cdn[0-9]*/||' | sed 's|/[^/]*\.vid$||')
-                
-                VIDEO_URL="https://${SUBDOMAIN}.trafficdeposit.com/widi/${PATH_PARTS}/${FILENAME_PART}"
-                echo "   🔧 لینک بازسازی شده: $VIDEO_URL"
-              fi
-            fi
-            
-            # ==========================================
-            # روش 5: جستجوی عمیق برای هر لینک vid
-            # ==========================================
-            if [ -z "$VIDEO_URL" ]; then
-              echo "🔍 روش 5: جستجوی عمیق..."
-              ALL_LINKS=$(echo "$PAGE_HTML" | grep -oP 'https?://[^"'\''<>\s]+' 2>/dev/null | sort -u)
-              VIDEO_URL=$(echo "$ALL_LINKS" | grep -iE "\.vid$|/widi/" | head -1)
-              [ -n "$VIDEO_URL" ] && echo "   ✅ پیدا شد"
-            fi
-            
-            # ==========================================
-            # بررسی نهایی
-            # ==========================================
-            if [ -z "$VIDEO_URL" ]; then
-              echo "❌ لینک ویدیو پیدا نشد!"
-              echo ""
-              echo "📄 تگ video پیدا شده:"
-              echo "$PAGE_HTML" | grep -oP '<video[^>]*>' 2>/dev/null | head -3
-              echo ""
-              echo "📄 src استخراج شده: ${VIDEO_SRC:-ندارد}"
-              echo ""
-              echo "📄 همه لینک‌های vid/mp4/trafficdeposit:"
-              echo "$ALL_LINKS" | grep -iE "\.vid|\.mp4|trafficdeposit|/widi/" | head -20
-              echo ""
-              FAILED_LIST="$FAILED_LIST\n- [$INDEX] $page_url (لینک ویدیو استخراج نشد)"
-              continue
-            fi
-            
+            # دانلود با aria2c (پشتیبانی عالی از magnet)
+            echo "🚀 شروع دانلود تورنت..."
             echo ""
-            echo "🎬 لینک نهایی: $VIDEO_URL"
             
-            # تمیز کردن
-            VIDEO_URL=$(echo "$VIDEO_URL" | sed 's/\\//g' | xargs)
-            
-            # نام فایل
-            FILENAME="${SLUG}.mp4"
-            echo "📁 ذخیره: $FILENAME"
-            echo ""
-            echo "🚀 شروع دانلود..."
-            
-            # دانلود با aria2
+            # aria2c مستقیماً magnet رو ساپورت میکنه
             aria2c \
-              "$VIDEO_URL" \
-              --out="downloads/$FILENAME" \
-              --max-connection-per-server=16 \
+              "$magnet" \
+              --dir="downloads" \
+              --out="$FILENAME" \
+              --seed-time=0 \
+              --max-upload-limit=10K \
+              --max-overall-upload-limit=50K \
+              --bt-max-peers=100 \
+              --bt-request-peer-speed-limit=50M \
+              --max-concurrent-downloads=5 \
               --split=16 \
               --min-split-size=1M \
               --connect-timeout=30 \
               --timeout=600 \
               --max-tries=5 \
-              --retry-wait=3 \
+              --retry-wait=5 \
               --continue=true \
               --allow-overwrite=false \
               --auto-file-renaming=false \
               --file-allocation=none \
               --disk-cache=128M \
-              --summary-interval=5 \
+              --summary-interval=10 \
               --console-log-level=notice \
-              --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              --header="Accept: */*" \
-              --header="Accept-Encoding: identity" \
-              --header="Connection: keep-alive" \
-              --referer="$page_url" \
-              --header="Referer: $page_url" \
-              --header="Origin: https://sxyprn.com" \
-              --header="Sec-Fetch-Dest: video" \
-              --header="Sec-Fetch-Mode: no-cors" \
-              --header="Sec-Fetch-Site: cross-site" \
+              --enable-dht=true \
+              --enable-dht6=false \
+              --enable-peer-exchange=true \
+              --bt-enable-lpd=true \
+              --bt-tracker-connect-timeout=10 \
+              --bt-tracker-timeout=10 \
+              --dht-entry-point="dht.transmissionbt.com:6881" \
+              --dht-entry-point="router.bittorrent.com:6881" \
+              --dht-entry-point="router.utorrent.com:6881" \
               2>&1 | tee "/tmp/aria2_${INDEX}.log" || true
             
-            # Fallback: curl
-            if [ ! -f "downloads/$FILENAME" ] || [ $(stat -c%s "downloads/$FILENAME" 2>/dev/null || echo 0) -lt 102400 ]; then
-              echo ""
-              echo "⚠️ تلاش با curl..."
-              curl -L \
-                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                -H "Referer: $page_url" \
-                -H "Origin: https://sxyprn.com" \
-                --connect-timeout 30 \
-                --max-time 600 \
-                -o "downloads/$FILENAME" \
-                "$VIDEO_URL" 2>&1 || true
+            ARIA_EXIT=${PIPESTATUS[0]}
+            
+            # aria2 ممکنه فایل رو با اسم دیگه‌ای ذخیره کرده باشه
+            # پیدا کردن فایل دانلود شده
+            DOWNLOADED_FILE=$(find downloads -type f -newer "/tmp/aria2_${INDEX}.log" -size +100k 2>/dev/null | head -1)
+            
+            if [ -z "$DOWNLOADED_FILE" ]; then
+              DOWNLOADED_FILE="downloads/$FILENAME"
             fi
             
             # بررسی نتیجه
-            if [ -f "downloads/$FILENAME" ]; then
-              SIZE=$(stat -c%s "downloads/$FILENAME" 2>/dev/null || echo 0)
+            if [ -f "$DOWNLOADED_FILE" ]; then
+              SIZE=$(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || echo 0)
               if [ "$SIZE" -gt 102400 ]; then
                 echo ""
-                echo "✅ [$INDEX] موفق: $FILENAME ($(numfmt --to=iec $SIZE))"
+                echo "✅ [$INDEX] موفق: $(basename "$DOWNLOADED_FILE") ($(numfmt --to=iec $SIZE))"
+                
+                # rename به اسم درست اگه لازم باشه
+                if [ "$(basename "$DOWNLOADED_FILE")" != "$FILENAME" ]; then
+                  mv "$DOWNLOADED_FILE" "downloads/$FILENAME" 2>/dev/null
+                fi
+                
                 SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
               else
                 echo ""
                 echo "❌ [$INDEX] حجم کم: $SIZE بایت"
-                head -c 200 "downloads/$FILENAME" 2>/dev/null | cat -v
-                rm -f "downloads/$FILENAME"
-                FAILED_LIST="$FAILED_LIST\n- [$INDEX] $page_url (حجم: ${SIZE} بایت)"
+                FAILED_LIST="$FAILED_LIST\n- [$INDEX] ${magnet:0:80}... (حجم: ${SIZE} بایت)"
               fi
             else
               echo ""
               echo "❌ [$INDEX] دانلود ناموفق"
-              FAILED_LIST="$FAILED_LIST\n- [$INDEX] $page_url (خطا در دانلود)"
+              echo "فایل‌های موجود در downloads:"
+              ls -lh downloads/ 2>/dev/null
+              FAILED_LIST="$FAILED_LIST\n- [$INDEX] ${magnet:0:80}..."
             fi
             
             echo ""
@@ -274,30 +146,29 @@ jobs:
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
           echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
           
-          # بسته‌بندی HTML برای دیباگ
-          if ls /tmp/page_*.html 1> /dev/null 2>&1; then
-            tar czf /tmp/pages_html.tar.gz /tmp/page_*.html 2>/dev/null || true
-          fi
-          
           # گزارش
           {
-            echo "# 📊 گزارش دانلود SxyPrn"
+            echo "# 📊 گزارش دانلود تورنت"
             echo ""
             echo "**زمان:** $(date '+%Y-%m-%d %H:%M:%S')"
             echo ""
             echo "| مورد | مقدار |"
             echo "|------|-------|"
-            echo "| کل صفحات | $INDEX |"
+            echo "| کل مگنت‌ها | $INDEX |"
             echo "| دانلود موفق | $SUCCESS_COUNT |"
             echo "| حجم کل | $(numfmt --to=iec $TOTAL_SIZE) |"
             echo ""
             
             if [ $SUCCESS_COUNT -gt 0 ]; then
-              echo "## ✅ ویدیوهای دانلود شده"
+              echo "## ✅ فایل‌های دانلود شده"
               echo ""
+              echo "| # | نام فایل | حجم |"
+              echo "|---|----------|-----|"
+              count=1
               for f in downloads/*; do
-                if [ -f "$f" ]; then
-                  echo "- 🎬 \`$(basename "$f")\` ($(numfmt --to=iec $(stat -c%s "$f")))"
+                if [ -f "$f" ] && [ $(stat -c%s "$f") -gt 102400 ]; then
+                  echo "| $count | \`$(basename "$f")\` | $(numfmt --to=iec $(stat -c%s "$f")) |"
+                  count=$((count + 1))
                 fi
               done
             fi
@@ -307,12 +178,15 @@ jobs:
               echo "## ❌ خطاها"
               echo -e "$FAILED_LIST"
               echo ""
-              echo "💡 فایل debug-data رو از Artifacts دانلود کن"
+              echo "💡 **علت احتمالی:**"
+              echo "- تعداد سیدر کم"
+              echo "- ترکرها در دسترس نبودن"
+              echo "- فایل از تورنت حذف شده"
             fi
           } > download_report.md
           
           if [ "$SUCCESS_COUNT" -eq 0 ]; then
-            echo "❌ هیچ ویدیویی دانلود نشد!"
+            echo "❌ هیچ فایلی دانلود نشد!"
             exit 1
           fi
 
@@ -326,21 +200,20 @@ jobs:
         if: steps.download.outputs.SUCCESS_COUNT != '0'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: sxyprn-${{ github.run_number }}
-          name: 🎬 SxyPrn Videos #${{ github.run_number }}
+          tag_name: torrent-${{ github.run_number }}
+          name: 🧲 Torrent Download #${{ github.run_number }}
           body_path: download_report.md
           files: |
             downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload debug data
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-data-${{ github.run_number }}
+          name: torrent-logs-${{ github.run_number }}
           path: |
-            /tmp/pages_html.tar.gz
             /tmp/aria2_*.log
             download_report.md
           retention-days: 3
