@@ -1,4 +1,4 @@
-name: Video Downloader (Cloudflare Bypass)
+name: Video Downloader (v2)
 
 on:
   workflow_dispatch:
@@ -19,8 +19,12 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq python3 python3-pip ffmpeg
-          pip3 install yt-dlp curl-cffi
+          # Force reinstall latest versions with full dependencies
+          pip3 install --upgrade --force-reinstall yt-dlp curl-cffi
           mkdir -p downloads
+          
+          # Debug: show available impersonation targets
+          python3 -m yt_dlp --list-impersonate-targets
 
       - name: Download videos
         id: dl
@@ -38,13 +42,13 @@ jobs:
             echo "[$total] Downloading: $url"
             echo "=========================================="
             
-            # Use impersonation to bypass Cloudflare
+            # Try with impersonation (use generic 'chrome' instead of 'chrome:120')
             python3 -m yt_dlp \
               --no-playlist \
               --merge-output-format mp4 \
               --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
               --extractor-args "generic:impersonate" \
-              --impersonate chrome:120 \
+              --impersonate chrome \
               -o "downloads/%(title)s.%(ext)s" \
               "$url" 2>&1 || {
                 echo "❌ Failed: $url"
