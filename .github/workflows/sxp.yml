@@ -1,4 +1,4 @@
-name: sxp with Cookie Support
+name: Download with cookies.txt Support
 
 on:
   workflow_dispatch:
@@ -7,8 +7,8 @@ on:
         description: 'لینک‌های دانلود (هر خط یک لینک)'
         required: true
         type: string
-      cookies:
-        description: 'کوکی‌ها (مثلاً: session_id=abc; token=xyz)'
+      cookies_txt:
+        description: 'محتوای فایل cookies.txt رو اینجا paste کن'
         required: false
         default: ''
         type: string
@@ -24,7 +24,7 @@ on:
         type: string
 
 jobs:
-  download-with-cookie:
+  download-with-cookies:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -41,34 +41,86 @@ jobs:
       - name: Create downloads directory
         run: mkdir -p downloads
 
-      - name: Download files
+      - name: Convert cookies.txt and download
         id: download
         run: |
           mapfile -t URL_ARRAY <<< "${{ github.event.inputs.urls }}"
           
-          COOKIES="${{ github.event.inputs.cookies }}"
+          COOKIES_TXT="${{ github.event.inputs.cookies_txt }}"
           REFERER="${{ github.event.inputs.referer }}"
           CONNECTIONS="${{ github.event.inputs.connections }}"
+          
+          # تبدیل cookies.txt به فرمت Cookie header
+          COOKIE_STRING=""
+          
+          if [ -n "$COOKIES_TXT" ]; then
+            echo "🍪 تبدیل cookies.txt به فرمت Cookie header..."
+            
+            while IFS=$'\t' read -r domain flag1 path flag2 expiry name value; do
+              # رد کردن خطوط کامنت و خالی
+              [[ "$domain" =~ ^# ]] && continue
+              [[ -z "$domain" ]] && continue
+              
+              # اضافه کردن name=value
+              if [ -n "$name" ] && [ -n "$value" ]; then
+                if [ -n "$COOKIE_STRING" ]; then
+                  COOKIE_STRING="$COOKIE_STRING; $name=$value"
+                else
+                  COOKIE_STRING="$name=$value"
+                fi
+              fi
+            done <<< "$COOKIES_TXT"
+            
+            echo "📋 کوکی‌های استخراج شده:"
+            echo "$COOKIE_STRING" | tr ';' '\n' | sed 's/^/   /'
+            echo ""
+          else
+            echo "⚠️ کوکی وارد نشده"
+          fi
           
           SUCCESS_COUNT=0
           FAILED_LIST=""
           TOTAL_SIZE=0
           
+          INDEX=0
           for url in "${URL_ARRAY[@]}"; do
             url=$(echo "$url" | xargs)
             if [ -z "$url" ]; then
               continue
             fi
             
+            INDEX=$((INDEX + 1))
+            
             echo "=========================================="
-            echo "🔗 دانلود: ${url:0:100}..."
+            echo "[$INDEX] 🔗 دانلود: ${url:0:120}..."
             echo "=========================================="
             
             # استخراج نام فایل
             filename=$(basename "$url" | cut -d'?' -f1 | cut -d'#' -f1 | sed 's/[^a-zA-Z0-9._-]/_/g')
             
             if [ -z "$filename" ] || [ ${#filename} -lt 5 ]; then
-              filename="download_$(date +%s%N | sha256sum | head -c 8).mp4"
+              filename="download_$(date +%s%N | sha256sum | head -c 8)"
+            fi
+            
+            # اضافه کردن پسوند اگه نداره
+            if ! echo "$filename" | grep -qE '\.[a-zA-Z0-9]{2,5}$'; then
+              # چک کردن Content-Type از هدر
+              content_type=$(curl -sI -L \
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                ${COOKIE_STRING:+-H "Cookie: $COOKIE_STRING"} \
+                ${REFERER:+-H "Referer: $REFERER"} \
+                --connect-timeout 10 \
+                --max-time 30 \
+                "$url" 2>/dev/null | grep -i "content-type:" | tail -1 | sed 's/.*: //' | tr -d '\r')
+              
+              case "$content_type" in
+                *video/mp4*)  ext="mp4" ;;
+                *video/webm*) ext="webm" ;;
+                *video/x-flv*) ext="flv" ;;
+                *video/*)     ext="mp4" ;;
+                *)            ext="vid" ;;
+              esac
+              filename="${filename}.${ext}"
             fi
             
             # جلوگیری از overwrite
@@ -83,18 +135,20 @@ jobs:
             
             echo "📁 نام فایل: $filename"
             
-            # ساخت هدرها
+            # ساخت آرایه هدرها
             HEADER_OPTS=(
               --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
               --header="Accept: */*"
               --header="Accept-Language: en-US,en;q=0.9"
-              --header="Accept-Encoding: identity;q=1, *;q=0"
+              --header="Accept-Encoding: identity"
               --header="Connection: keep-alive"
               --header="Cache-Control: no-cache"
               --header="Pragma: no-cache"
               --header="Sec-Fetch-Dest: video"
               --header="Sec-Fetch-Mode: no-cors"
               --header="Sec-Fetch-Site: cross-site"
+              --header="DNT: 1"
+              --header="Upgrade-Insecure-Requests: 1"
             )
             
             # اضافه کردن رفرر
@@ -102,21 +156,22 @@ jobs:
               echo "🔗 رفرر: $REFERER"
               HEADER_OPTS+=(--referer="$REFERER")
               HEADER_OPTS+=(--header="Referer: $REFERER")
+              HEADER_OPTS+=(--header="Origin: $(echo "$REFERER" | grep -oP '^https?://[^/]+')")
             else
-              # رفرر خودکار
               DOMAIN=$(echo "$url" | grep -oP '^https?://[^/]+')
               HEADER_OPTS+=(--referer="$DOMAIN/")
             fi
             
             # اضافه کردن کوکی
-            if [ -n "$COOKIES" ]; then
-              echo "🍪 کوکی: ${COOKIES:0:50}..."
-              HEADER_OPTS+=(--header="Cookie: $COOKIES")
+            if [ -n "$COOKIE_STRING" ]; then
+              echo "🍪 کوکی: ${COOKIE_STRING:0:80}..."
+              HEADER_OPTS+=(--header="Cookie: $COOKIE_STRING")
             fi
             
             echo "🚀 شروع دانلود با $CONNECTIONS اتصال..."
+            echo ""
             
-            # دانلود با aria2
+            # تلاش 1: aria2 با کوکی
             aria2c \
               "$url" \
               --out="downloads/$filename" \
@@ -135,49 +190,76 @@ jobs:
               --summary-interval=5 \
               --console-log-level=notice \
               "${HEADER_OPTS[@]}" \
-              2>&1 | tee "/tmp/aria2_$counter.log"
+              2>&1 | tee "/tmp/aria2_${INDEX}.log"
             
             ARIA_EXIT=${PIPESTATUS[0]}
             
-            # اگر aria2 ناموفق بود، با curl امتحان کن
+            # تلاش 2: curl به عنوان backup
             if [ $ARIA_EXIT -ne 0 ] || [ ! -f "downloads/$filename" ] || [ $(stat -c%s "downloads/$filename" 2>/dev/null || echo 0) -lt 10240 ]; then
-              echo "⚠️ aria2 ناموفق - تلاش با curl..."
+              echo ""
+              echo "⚠️ aria2 ناموفق - تلاش با curl (تک اتصال)..."
               
-              CURL_HEADERS=(
-                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+              CURL_OPTS=(
+                -L
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 -H "Accept: */*"
                 -H "Connection: keep-alive"
+                --connect-timeout 30
+                --max-time 600
+                -o "downloads/$filename"
               )
               
-              [ -n "$REFERER" ] && CURL_HEADERS+=(-H "Referer: $REFERER") && CURL_HEADERS+=(--referer "$REFERER")
-              [ -n "$COOKIES" ] && CURL_HEADERS+=(-H "Cookie: $COOKIES")
+              [ -n "$REFERER" ] && CURL_OPTS+=(-H "Referer: $REFERER") && CURL_OPTS+=(--referer "$REFERER")
+              [ -n "$COOKIE_STRING" ] && CURL_OPTS+=(-H "Cookie: $COOKIE_STRING")
               
-              curl -L \
-                "${CURL_HEADERS[@]}" \
-                --connect-timeout 30 \
-                --max-time 600 \
-                -o "downloads/$filename" \
-                "$url" 2>&1 | tail -5
-              
-              CURL_EXIT=$?
+              curl "${CURL_OPTS[@]}" "$url" 2>&1 | tail -5
+              echo ""
             fi
             
-            # بررسی نتیجه
+            # تلاش 3: wget با تمام هدرها
+            if [ ! -f "downloads/$filename" ] || [ $(stat -c%s "downloads/$filename" 2>/dev/null || echo 0) -lt 10240 ]; then
+              echo "⚠️ curl ناموفق - تلاش با wget..."
+              
+              WGET_OPTS=(
+                --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                --header="Accept: */*"
+                --header="Connection: keep-alive"
+                --tries=3
+                --timeout=60
+                --continue
+                --no-check-certificate
+                -O "downloads/$filename"
+              )
+              
+              [ -n "$REFERER" ] && WGET_OPTS+=(--referer="$REFERER")
+              [ -n "$COOKIE_STRING" ] && WGET_OPTS+=(--header="Cookie: $COOKIE_STRING")
+              
+              wget "${WGET_OPTS[@]}" "$url" 2>&1 | tail -5
+              echo ""
+            fi
+            
+            # بررسی نتیجه نهایی
             if [ -f "downloads/$filename" ]; then
               SIZE=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
-              if [ "$SIZE" -gt 10240 ]; then
-                echo "✅ موفق: $filename ($(numfmt --to=iec $SIZE))"
+              if [ "$SIZE" -gt 102400 ]; then  # بزرگتر از 100KB
+                HUMAN=$(numfmt --to=iec $SIZE)
+                echo "✅ [$INDEX] موفق: $filename ($HUMAN)"
                 SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
-              else
-                echo "❌ حجم کم: ${SIZE} بایت - حذف"
-                cat "downloads/$filename" 2>/dev/null | head -c 200
+              elif [ "$SIZE" -gt 1024 ]; then
+                echo "⚠️ [$INDEX] حجم مشکوک: $SIZE بایت"
+                # نمایش محتوا برای دیباگ
+                head -c 300 "downloads/$filename" 2>/dev/null | cat -v
                 rm -f "downloads/$filename"
-                FAILED_LIST="$FAILED_LIST\n- $url (حجم غیرعادی: ${SIZE} بایت)"
+                FAILED_LIST="$FAILED_LIST\n- [$INDEX] $url (حجم: ${SIZE} بایت)"
+              else
+                echo "❌ [$INDEX] حجم خیلی کم: $SIZE بایت"
+                rm -f "downloads/$filename"
+                FAILED_LIST="$FAILED_LIST\n- [$INDEX] $url (حجم: ${SIZE} بایت)"
               fi
             else
-              echo "❌ دانلود نشد"
-              FAILED_LIST="$FAILED_LIST\n- $url (فایل ایجاد نشد)"
+              echo "❌ [$INDEX] فایل ایجاد نشد"
+              FAILED_LIST="$FAILED_LIST\n- [$INDEX] $url (دانلود ناموفق)"
             fi
             
             echo ""
@@ -194,17 +276,24 @@ jobs:
             echo ""
             echo "| مورد | مقدار |"
             echo "|------|-------|"
+            echo "| کل لینک‌ها | $INDEX |"
             echo "| دانلود موفق | $SUCCESS_COUNT |"
             echo "| حجم کل | $(numfmt --to=iec $TOTAL_SIZE) |"
+            echo "| کوکی | $([ -n "$COOKIE_STRING" ] && echo "✅ فعال" || echo "❌ ندارد") |"
             echo "| رفرر | ${REFERER:-خودکار} |"
-            echo "| کوکی | $([ -n "$COOKIES" ] && echo "✅ تنظیم شده" || echo "❌ وارد نشده") |"
             echo ""
             
             if [ $SUCCESS_COUNT -gt 0 ]; then
-              echo "## ✅ فایل‌ها"
+              echo "## ✅ فایل‌های دانلود شده"
               echo ""
+              echo "| # | نام فایل | حجم |"
+              echo "|---|----------|-----|"
+              count=1
               for f in downloads/*; do
-                [ -f "$f" ] && echo "- 📁 \`$(basename "$f")\` ($(numfmt --to=iec $(stat -c%s "$f")))"
+                if [ -f "$f" ]; then
+                  echo "| $count | \`$(basename "$f")\` | $(numfmt --to=iec $(stat -c%s "$f")) |"
+                  count=$((count + 1))
+                fi
               done
             fi
             
@@ -212,6 +301,11 @@ jobs:
               echo ""
               echo "## ❌ خطاها"
               echo -e "$FAILED_LIST"
+              echo ""
+              echo "💡 **راهنمایی:**"
+              echo "- مطمئن شو کوکی‌ها موقع دانلود معتبر باشن"
+              echo "- از همون IP که کوکی گرفتی دانلود کن"
+              echo "- بعضی لینک‌ها فقط یکبار مصرف هستن"
             fi
           } > download_report.md
           
@@ -220,23 +314,29 @@ jobs:
             exit 1
           fi
 
+      - name: Show results
+        run: |
+          echo "📁 فایل‌های دانلود شده:"
+          du -sh downloads/ 2>/dev/null
+          ls -lh downloads/
+
       - name: Create Release
         if: steps.download.outputs.SUCCESS_COUNT != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: cookie-download-${{ github.run_number }}
-          name: 🍪 Download with Cookie #${{ github.run_number }}
+          name: 🍪 Cookie Download #${{ github.run_number }}
           body_path: download_report.md
           files: |
             downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload logs
+      - name: Upload debug logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cookie-download-logs-${{ github.run_number }}
+          name: debug-logs-${{ github.run_number }}
           path: |
             /tmp/aria2_*.log
             download_report.md
