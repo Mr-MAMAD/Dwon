@@ -1,4 +1,4 @@
-name: Video Downloader (yt-dlp)
+name: Video Downloader (Cloudflare Bypass)
 
 on:
   workflow_dispatch:
@@ -18,9 +18,8 @@ jobs:
       - name: Setup
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl ffmpeg
-          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-          sudo chmod a+rx /usr/local/bin/yt-dlp
+          sudo apt-get install -y -qq python3 python3-pip ffmpeg
+          pip3 install yt-dlp curl-cffi
           mkdir -p downloads
 
       - name: Download videos
@@ -29,7 +28,6 @@ jobs:
         run: |
           success=0
           total=0
-          report=""
           
           while IFS= read -r url; do
             url=$(echo "$url" | xargs)
@@ -40,18 +38,17 @@ jobs:
             echo "[$total] Downloading: $url"
             echo "=========================================="
             
-            # yt-dlp extracts and downloads automatically
-            # --no-playlist ensures only the video, not playlist
-            # -o sets output template (use video title)
-            yt-dlp \
+            # Use impersonation to bypass Cloudflare
+            python3 -m yt_dlp \
               --no-playlist \
               --merge-output-format mp4 \
               --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              --referer "$url" \
+              --extractor-args "generic:impersonate" \
+              --impersonate chrome:120 \
               -o "downloads/%(title)s.%(ext)s" \
               "$url" 2>&1 || {
-                echo "❌ yt-dlp failed for $url"
-                echo "$url (failed)" >> failed.txt
+                echo "❌ Failed: $url"
+                echo "$url" >> failed.txt
                 continue
               }
             
@@ -62,11 +59,10 @@ jobs:
               if [ "$size" -gt 102400 ]; then
                 echo "✅ Downloaded: $file ($(numfmt --to=iec $size))"
                 success=$((success+1))
-                report="$report\n- $url → $file ($(numfmt --to=iec $size))"
               else
                 echo "❌ File too small ($size bytes)"
                 rm -f "downloads/$file"
-                echo "$url (small file)" >> failed.txt
+                echo "$url" >> failed.txt
               fi
             fi
             echo ""
@@ -74,8 +70,16 @@ jobs:
           
           echo "success=$success" >> $GITHUB_OUTPUT
           
+          # Write report
+          echo "## Download Report" > report.md
+          echo "" >> report.md
+          echo "| Success | Total |" >> report.md
+          echo "|---------|-------|" >> report.md
+          echo "| $success | $total |" >> report.md
+          
           if [ -f failed.txt ]; then
-            echo "## ❌ Failed URLs" >> report.md
+            echo "" >> report.md
+            echo "## Failed URLs" >> report.md
             cat failed.txt >> report.md
           fi
           
