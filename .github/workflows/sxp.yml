@@ -1,257 +1,233 @@
-name: sxp DL Release PRO
+name: sxp
 
 on:
   workflow_dispatch:
     inputs:
-      url:
-        description: "URLs (space/comma/newline separated)"
+      urls:
+        description: 'لینک‌های دانلود (هر خط یک لینک)'
         required: true
         type: string
-
-      cookie:
-        description: "Manual Cookie Header (Optional - overrides cookies.txt)"
+      connections:
+        description: 'تعداد اتصال موازی برای هر فایل (پیش‌فرض: 8)'
         required: false
+        default: '8'
         type: string
-        default: ""
-
-      referer:
-        description: "Referer (Optional)"
-        required: false
-        type: string
-        default: ""
-
-      password:
-        description: "Archive Password (Optional)"
-        required: false
-        type: string
-        default: ""
 
 jobs:
-  direct-download:
+  download-and-release:
     runs-on: ubuntu-latest
-
     permissions:
       contents: write
-
+    
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Tools
-        shell: bash
+      - name: Install aria2 (fast parallel downloader)
         run: |
           sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2
 
-          sudo apt-get install -y \
-            aria2 \
-            curl \
-            ffmpeg \
-            p7zip-full \
-            mediainfo \
-            jq
+      - name: Create downloads directory
+        run: mkdir -p downloads
 
-          sudo curl -L \
-            https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-            -o /usr/local/bin/yt-dlp
-
-          sudo chmod a+rx /usr/local/bin/yt-dlp
-
-      - name: Prepare Workspace
-        shell: bash
+      - name: Download files with aria2
+        id: download
         run: |
-          rm -rf tmp_downloads
-          rm -rf upload
-
-          mkdir -p tmp_downloads
-          mkdir -p upload
-
-          touch upload/success.txt
-          touch upload/failed.txt
-
-      - name: Download Files
-        shell: bash
-        run: |
-          set +e
-
-          RAW_URLS="${{ github.event.inputs.url }}"
-          MANUAL_COOKIE="${{ github.event.inputs.cookie }}"
-          REFERER="${{ github.event.inputs.referer }}"
-
-          IFS=$'\n ,'
-          read -ra URLS <<< "$RAW_URLS"
-
-          INDEX=1
-
-          for URL in "${URLS[@]}"; do
-
-            if [ -z "$URL" ]; then
+          # تبدیل لینک‌ها به آرایه
+          mapfile -t URL_ARRAY <<< "${{ github.event.inputs.urls }}"
+          
+          CONNECTIONS="${{ github.event.inputs.connections }}"
+          SUCCESS_COUNT=0
+          FAILED_URLS=""
+          DOWNLOADED_FILES=""
+          
+          # فایل موقت برای لیست دانلودهای aria2
+          ARIA_LIST="/tmp/aria_list.txt"
+          > "$ARIA_LIST"
+          
+          # پردازش لینک‌ها و ایجاد لیست برای aria2
+          declare -a VALID_URLS=()
+          declare -a OUTPUT_NAMES=()
+          INDEX=0
+          
+          for url in "${URL_ARRAY[@]}"; do
+            # حذف فاصله‌های اضافی و خطوط خالی
+            url=$(echo "$url" | xargs)
+            if [ -z "$url" ]; then
               continue
             fi
-
-            echo "=================================================="
-            echo "DOWNLOAD [$INDEX]: $URL"
-            echo "=================================================="
-
-            SAFE_NAME="file_${INDEX}"
-
-            # ---------------- yt-dlp ----------------
-            YTDLP_ARGS=(
-              --no-part
-              --no-playlist
-              --restrict-filenames
-              -o "tmp_downloads/${SAFE_NAME}.%(ext)s"
-              --add-header "User-Agent:Mozilla/5.0"
-            )
-
-            if [ -n "$REFERER" ]; then
-              YTDLP_ARGS+=(--add-header "Referer:$REFERER")
+            
+            echo "----------------------------------------"
+            echo "🔗 پردازش لینک: $url"
+            
+            # استخراج نام فایل از URL
+            filename=$(basename "$url" | cut -d'?' -f1 | sed 's/[^a-zA-Z0-9._-]/_/g')
+            if [ -z "$filename" ] || [ "$filename" = "/" ] || [ ${#filename} -lt 4 ]; then
+              filename="file_$(date +%s%N | sha256sum | head -c 8).mp4"
             fi
-
-            # Manual cookie overrides everything
-            if [ -n "$MANUAL_COOKIE" ]; then
-              YTDLP_ARGS+=(--add-header "Cookie:$MANUAL_COOKIE")
-            elif [ -f "cookies.txt" ]; then
-              YTDLP_ARGS+=(--cookies cookies.txt)
-            fi
-
-            echo "Trying yt-dlp..."
-            yt-dlp "${YTDLP_ARGS[@]}" "$URL"
-
-            STATUS=$?
-
-            # ---------------- aria2 fallback ----------------
-            if [ $STATUS -ne 0 ]; then
-
-              echo "yt-dlp failed -> aria2 fallback"
-
-              ARIA_ARGS=(
-                --split=1
-                --max-connection-per-server=1
-                --max-tries=5
-                --retry-wait=10
-                --continue=true
-                --timeout=60
-                --auto-file-renaming=true
-                --dir=tmp_downloads
-                --header="User-Agent: Mozilla/5.0"
-              )
-
-              if [ -n "$REFERER" ]; then
-                ARIA_ARGS+=(--referer="$REFERER")
-              fi
-
-              if [ -n "$MANUAL_COOKIE" ]; then
-                ARIA_ARGS+=(--header="Cookie: $MANUAL_COOKIE")
-              fi
-
-              aria2c "${ARIA_ARGS[@]}" "$URL"
-
-              STATUS=$?
-            fi
-
-            # ---------------- curl fallback ----------------
-            if [ $STATUS -ne 0 ]; then
-
-              echo "aria2 failed -> curl fallback"
-
-              SAFE_EXT=$(echo "$URL" | awk -F. '{print $NF}' | cut -d'?' -f1)
-              OUTPUT_FILE="tmp_downloads/${SAFE_NAME}.${SAFE_EXT}"
-
-              CURL_ARGS=(
-                -L
-                -A "Mozilla/5.0"
-                --retry 5
-                --connect-timeout 60
-              )
-
-              if [ -n "$REFERER" ]; then
-                CURL_ARGS+=(-e "$REFERER")
-              fi
-
-              if [ -n "$MANUAL_COOKIE" ]; then
-                CURL_ARGS+=(-H "Cookie: $MANUAL_COOKIE")
-              fi
-
-              curl "${CURL_ARGS[@]}" \
-                -o "$OUTPUT_FILE" \
-                "$URL"
-
-              STATUS=$?
-            fi
-
-            # ---------------- validation ----------------
-            VALID=0
-
-            for FILE in tmp_downloads/*; do
-
-              [ -f "$FILE" ] || continue
-              [ -s "$FILE" ] || { rm -f "$FILE"; continue; }
-
-              MIME=$(file --mime-type -b "$FILE")
-
-              case "$MIME" in
-                text/html|application/json|text/plain)
-                  rm -f "$FILE"
-                  ;;
-                *)
-                  VALID=1
-                  ;;
-              esac
-
+            
+            # جلوگیری از overwrite
+            original_filename="$filename"
+            counter=1
+            while [ -f "downloads/$filename" ] || [[ " ${OUTPUT_NAMES[*]} " =~ " ${filename} " ]]; do
+              base="${original_filename%.*}"
+              ext="${original_filename##*.}"
+              filename="${base}_${counter}.${ext}"
+              counter=$((counter + 1))
             done
-
-            if [ "$VALID" -eq 1 ]; then
-              echo "$URL" >> upload/success.txt
-            else
-              echo "$URL" >> upload/failed.txt
-            fi
-
+            
+            # اضافه کردن به لیست aria2
+            echo "$url" >> "$ARIA_LIST"
+            echo "  out=downloads/$filename" >> "$ARIA_LIST"
+            
+            VALID_URLS+=("$url")
+            OUTPUT_NAMES+=("$filename")
             INDEX=$((INDEX + 1))
-
           done
-
-          set -e
-
-      - name: Prepare Uploads
-        shell: bash
-        run: |
-          PASS="${{ github.event.inputs.password }}"
-
-          for FILE in tmp_downloads/*; do
-            [ -f "$FILE" ] || continue
-
-            BASENAME=$(basename "$FILE")
-
-            if [ -n "$PASS" ]; then
-              7z a -p"$PASS" -mhe=on "upload/${BASENAME}.7z" "$FILE"
+          
+          TOTAL_URLS=${#VALID_URLS[@]}
+          
+          if [ "$TOTAL_URLS" -eq 0 ]; then
+            echo "❌ هیچ لینک معتبری وارد نشده!"
+            exit 1
+          fi
+          
+          echo "=========================================="
+          echo "📥 شروع دانلود $TOTAL_URLS فایل با $CONNECTIONS اتصال موازی..."
+          echo "=========================================="
+          
+          # دانلود با aria2
+          # -x: تعداد اتصالات به ازای هر فایل
+          # -s: تقسیم فایل به بخش‌های مجزا
+          # -j: تعداد دانلود همزمان
+          # -c: ادامه دانلود ناقص
+          # --max-connection-per-server: حداکثر اتصال به یک سرور
+          # --min-split-size: حداقل سایز برای تقسیم (1MB)
+          # --console-log-level=notice: نمایش پیشرفت
+          
+          aria2c \
+            --input-file="$ARIA_LIST" \
+            --max-concurrent-downloads=5 \
+            --max-connection-per-server=16 \
+            --split="$CONNECTIONS" \
+            --min-split-size=1M \
+            --connect-timeout=30 \
+            --timeout=600 \
+            --max-tries=5 \
+            --retry-wait=3 \
+            --continue=true \
+            --allow-overwrite=false \
+            --auto-file-renaming=false \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            --summary-interval=0 \
+            --console-log-level=notice \
+            2>&1 | tee /tmp/aria2_output.log
+          
+          ARIA_EXIT_CODE=${PIPESTATUS[0]}
+          
+          # بررسی نتایج
+          echo "=========================================="
+          echo "📊 بررسی نتایج دانلود:"
+          echo "=========================================="
+          
+          for i in "${!VALID_URLS[@]}"; do
+            url="${VALID_URLS[$i]}"
+            filename="${OUTPUT_NAMES[$i]}"
+            
+            if [ -f "downloads/$filename" ]; then
+              FILE_SIZE=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
+              if [ "$FILE_SIZE" -gt 10240 ]; then
+                HUMAN_SIZE=$(numfmt --to=iec $FILE_SIZE)
+                echo "✅ [$((i+1))/$TOTAL_URLS] $filename ($HUMAN_SIZE)"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                DOWNLOADED_FILES="$DOWNLOADED_FILES,$filename"
+              else
+                echo "⚠️ [$((i+1))/$TOTAL_URLS] $filename - فایل خیلی کوچک (${FILE_SIZE} بایت)"
+                rm -f "downloads/$filename"
+                FAILED_URLS="$FAILED_URLS\n- $url (سایز: ${FILE_SIZE} بایت - احتمالاً خراب)"
+              fi
             else
-              cp "$FILE" "upload/$BASENAME"
+              echo "❌ [$((i+1))/$TOTAL_URLS] $filename - دانلود نشد"
+              FAILED_URLS="$FAILED_URLS\n- $url (دانلود ناموفق)"
             fi
           done
-
-      - name: Generate Release
-        id: meta
-        shell: bash
-        run: |
-          TAG="run-$(date +%Y%m%d-%H%M%S)"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
+          
+          echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
+          echo "DOWNLOADED_FILES=$DOWNLOADED_FILES" >> $GITHUB_OUTPUT
+          echo "TOTAL_URLS=$TOTAL_URLS" >> $GITHUB_OUTPUT
+          
+          # ایجاد گزارش
           {
-            echo "# Report"
-            echo "## Success"
-            cat upload/success.txt
-            echo "## Failed"
-            cat upload/failed.txt
-            echo "## Files"
-            ls upload
-          } > body.md
+            echo "# گزارش دانلود 🚀"
+            echo ""
+            echo "**تاریخ:** $(date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            echo "**تعداد کل لینک‌ها:** $TOTAL_URLS"
+            echo ""
+            echo "**دانلود موفق:** $SUCCESS_COUNT"
+            echo ""
+            echo "**اتصالات موازی:** $CONNECTIONS"
+            echo ""
+            
+            if [ "$SUCCESS_COUNT" -gt 0 ]; then
+              echo "## فایل‌های دانلود شده ✅"
+              echo ""
+              while IFS= read -r file; do
+                if [ -n "$file" ]; then
+                  size=$(stat -c%s "downloads/$file" 2>/dev/null || echo 0)
+                  echo "- 📁 \`$file\` ($(numfmt --to=iec $size))"
+                fi
+              done <<< "$(echo "$DOWNLOADED_FILES" | tr ',' '\n' | tail -n +2)"
+              echo ""
+            fi
+            
+            if [ -n "$FAILED_URLS" ]; then
+              echo "## لینک‌های ناموفق ❌"
+              echo ""
+              echo -e "$FAILED_URLS"
+              echo ""
+            fi
+            
+            echo "---"
+            echo "💡 **نکته:** از aria2 برای دانلود سریع استفاده شده"
+          } > download_report.md
+          
+          echo "=========================================="
+          echo "📈 خلاصه: $SUCCESS_COUNT از $TOTAL_URLS فایل با موفقیت دانلود شد"
+          echo "=========================================="
+          
+          if [ "$SUCCESS_COUNT" -eq 0 ]; then
+            echo "❌ هیچ فایلی دانلود نشد - Release ساخته نمی‌شود"
+            exit 1
+          fi
+
+      - name: Show downloaded files
+        run: |
+          echo "📁 فایل‌های دانلود شده:"
+          echo "========================"
+          ls -lha downloads/
+          echo ""
+          echo "📊 حجم کل:"
+          du -sh downloads/
 
       - name: Create Release
+        if: steps.download.outputs.SUCCESS_COUNT != '0'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: Download ${{ steps.meta.outputs.tag }}
-          body_path: body.md
-          files: upload/*
+          tag_name: release-${{ github.run_number }}-attempt-${{ github.run_attempt }}
+          name: 🚀 Release #${{ github.run_number }} (${{ steps.download.outputs.SUCCESS_COUNT }}/${{ steps.download.outputs.TOTAL_URLS }} files)
+          body_path: download_report.md
+          files: |
+            downloads/*
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: download-report-${{ github.run_number }}
+          path: download_report.md
+          retention-days: 7
