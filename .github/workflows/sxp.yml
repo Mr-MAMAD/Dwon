@@ -1,30 +1,24 @@
-name: Download with cookies.txt Support
+name: SxyPrn Video Downloader
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'لینک‌های دانلود (هر خط یک لینک)'
+        description: 'لینک صفحات SxyPrn (هر خط یک لینک)'
         required: true
         type: string
-      cookies_txt:
-        description: 'محتوای فایل cookies.txt رو اینجا paste کن'
+      quality:
+        description: 'کیفیت (max/hd/sd)'
         required: false
-        default: ''
-        type: string
-      referer:
-        description: 'رفرر (آدرس صفحه‌ای که لینک رو ازش گرفتی)'
-        required: false
-        default: ''
-        type: string
-      connections:
-        description: 'تعداد اتصال موازی (پیش‌فرض: 8)'
-        required: false
-        default: '8'
-        type: string
+        default: 'max'
+        type: choice
+        options:
+          - max
+          - hd
+          - sd
 
 jobs:
-  download-with-cookies:
+  download-videos:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -33,109 +27,159 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install aria2 and curl
+      - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 curl
+          sudo apt-get install -y -qq curl wget aria2 jq pup
 
-      - name: Create downloads directory
-        run: mkdir -p downloads
-
-      - name: Convert cookies.txt and download
+      - name: Download videos
         id: download
         run: |
           mapfile -t URL_ARRAY <<< "${{ github.event.inputs.urls }}"
-          
-          COOKIES_TXT="${{ github.event.inputs.cookies_txt }}"
-          REFERER="${{ github.event.inputs.referer }}"
-          CONNECTIONS="${{ github.event.inputs.connections }}"
-          
-          # تبدیل cookies.txt به فرمت Cookie header
-          COOKIE_STRING=""
-          
-          if [ -n "$COOKIES_TXT" ]; then
-            echo "🍪 تبدیل cookies.txt به فرمت Cookie header..."
-            
-            while IFS=$'\t' read -r domain flag1 path flag2 expiry name value; do
-              # رد کردن خطوط کامنت و خالی
-              [[ "$domain" =~ ^# ]] && continue
-              [[ -z "$domain" ]] && continue
-              
-              # اضافه کردن name=value
-              if [ -n "$name" ] && [ -n "$value" ]; then
-                if [ -n "$COOKIE_STRING" ]; then
-                  COOKIE_STRING="$COOKIE_STRING; $name=$value"
-                else
-                  COOKIE_STRING="$name=$value"
-                fi
-              fi
-            done <<< "$COOKIES_TXT"
-            
-            echo "📋 کوکی‌های استخراج شده:"
-            echo "$COOKIE_STRING" | tr ';' '\n' | sed 's/^/   /'
-            echo ""
-          else
-            echo "⚠️ کوکی وارد نشده"
-          fi
+          QUALITY="${{ github.event.inputs.quality }}"
           
           SUCCESS_COUNT=0
           FAILED_LIST=""
           TOTAL_SIZE=0
           
+          mkdir -p downloads
+          
           INDEX=0
-          for url in "${URL_ARRAY[@]}"; do
-            url=$(echo "$url" | xargs)
-            if [ -z "$url" ]; then
+          for page_url in "${URL_ARRAY[@]}"; do
+            page_url=$(echo "$page_url" | xargs)
+            if [ -z "$page_url" ]; then
               continue
             fi
             
             INDEX=$((INDEX + 1))
             
             echo "=========================================="
-            echo "[$INDEX] 🔗 دانلود: ${url:0:120}..."
+            echo "[$INDEX] 🌐 صفحه: $page_url"
             echo "=========================================="
             
-            # استخراج نام فایل
-            filename=$(basename "$url" | cut -d'?' -f1 | cut -d'#' -f1 | sed 's/[^a-zA-Z0-9._-]/_/g')
-            
-            if [ -z "$filename" ] || [ ${#filename} -lt 5 ]; then
-              filename="download_$(date +%s%N | sha256sum | head -c 8)"
+            # استخراج slug از URL برای نام فایل
+            SLUG=$(echo "$page_url" | grep -oP 'post/\K[^?]+' | sed 's/\.html$//')
+            if [ -z "$SLUG" ]; then
+              SLUG="video_$INDEX"
             fi
             
-            # اضافه کردن پسوند اگه نداره
-            if ! echo "$filename" | grep -qE '\.[a-zA-Z0-9]{2,5}$'; then
-              # چک کردن Content-Type از هدر
-              content_type=$(curl -sI -L \
-                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                ${COOKIE_STRING:+-H "Cookie: $COOKIE_STRING"} \
-                ${REFERER:+-H "Referer: $REFERER"} \
-                --connect-timeout 10 \
-                --max-time 30 \
-                "$url" 2>/dev/null | grep -i "content-type:" | tail -1 | sed 's/.*: //' | tr -d '\r')
+            # دانلود صفحه
+            echo "📥 دانلود صفحه..."
+            PAGE_HTML=$(curl -s -L \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+              -H "Accept-Language: en-US,en;q=0.5" \
+              --connect-timeout 30 \
+              --max-time 60 \
+              "$page_url" 2>/dev/null)
+            
+            if [ -z "$PAGE_HTML" ]; then
+              echo "❌ صفحه دانلود نشد"
+              FAILED_LIST="$FAILED_LIST\n- [$INDEX] $page_url (صفحه لود نشد)"
+              continue
+            fi
+            
+            echo "✅ صفحه دانلود شد ($(echo "$PAGE_HTML" | wc -c) بایت)"
+            
+            # روش 1: استخراج لینک از video source
+            echo "🔍 جستجوی لینک ویدیو..."
+            
+            # استخراج همه لینک‌های احتمالی ویدیو
+            VIDEO_URL=""
+            
+            # روش 1a: src در تگ video
+            VIDEO_URL=$(echo "$PAGE_HTML" | grep -oP 'src="https?://[^"]*trafficdeposit[^"]*' | head -1 | sed 's/^src="//')
+            
+            # روش 1b: data-src
+            if [ -z "$VIDEO_URL" ]; then
+              VIDEO_URL=$(echo "$PAGE_HTML" | grep -oP 'data-src="https?://[^"]*trafficdeposit[^"]*' | head -1 | sed 's/^data-src="//')
+            fi
+            
+            # روش 1c: video_url در جاوااسکریپت
+            if [ -z "$VIDEO_URL" ]; then
+              VIDEO_URL=$(echo "$PAGE_HTML" | grep -oP "video_url:\s*'https?://[^']*trafficdeposit[^']*" | head -1 | sed "s/video_url:\s*'//")
+            fi
+            
+            # روش 1d: source داخل video
+            if [ -z "$VIDEO_URL" ]; then
+              VIDEO_URL=$(echo "$PAGE_HTML" | grep -oP '<source[^>]*src="https?://[^"]*trafficdeposit[^"]*' | head -1 | grep -oP 'src="\K[^"]*')
+            fi
+            
+            # روش 1e: هر لینکی که trafficdeposit داشته باشه
+            if [ -z "$VIDEO_URL" ]; then
+              VIDEO_URL=$(echo "$PAGE_HTML" | grep -oP 'https?://[^"'\''<>]*trafficdeposit[^"'\''<>]*\.(mp4|vid|m3u8|ts)[^"'\''<>]*' | head -1)
+            fi
+            
+            # روش 1f: لینک‌های widi
+            if [ -z "$VIDEO_URL" ]; then
+              VIDEO_URL=$(echo "$PAGE_HTML" | grep -oP 'https?://[^"'\''<>]*/widi/[^"'\''<>]*' | head -1)
+            fi
+            
+            # روش 2: استخراج از iframe
+            if [ -z "$VIDEO_URL" ]; then
+              echo "🔍 بررسی iframe..."
+              IFRAME_URL=$(echo "$PAGE_HTML" | grep -oP 'iframe[^>]*src="https?://[^"]*"' | head -1 | grep -oP 'src="\K[^"]*')
               
-              case "$content_type" in
-                *video/mp4*)  ext="mp4" ;;
-                *video/webm*) ext="webm" ;;
-                *video/x-flv*) ext="flv" ;;
-                *video/*)     ext="mp4" ;;
-                *)            ext="vid" ;;
-              esac
-              filename="${filename}.${ext}"
+              if [ -n "$IFRAME_URL" ]; then
+                echo "📥 دانلود iframe: ${IFRAME_URL:0:100}..."
+                IFRAME_HTML=$(curl -s -L \
+                  -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                  -H "Referer: $page_url" \
+                  --connect-timeout 30 \
+                  --max-time 60 \
+                  "$IFRAME_URL" 2>/dev/null)
+                
+                VIDEO_URL=$(echo "$IFRAME_HTML" | grep -oP 'https?://[^"'\''<>]*trafficdeposit[^"'\''<>]*\.(mp4|vid)[^"'\''<>]*' | head -1)
+              fi
             fi
             
-            # جلوگیری از overwrite
-            original="$filename"
-            counter=1
-            while [ -f "downloads/$filename" ]; do
-              base="${original%.*}"
-              ext="${original##*.}"
-              filename="${base}_${counter}.${ext}"
-              counter=$((counter + 1))
-            done
+            # روش 3: API endpoint
+            if [ -z "$VIDEO_URL" ]; then
+              echo "🔍 بررسی API..."
+              # استخراج video ID
+              VIDEO_ID=$(echo "$page_url" | grep -oP 'post/\K[^.?]+')
+              API_URL="https://sxyprn.com/api/video/$VIDEO_ID"
+              
+              API_RESPONSE=$(curl -s -L \
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                -H "Accept: application/json" \
+                -H "Referer: $page_url" \
+                --connect-timeout 30 \
+                --max-time 60 \
+                "$API_URL" 2>/dev/null)
+              
+              VIDEO_URL=$(echo "$API_RESPONSE" | grep -oP '"video_url":"[^"]*"' | cut -d'"' -f4 | sed 's/\\//g')
+              [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$API_RESPONSE" | grep -oP '"file":"[^"]*"' | cut -d'"' -f4)
+            fi
             
-            echo "📁 نام فایل: $filename"
+            # روش 4: کل HTML برای هر لینک trafficdeposit
+            if [ -z "$VIDEO_URL" ]; then
+              echo "🔍 جستجوی عمیق..."
+              # ذخیره HTML برای دیباگ
+              echo "$PAGE_HTML" > "/tmp/page_$INDEX.html"
+              
+              # استخراج همه لینک‌ها
+              ALL_LINKS=$(echo "$PAGE_HTML" | grep -oP 'https?://[^"'\''<>\s]+' | sort -u)
+              VIDEO_URL=$(echo "$ALL_LINKS" | grep -i "trafficdeposit" | head -1)
+              [ -z "$VIDEO_URL" ] && VIDEO_URL=$(echo "$ALL_LINKS" | grep -i "\.vid\|\.mp4\|/widi/" | head -1)
+            fi
             
-            # ساخت آرایه هدرها
+            if [ -z "$VIDEO_URL" ]; then
+              echo "❌ لینک ویدیو پیدا نشد"
+              echo "📄 بخشی از صفحه:"
+              echo "$PAGE_HTML" | grep -i "video\|source\|trafficdeposit\|widi\|\.vid\|\.mp4" | head -10
+              FAILED_LIST="$FAILED_LIST\n- [$INDEX] $page_url (لینک ویدیو استخراج نشد)"
+              continue
+            fi
+            
+            echo "🎬 لینک ویدیو: ${VIDEO_URL:0:120}..."
+            
+            # تعیین نام فایل
+            FILENAME="${SLUG}.mp4"
+            
+            echo "📁 ذخیره به عنوان: $FILENAME"
+            
+            # ساخت هدرها
             HEADER_OPTS=(
               --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
               --header="Accept: */*"
@@ -143,40 +187,22 @@ jobs:
               --header="Accept-Encoding: identity"
               --header="Connection: keep-alive"
               --header="Cache-Control: no-cache"
-              --header="Pragma: no-cache"
               --header="Sec-Fetch-Dest: video"
               --header="Sec-Fetch-Mode: no-cors"
               --header="Sec-Fetch-Site: cross-site"
-              --header="DNT: 1"
-              --header="Upgrade-Insecure-Requests: 1"
+              --referer="$page_url"
+              --header="Referer: $page_url"
+              --header="Origin: https://sxyprn.com"
             )
             
-            # اضافه کردن رفرر
-            if [ -n "$REFERER" ]; then
-              echo "🔗 رفرر: $REFERER"
-              HEADER_OPTS+=(--referer="$REFERER")
-              HEADER_OPTS+=(--header="Referer: $REFERER")
-              HEADER_OPTS+=(--header="Origin: $(echo "$REFERER" | grep -oP '^https?://[^/]+')")
-            else
-              DOMAIN=$(echo "$url" | grep -oP '^https?://[^/]+')
-              HEADER_OPTS+=(--referer="$DOMAIN/")
-            fi
+            echo "🚀 دانلود ویدیو..."
             
-            # اضافه کردن کوکی
-            if [ -n "$COOKIE_STRING" ]; then
-              echo "🍪 کوکی: ${COOKIE_STRING:0:80}..."
-              HEADER_OPTS+=(--header="Cookie: $COOKIE_STRING")
-            fi
-            
-            echo "🚀 شروع دانلود با $CONNECTIONS اتصال..."
-            echo ""
-            
-            # تلاش 1: aria2 با کوکی
+            # دانلود با aria2
             aria2c \
-              "$url" \
-              --out="downloads/$filename" \
-              --max-connection-per-server="$CONNECTIONS" \
-              --split="$CONNECTIONS" \
+              "$VIDEO_URL" \
+              --out="downloads/$FILENAME" \
+              --max-connection-per-server=8 \
+              --split=8 \
               --min-split-size=1M \
               --connect-timeout=30 \
               --timeout=600 \
@@ -194,72 +220,34 @@ jobs:
             
             ARIA_EXIT=${PIPESTATUS[0]}
             
-            # تلاش 2: curl به عنوان backup
-            if [ $ARIA_EXIT -ne 0 ] || [ ! -f "downloads/$filename" ] || [ $(stat -c%s "downloads/$filename" 2>/dev/null || echo 0) -lt 10240 ]; then
-              echo ""
-              echo "⚠️ aria2 ناموفق - تلاش با curl (تک اتصال)..."
-              
-              CURL_OPTS=(
-                -L
-                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                -H "Accept: */*"
-                -H "Connection: keep-alive"
-                --connect-timeout 30
-                --max-time 600
-                -o "downloads/$filename"
-              )
-              
-              [ -n "$REFERER" ] && CURL_OPTS+=(-H "Referer: $REFERER") && CURL_OPTS+=(--referer "$REFERER")
-              [ -n "$COOKIE_STRING" ] && CURL_OPTS+=(-H "Cookie: $COOKIE_STRING")
-              
-              curl "${CURL_OPTS[@]}" "$url" 2>&1 | tail -5
-              echo ""
+            # Fallback to curl
+            if [ $ARIA_EXIT -ne 0 ]; then
+              echo "⚠️ تلاش با curl..."
+              curl -L \
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                -H "Referer: $page_url" \
+                -H "Origin: https://sxyprn.com" \
+                --connect-timeout 30 \
+                --max-time 600 \
+                -o "downloads/$FILENAME" \
+                "$VIDEO_URL" 2>&1
             fi
             
-            # تلاش 3: wget با تمام هدرها
-            if [ ! -f "downloads/$filename" ] || [ $(stat -c%s "downloads/$filename" 2>/dev/null || echo 0) -lt 10240 ]; then
-              echo "⚠️ curl ناموفق - تلاش با wget..."
-              
-              WGET_OPTS=(
-                --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                --header="Accept: */*"
-                --header="Connection: keep-alive"
-                --tries=3
-                --timeout=60
-                --continue
-                --no-check-certificate
-                -O "downloads/$filename"
-              )
-              
-              [ -n "$REFERER" ] && WGET_OPTS+=(--referer="$REFERER")
-              [ -n "$COOKIE_STRING" ] && WGET_OPTS+=(--header="Cookie: $COOKIE_STRING")
-              
-              wget "${WGET_OPTS[@]}" "$url" 2>&1 | tail -5
-              echo ""
-            fi
-            
-            # بررسی نتیجه نهایی
-            if [ -f "downloads/$filename" ]; then
-              SIZE=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
-              if [ "$SIZE" -gt 102400 ]; then  # بزرگتر از 100KB
-                HUMAN=$(numfmt --to=iec $SIZE)
-                echo "✅ [$INDEX] موفق: $filename ($HUMAN)"
+            # بررسی نتیجه
+            if [ -f "downloads/$FILENAME" ]; then
+              SIZE=$(stat -c%s "downloads/$FILENAME" 2>/dev/null || echo 0)
+              if [ "$SIZE" -gt 102400 ]; then
+                echo "✅ موفق: $FILENAME ($(numfmt --to=iec $SIZE))"
                 SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
-              elif [ "$SIZE" -gt 1024 ]; then
-                echo "⚠️ [$INDEX] حجم مشکوک: $SIZE بایت"
-                # نمایش محتوا برای دیباگ
-                head -c 300 "downloads/$filename" 2>/dev/null | cat -v
-                rm -f "downloads/$filename"
-                FAILED_LIST="$FAILED_LIST\n- [$INDEX] $url (حجم: ${SIZE} بایت)"
               else
-                echo "❌ [$INDEX] حجم خیلی کم: $SIZE بایت"
-                rm -f "downloads/$filename"
-                FAILED_LIST="$FAILED_LIST\n- [$INDEX] $url (حجم: ${SIZE} بایت)"
+                echo "❌ حجم کم: $SIZE بایت"
+                rm -f "downloads/$FILENAME"
+                FAILED_LIST="$FAILED_LIST\n- [$INDEX] $page_url (حجم غیرعادی)"
               fi
             else
-              echo "❌ [$INDEX] فایل ایجاد نشد"
-              FAILED_LIST="$FAILED_LIST\n- [$INDEX] $url (دانلود ناموفق)"
+              echo "❌ دانلود ناموفق"
+              FAILED_LIST="$FAILED_LIST\n- [$INDEX] $page_url (خطا در دانلود)"
             fi
             
             echo ""
@@ -268,32 +256,24 @@ jobs:
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
           echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
           
-          # ایجاد گزارش
+          # ذخیره HTML صفحات برای دیباگ
+          tar czf /tmp/pages_html.tar.gz /tmp/page_*.html 2>/dev/null || true
+          
           {
-            echo "# 📊 گزارش دانلود با کوکی"
-            echo ""
-            echo "**زمان:** $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "# 📊 گزارش دانلود SxyPrn"
             echo ""
             echo "| مورد | مقدار |"
             echo "|------|-------|"
-            echo "| کل لینک‌ها | $INDEX |"
+            echo "| کل صفحات | $INDEX |"
             echo "| دانلود موفق | $SUCCESS_COUNT |"
             echo "| حجم کل | $(numfmt --to=iec $TOTAL_SIZE) |"
-            echo "| کوکی | $([ -n "$COOKIE_STRING" ] && echo "✅ فعال" || echo "❌ ندارد") |"
-            echo "| رفرر | ${REFERER:-خودکار} |"
             echo ""
             
             if [ $SUCCESS_COUNT -gt 0 ]; then
-              echo "## ✅ فایل‌های دانلود شده"
+              echo "## ✅ ویدیوهای دانلود شده"
               echo ""
-              echo "| # | نام فایل | حجم |"
-              echo "|---|----------|-----|"
-              count=1
               for f in downloads/*; do
-                if [ -f "$f" ]; then
-                  echo "| $count | \`$(basename "$f")\` | $(numfmt --to=iec $(stat -c%s "$f")) |"
-                  count=$((count + 1))
-                fi
+                [ -f "$f" ] && echo "- 🎬 \`$(basename "$f")\` ($(numfmt --to=iec $(stat -c%s "$f")))"
               done
             fi
             
@@ -301,43 +281,33 @@ jobs:
               echo ""
               echo "## ❌ خطاها"
               echo -e "$FAILED_LIST"
-              echo ""
-              echo "💡 **راهنمایی:**"
-              echo "- مطمئن شو کوکی‌ها موقع دانلود معتبر باشن"
-              echo "- از همون IP که کوکی گرفتی دانلود کن"
-              echo "- بعضی لینک‌ها فقط یکبار مصرف هستن"
             fi
           } > download_report.md
           
           if [ "$SUCCESS_COUNT" -eq 0 ]; then
-            echo "❌ هیچ فایلی دانلود نشد!"
+            echo "❌ هیچ ویدیویی دانلود نشد!"
             exit 1
           fi
-
-      - name: Show results
-        run: |
-          echo "📁 فایل‌های دانلود شده:"
-          du -sh downloads/ 2>/dev/null
-          ls -lh downloads/
 
       - name: Create Release
         if: steps.download.outputs.SUCCESS_COUNT != '0'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: cookie-download-${{ github.run_number }}
-          name: 🍪 Cookie Download #${{ github.run_number }}
+          tag_name: sxyprn-${{ github.run_number }}
+          name: 🎬 SxyPrn Videos #${{ github.run_number }}
           body_path: download_report.md
           files: |
             downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload debug logs
+      - name: Upload debug data
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-logs-${{ github.run_number }}
+          name: debug-data-${{ github.run_number }}
           path: |
+            /tmp/pages_html.tar.gz
             /tmp/aria2_*.log
             download_report.md
           retention-days: 3
