@@ -1,102 +1,59 @@
-name: Video Downloader - Cloudflare Fixed
+name: dood download Videos
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'Video page URLs (one per line)'
+        description: 'One URL per line'
         required: true
         type: string
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  download:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    
+
     steps:
-      - name: Setup
+      - uses: actions/checkout@v4
+
+      - name: Install tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq python3 python3-pip python3-dev build-essential ffmpeg
-          pip3 install --upgrade pip setuptools wheel
-          # Install curl_cffi with build deps (this is the key part)
-          pip3 install curl-cffi --verbose
-          # Now install yt-dlp (will detect curl_cffi)
-          pip3 install yt-dlp
-          mkdir -p downloads
-          echo "Available impersonation targets:"
-          python3 -m yt_dlp --list-impersonate-targets
+          sudo apt update
+          sudo apt install -y ffmpeg
+          python3 -m pip install -U yt-dlp
 
       - name: Download videos
-        id: dl
-        shell: bash
         run: |
-          success=0
-          total=0
-          
-          while IFS= read -r url; do
-            url=$(echo "$url" | xargs)
-            [ -z "$url" ] && continue
-            total=$((total+1))
-            
-            echo "=========================================="
-            echo "[$total] Downloading: $url"
-            echo "=========================================="
-            
-            # Use impersonation to bypass Cloudflare
-            python3 -m yt_dlp \
-              --no-playlist \
-              --merge-output-format mp4 \
-              --impersonate chrome \
-              -o "downloads/%(title)s.%(ext)s" \
-              "$url" 2>&1 || {
-                echo "❌ Failed: $url"
-                echo "$url" >> failed.txt
-                continue
-              }
-            
-            # Verify downloaded file
-            file=$(ls -t downloads/ | head -1)
-            if [ -n "$file" ]; then
-              size=$(stat -c%s "downloads/$file" 2>/dev/null || echo 0)
-              if [ "$size" -gt 102400 ]; then
-                echo "✅ Downloaded: $file ($(numfmt --to=iec $size))"
-                success=$((success+1))
-              else
-                echo "❌ File too small ($size bytes)"
-                rm -f "downloads/$file"
-                echo "$url" >> failed.txt
-              fi
-            fi
-            echo ""
-          done <<< "${{ github.event.inputs.urls }}"
-          
-          echo "success=$success" >> $GITHUB_OUTPUT
-          
-          # Write report
-          echo "## Download Report" > report.md
-          echo "| Success | Total |" >> report.md
-          echo "|---------|-------|" >> report.md
-          echo "| $success | $total |" >> report.md
-          
-          if [ -f failed.txt ]; then
-            echo "" >> report.md
-            echo "## Failed URLs" >> report.md
-            cat failed.txt >> report.md
-          fi
-          
-          if [ $success -eq 0 ]; then
-            echo "No files downloaded!"
-            exit 1
-          fi
+          mkdir -p downloads
 
-      - name: Create Release
-        if: steps.dl.outputs.success != '0'
+          cat << 'EOF' > urls.txt
+          ${{ github.event.inputs.urls }}
+          EOF
+
+          counter=1
+
+          while IFS= read -r url || [ -n "$url" ]; do
+            [ -z "$url" ] && continue
+
+            echo "Downloading: $url"
+
+            yt-dlp \
+              --merge-output-format mp4 \
+              -o "downloads/video_${counter}.%(ext)s" \
+              "$url"
+
+            counter=$((counter+1))
+          done < urls.txt
+
+      - name: Create archive
+        run: zip -r videos.zip downloads
+
+      - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: video-${{ github.run_number }}
-          files: downloads/*
-          body_path: report.md
+          tag_name: run-${{ github.run_number }}
+          files: videos.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
