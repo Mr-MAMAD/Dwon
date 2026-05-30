@@ -1,4 +1,4 @@
-name: Magnet Torrent Downloader
+name: Magnet Torrent Downloader with Timeout
 
 on:
   workflow_dispatch:
@@ -7,12 +7,23 @@ on:
         description: 'لینک‌های مگنت (هر خط یک لینک)'
         required: true
         type: string
+      split_size:
+        description: 'حجم هر تکه (مثلاً 1900M)'
+        required: false
+        default: '1900M'
+        type: string
+      timeout_minutes:
+        description: 'حداکثر زمان انتظار برای هر مگنت (دقیقه) - پیش‌فرض 15'
+        required: false
+        default: '15'
+        type: string
 
 jobs:
   download-torrents:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    timeout-minutes: 360  # حداکثر زمان کل ورکفلو
     
     steps:
       - name: Checkout
@@ -23,19 +34,22 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 curl
 
-      - name: Download torrents
+      - name: Download and split torrents
         id: download
         shell: bash
         run: |
           set +e
           
           mapfile -t MAGNET_ARRAY <<< "${{ github.event.inputs.magnets }}"
+          SPLIT_SIZE="${{ github.event.inputs.split_size }}"
+          TIMEOUT_MINUTES="${{ github.event.inputs.timeout_minutes }}"
+          TIMEOUT_SECONDS=$((TIMEOUT_MINUTES * 60))
           
           SUCCESS_COUNT=0
           FAILED_LIST=""
           TOTAL_SIZE=0
           
-          mkdir -p downloads
+          mkdir -p downloads splitted
           
           INDEX=0
           for magnet in "${MAGNET_ARRAY[@]}"; do
@@ -48,42 +62,42 @@ jobs:
             
             echo "=========================================="
             echo "[$INDEX] 🧲 مگنت: ${magnet:0:100}..."
+            echo "⏱️ حداکثر زمان انتظار: ${TIMEOUT_MINUTES} دقیقه"
             echo "=========================================="
             
-            # استخراج نام فایل از magnet link
+            # استخراج نام فایل
             FILENAME=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
             
-            # اگر نام پیدا نشد از hash استفاده کن
             if [ -z "$FILENAME" ]; then
               HASH=$(echo "$magnet" | grep -oP 'btih:\K[^&]+' 2>/dev/null)
               FILENAME="torrent_${HASH:0:10}.mp4"
             fi
             
-            # تمیز کردن نام فایل
-            FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__\+/_/g')
+            CLEAN_NAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__\+/_/g')
+            BASE_NAME="${CLEAN_NAME%.*}"
             
-            echo "📁 نام فایل: $FILENAME"
+            echo "📁 نام فایل: $CLEAN_NAME"
             
-            # دانلود با aria2c (پشتیبانی عالی از magnet)
-            echo "🚀 شروع دانلود تورنت..."
-            echo ""
+            # ==========================================
+            # دانلود با timeout
+            # ==========================================
+            echo "🚀 شروع دانلود (timeout: ${TIMEOUT_MINUTES}min)..."
             
-            # aria2c مستقیماً magnet رو ساپورت میکنه
+            # اجرای aria2 در background
             aria2c \
               "$magnet" \
               --dir="downloads" \
-              --out="$FILENAME" \
+              --out="$CLEAN_NAME" \
               --seed-time=0 \
               --max-upload-limit=10K \
-              --max-overall-upload-limit=50K \
               --bt-max-peers=100 \
               --bt-request-peer-speed-limit=50M \
               --max-concurrent-downloads=5 \
               --split=16 \
               --min-split-size=1M \
               --connect-timeout=30 \
-              --timeout=600 \
-              --max-tries=5 \
+              --timeout=60 \
+              --max-tries=0 \
               --retry-wait=5 \
               --continue=true \
               --allow-overwrite=false \
@@ -98,90 +112,177 @@ jobs:
               --bt-enable-lpd=true \
               --bt-tracker-connect-timeout=10 \
               --bt-tracker-timeout=10 \
+              --bt-stop-timeout=60 \
               --dht-entry-point="dht.transmissionbt.com:6881" \
               --dht-entry-point="router.bittorrent.com:6881" \
               --dht-entry-point="router.utorrent.com:6881" \
-              2>&1 | tee "/tmp/aria2_${INDEX}.log" || true
+              2>&1 | tee "/tmp/aria2_${INDEX}.log" &
             
-            ARIA_EXIT=${PIPESTATUS[0]}
+            ARIA_PID=$!
             
-            # aria2 ممکنه فایل رو با اسم دیگه‌ای ذخیره کرده باشه
-            # پیدا کردن فایل دانلود شده
-            DOWNLOADED_FILE=$(find downloads -type f -newer "/tmp/aria2_${INDEX}.log" -size +100k 2>/dev/null | head -1)
+            # ==========================================
+            # Monitoring با timeout
+            # ==========================================
+            START_TIME=$(date +%s)
+            LAST_SIZE=0
+            STUCK_COUNT=0
             
-            if [ -z "$DOWNLOADED_FILE" ]; then
-              DOWNLOADED_FILE="downloads/$FILENAME"
+            while kill -0 $ARIA_PID 2>/dev/null; do
+              CURRENT_TIME=$(date +%s)
+              ELAPSED=$((CURRENT_TIME - START_TIME))
+              
+              # چک timeout
+              if [ "$ELAPSED" -gt "$TIMEOUT_SECONDS" ]; then
+                echo ""
+                echo "⏰ timeout! ($TIMEOUT_MINUTES دقیقه گذشت)"
+                
+                # چک کن حداقل چیزی دانلود شده؟
+                if [ -f "downloads/$CLEAN_NAME" ]; then
+                  SIZE=$(stat -c%s "downloads/$CLEAN_NAME" 2>/dev/null || echo 0)
+                  if [ "$SIZE" -gt 1048576 ]; then  # اگه بیشتر از 1MB دانلود شده
+                    echo "⚠️ دانلود ناقص - $(numfmt --to=iec $SIZE) دانلود شد"
+                  else
+                    echo "❌ تقریباً هیچی دانلود نشد"
+                    rm -f "downloads/$CLEAN_NAME"
+                  fi
+                fi
+                
+                kill -9 $ARIA_PID 2>/dev/null
+                break
+              fi
+              
+              # چک stuck شدن (5 دقیقه بدون پیشرفت)
+              if [ -f "downloads/$CLEAN_NAME" ]; then
+                CURRENT_SIZE=$(stat -c%s "downloads/$CLEAN_NAME" 2>/dev/null || echo 0)
+                if [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ] && [ "$ELAPSED" -gt 300 ]; then
+                  STUCK_COUNT=$((STUCK_COUNT + 1))
+                  if [ "$STUCK_COUNT" -gt 6 ]; then  # 6×10s = 60s stuck
+                    echo ""
+                    echo "🔴 دانلود stuck شده - بدون پیشرفت برای 1 دقیقه"
+                    kill -9 $ARIA_PID 2>/dev/null
+                    break
+                  fi
+                else
+                  STUCK_COUNT=0
+                fi
+                LAST_SIZE=$CURRENT_SIZE
+              fi
+              
+              # نمایش وضعیت هر 30 ثانیه
+              if [ $((ELAPSED % 30)) -eq 0 ]; then
+                echo "⏳ [$((ELAPSED/60))دقیقه] در حال دانلود..."
+              fi
+              
+              sleep 10
+            done
+            
+            wait $ARIA_PID 2>/dev/null
+            
+            # ==========================================
+            # بررسی نتیجه
+            # ==========================================
+            DOWNLOADED_FILE="downloads/$CLEAN_NAME"
+            
+            # پیدا کردن فایل اگه با اسم دیگه ذخیره شده
+            if [ ! -f "$DOWNLOADED_FILE" ]; then
+              DOWNLOADED_FILE=$(find downloads -type f -newer "/tmp/aria2_${INDEX}.log" -size +100k 2>/dev/null | head -1)
             fi
             
-            # بررسی نتیجه
             if [ -f "$DOWNLOADED_FILE" ]; then
               SIZE=$(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || echo 0)
+              HUMAN_SIZE=$(numfmt --to=iec $SIZE 2>/dev/null)
+              
               if [ "$SIZE" -gt 102400 ]; then
                 echo ""
-                echo "✅ [$INDEX] موفق: $(basename "$DOWNLOADED_FILE") ($(numfmt --to=iec $SIZE))"
+                echo "✅ [$INDEX] دانلود شد: $(basename "$DOWNLOADED_FILE") ($HUMAN_SIZE)"
                 
-                # rename به اسم درست اگه لازم باشه
-                if [ "$(basename "$DOWNLOADED_FILE")" != "$FILENAME" ]; then
-                  mv "$DOWNLOADED_FILE" "downloads/$FILENAME" 2>/dev/null
+                MAX_SIZE=$((2 * 1024 * 1024 * 1024))  # 2GB
+                
+                if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+                  echo "✂️ تقسیم فایل به تکه‌های ${SPLIT_SIZE}..."
+                  
+                  SPLIT_DIR="splitted/${BASE_NAME}"
+                  mkdir -p "$SPLIT_DIR"
+                  
+                  split -d -b "$SPLIT_SIZE" "$DOWNLOADED_FILE" "${SPLIT_DIR}/${BASE_NAME}.part"
+                  
+                  md5sum "$DOWNLOADED_FILE" > "${SPLIT_DIR}/checksum.md5"
+                  
+                  cat > "${SPLIT_DIR}/info.txt" << EOF
+Original File: $CLEAN_NAME
+Original Size: $HUMAN_SIZE ($SIZE bytes)
+Split Size: $SPLIT_SIZE
+Total Parts: $(ls "${SPLIT_DIR}"/*.part* 2>/dev/null | wc -l)
+
+ترکیب در ویندوز:
+  copy /b part00 + part01 + part02 ... $CLEAN_NAME
+
+ترکیب در لینوکس/مک:
+  cat part* > $CLEAN_NAME
+  md5sum -c checksum.md5
+EOF
+                  
+                  echo "📦 تکه‌ها:"
+                  ls -lh "$SPLIT_DIR"/
+                  
+                  rm -f "$DOWNLOADED_FILE"
+                else
+                  cp "$DOWNLOADED_FILE" "splitted/$CLEAN_NAME"
                 fi
                 
                 SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
+                
               else
                 echo ""
-                echo "❌ [$INDEX] حجم کم: $SIZE بایت"
-                FAILED_LIST="$FAILED_LIST\n- [$INDEX] ${magnet:0:80}... (حجم: ${SIZE} بایت)"
+                echo "❌ [$INDEX] حجم خیلی کم: $SIZE بایت - حذف"
+                rm -f "$DOWNLOADED_FILE"
+                FAILED_LIST="$FAILED_LIST\n- [$INDEX] $CLEAN_NAME (حجم: ${SIZE} بایت - احتمالاً سیدر نداشته)"
               fi
             else
               echo ""
-              echo "❌ [$INDEX] دانلود ناموفق"
-              echo "فایل‌های موجود در downloads:"
-              ls -lh downloads/ 2>/dev/null
-              FAILED_LIST="$FAILED_LIST\n- [$INDEX] ${magnet:0:80}..."
+              echo "❌ [$INDEX] دانلود ناموفق - فایل ایجاد نشد"
+              FAILED_LIST="$FAILED_LIST\n- [$INDEX] $CLEAN_NAME (سیدر پیدا نشد - timeout)"
             fi
             
+            echo ""
+            echo "--- رفتن به مگنت بعدی ---"
             echo ""
           done
           
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
           echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
           
-          # گزارش
           {
             echo "# 📊 گزارش دانلود تورنت"
             echo ""
             echo "**زمان:** $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "**حداکثر زمان انتظار:** ${TIMEOUT_MINUTES} دقیقه"
             echo ""
             echo "| مورد | مقدار |"
             echo "|------|-------|"
             echo "| کل مگنت‌ها | $INDEX |"
-            echo "| دانلود موفق | $SUCCESS_COUNT |"
+            echo "| موفق | $SUCCESS_COUNT |"
+            echo "| ناموفق | $((INDEX - SUCCESS_COUNT)) |"
             echo "| حجم کل | $(numfmt --to=iec $TOTAL_SIZE) |"
             echo ""
             
             if [ $SUCCESS_COUNT -gt 0 ]; then
-              echo "## ✅ فایل‌های دانلود شده"
+              echo "## ✅ دانلود شده"
               echo ""
-              echo "| # | نام فایل | حجم |"
-              echo "|---|----------|-----|"
-              count=1
-              for f in downloads/*; do
-                if [ -f "$f" ] && [ $(stat -c%s "$f") -gt 102400 ]; then
-                  echo "| $count | \`$(basename "$f")\` | $(numfmt --to=iec $(stat -c%s "$f")) |"
-                  count=$((count + 1))
+              for f in splitted/*; do
+                if [ -f "$f" ]; then
+                  echo "- 🎬 \`$(basename "$f")\` ($(numfmt --to=iec $(stat -c%s "$f")))"
+                elif [ -d "$f" ]; then
+                  echo "- 📦 \`$(basename "$f")\` ($(ls "$f"/*.part* 2>/dev/null | wc -l) تکه)"
                 fi
               done
             fi
             
             if [ -n "$FAILED_LIST" ]; then
               echo ""
-              echo "## ❌ خطاها"
+              echo "## ❌ ناموفق"
               echo -e "$FAILED_LIST"
-              echo ""
-              echo "💡 **علت احتمالی:**"
-              echo "- تعداد سیدر کم"
-              echo "- ترکرها در دسترس نبودن"
-              echo "- فایل از تورنت حذف شده"
             fi
           } > download_report.md
           
@@ -190,21 +291,16 @@ jobs:
             exit 1
           fi
 
-      - name: Show downloads
-        run: |
-          echo "📁 فایل‌های دانلود شده:"
-          du -sh downloads/ 2>/dev/null || echo "خالی"
-          ls -lh downloads/ 2>/dev/null || echo "بدون فایل"
-
       - name: Create Release
         if: steps.download.outputs.SUCCESS_COUNT != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: torrent-${{ github.run_number }}
-          name: 🧲 Torrent Download #${{ github.run_number }}
+          name: 🧲 Torrent #${{ github.run_number }}
           body_path: download_report.md
           files: |
-            downloads/*
+            splitted/**/*
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
