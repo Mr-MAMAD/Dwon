@@ -1,42 +1,8 @@
-name: Magnet Torrent Downloader (Stable v3)
-
-on:
-  workflow_dispatch:
-    inputs:
-      magnets:
-        description: 'Magnet links (ONE PER LINE)'
-        required: true
-        type: string
-      stuck_limit:
-        description: 'Skip after N times SD:0 (default: 5)'
-        required: false
-        default: '5'
-        type: string
-      total_timeout:
-        description: 'Max wait per magnet (minutes, default: 30)'
-        required: false
-        default: '30'
-        type: string
-
-jobs:
-  download-torrents:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    timeout-minutes: 360
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 curl
-
       - name: Download torrents
         id: download
         shell: bash
+        env:
+          MAGNETS: ${{ github.event.inputs.magnets }}    # ⬅️ اینجا ذخیره کن
         run: |
           set +e
 
@@ -51,8 +17,8 @@ jobs:
 
           mkdir -p downloads
 
-          while IFS= read -r line; do
-            magnet=$(echo "$line" | xargs | grep -oP 'magnet:\?[^ ]+' | head -1)
+          echo "$MAGNETS" | while IFS= read -r line; do    # ⬅️ pipe با حفظ خطوط
+            magnet=$(echo "$line" | grep -oP 'magnet:\?[^ ]+' | head -1)   # بدون xargs
             [ -z "$magnet" ] && continue
 
             INDEX=$((INDEX + 1))
@@ -167,9 +133,9 @@ jobs:
             echo ""
             echo "--- Moving to next ---"
             echo ""
-          done <<< "${{ github.event.inputs.magnets }}"
+          done
 
-          # Write outputs (even if zero success, we don't fail the job)
+          # Write outputs
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
           echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
 
@@ -192,16 +158,4 @@ jobs:
             fi
           } > download_report.md
 
-          # NO exit 1 here – let the job succeed always
           echo "Done processing all magnets. Total success: $SUCCESS_COUNT"
-
-      - name: Release
-        if: steps.download.outputs.SUCCESS_COUNT != '0'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: torrent-${{ github.run_number }}
-          name: 🧲 Torrent #${{ github.run_number }}
-          body_path: download_report.md
-          files: downloads/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
