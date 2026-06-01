@@ -1,248 +1,156 @@
-name: PH Downloader (100 URLs)
+name: PH Downloader
 
 on:
-  workflow_dispatch:
-    inputs:
-      url:
-        description: 'Video URLs (comma/space/newline separated) - up to 100 links'
-        required: true
-        type: string
-      quality:
-        description: 'Quality'
-        required: true
-        type: choice
-        options:
-          - 'best'
-          - '720p'
-          - '480p'
-      cookies:
-        description: 'Cookies from browser (Netscape format - export with extension)'
-        required: false
-        type: string
+workflow_dispatch:
+inputs:
+url:
+description: 'Video URLs'
+required: true
+type: string
+quality:
+description: 'Quality'
+required: true
+type: choice
+options:
+- best
+- 720p
+- 480p
+cookies:
+description: 'Cookies in Netscape format'
+required: false
+type: string
 
 jobs:
-  download:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+download:
+runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+```
+permissions:
+  contents: write
 
-      - name: Install yt-dlp (nightly)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg
-          # نسخه nightly که آخرین تغییرات PornHub را دارد
-          sudo curl -L https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-          sudo chmod a+rx /usr/local/bin/yt-dlp
-          echo "yt-dlp version:"
-          yt-dlp --version
+steps:
+  - uses: actions/checkout@v4
 
-      - name: Setup Cookies
-        env:
-          INPUT_COOKIES: ${{ github.event.inputs.cookies }}
-        run: |
-          if [ -n "$INPUT_COOKIES" ]; then
-            echo "$INPUT_COOKIES" > cookies.txt
-            echo "Cookies file created"
-          else
-            echo "No cookies provided - using headers only"
-          fi
+  - name: Install yt-dlp
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y ffmpeg
 
-      - name: Prepare URL List
-        env:
-          INPUT_URL: ${{ github.event.inputs.url }}
-        run: |
-          echo "$INPUT_URL" | sed 's/[,[:space:]]\+/\n/g' | grep -v '^$' > urls.txt
-          head -n 100 urls.txt > urls_limited.txt
-          mv urls_limited.txt urls.txt
-          
-          TOTAL=$(wc -l < urls.txt)
-          echo "Total URLs: $TOTAL"
-          echo "TOTAL_URLS=$TOTAL" >> $GITHUB_ENV
-          
-          echo ""
-          echo "URLs to download:"
-          cat -n urls.txt
+      sudo curl -L \
+      https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp \
+      -o /usr/local/bin/yt-dlp
 
-      - name: Download Videos
-        env:
-          QUALITY: ${{ github.event.inputs.quality }}
-        run: |
-          mkdir -p output
+      sudo chmod +x /usr/local/bin/yt-dlp
 
-          if [ "$QUALITY" = "720p" ]; then
-            FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
-          elif [ "$QUALITY" = "480p" ]; then
-            FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
-          else
-            FORMAT="bestvideo+bestaudio/best"
-          fi
+      yt-dlp --version
 
-          # تشخیص وجود cookies
-          COOKIES_OPT=""
-          if [ -f cookies.txt ]; then
-            COOKIES_OPT="--cookies cookies.txt"
-          fi
-          export COOKIES_OPT
+  - name: Setup Cookies
+    env:
+      INPUT_COOKIES: ${{ github.event.inputs.cookies }}
+    run: |
+      if [ -n "$INPUT_COOKIES" ]; then
+        printf "%s" "$INPUT_COOKIES" > cookies.txt
+        echo "Cookies file created"
+      fi
 
-          cat > download.sh << 'SCRIPT'
-          #!/bin/bash
-          URL="$1"
-          FORMAT="$2"
-          INDEX="$3"
-          
-          USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-          
-          # گرفتن cookies option از محیط
-          COOKIES_OPT="${COOKIES_OPT:-}"
-          
-          for i in 1 2 3 4 5; do
-            echo "[$INDEX] Attempt $i: $URL"
-            
-            # ساخت command به صورت array برای handle کردن cookies
-            CMD=(yt-dlp -f "$FORMAT"
-              --merge-output-format mp4
-              --no-playlist
-              --restrict-filenames
-              --encoding utf-8
-              --user-agent "$USER_AGENT"
-              --referer "https://www.pornhub.com/"
-              --add-header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-              --add-header "Accept-Language: en-US,en;q=0.9"
-              --add-header "Cache-Control: no-cache"
-              --add-header "Sec-Ch-Ua: \"Google Chrome\";v=\"125\", \"Chromium\";v=\"125\", \"Not.A/Brand\";v=\"24\""
-              --add-header "Sec-Ch-Ua-Mobile: ?0"
-              --add-header "Sec-Ch-Ua-Platform: \"Windows\""
-              --add-header "Sec-Fetch-Dest: document"
-              --add-header "Sec-Fetch-Mode: navigate"
-              --add-header "Sec-Fetch-Site: none"
-              --add-header "Sec-Fetch-User: ?1"
-              --add-header "Upgrade-Insecure-Requests: 1"
-              --sleep-requests 2
-              --sleep-interval 3
-              --max-sleep-interval 8
-              --retries 5
-              --fragment-retries 5
-              --extractor-retries 5
-              --no-check-certificates
-              --geo-bypass
-              --legacy-server-connect
-              --ignore-no-formats-error
-              -o "output/testname.mp4"
-            )
-            
-            # اضافه کردن cookies اگر وجود داشت
-            if [ -n "$COOKIES_OPT" ]; then
-              CMD+=($COOKIES_OPT)
-            fi
-            
-            CMD+=("$URL")
-            
-            OUTPUT=$("${CMD[@]}" 2>&1) && {
-              echo "[$INDEX] SUCCESS"
-              exit 0
-            }
-            
-            echo "$OUTPUT" | tail -5
-            
-            # اگر 410 یا private بود، skip کن
-            if echo "$OUTPUT" | grep -qE "410: Gone|Private video|Video unavailable"; then
-              echo "[$INDEX] SKIPPED: Video not accessible"
-              echo "$URL [NOT ACCESSIBLE]" >> failed.txt
-              exit 1
-            fi
-            
-            sleep $((i * 5))
-          done
-          
-          echo "[$INDEX] FAILED after 5 attempts"
-          echo "$URL [FAILED]" >> failed.txt
-          exit 1
-          SCRIPT
-          chmod +x download.sh
+  - name: Prepare URLs
+    env:
+      INPUT_URL: ${{ github.event.inputs.url }}
+    run: |
+      echo "$INPUT_URL" \
+      | sed 's/[,[:space:]]\+/\n/g' \
+      | grep -v '^$' \
+      | head -100 > urls.txt
 
-          # اجرای دانلودها - ادامه حتی با خطا
-          INDEX=0
-          SUCCESS=0
-          FAILED=0
-          while IFS= read -r url || [ -n "$url" ]; do
-            [ -z "$url" ] && continue
-            INDEX=$((INDEX + 1))
-            if ./download.sh "$url" "$FORMAT" "$INDEX"; then
-              SUCCESS=$((SUCCESS + 1))
-            else
-              FAILED=$((FAILED + 1))
-              echo "Continuing to next URL..."
-            fi
-            sleep 5
-          done < urls.txt
-          
-          echo "SUCCESS_COUNT=$SUCCESS" >> $GITHUB_ENV
-          echo "FAILED_COUNT=$FAILED" >> $GITHUB_ENV
-          echo ""
-          echo "=========================================="
-          echo "Completed: $SUCCESS successful, $FAILED failed"
-          echo "=========================================="
+      echo "Found $(wc -l < urls.txt) URLs"
 
-      - name: Check output
-        id: check
-        run: |
-          COUNT=$(find output -type f -name "*.mp4" 2>/dev/null | wc -l)
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
-          echo "Downloaded $COUNT video(s)"
+  - name: Download
+    run: |
+      mkdir -p output
 
-      - name: Generate Tag
-        if: steps.check.outputs.count != '0'
-        id: tag
-        run: echo "tag=run-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+      USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 
-      - name: Create Release
-        if: steps.check.outputs.count != '0'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: "Downloaded Videos ${{ steps.tag.outputs.tag }}"
-          files: output/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      if [ "${{ github.event.inputs.quality }}" = "720p" ]; then
+        FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
+      elif [ "${{ github.event.inputs.quality }}" = "480p" ]; then
+        FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
+      else
+        FORMAT="bestvideo+bestaudio/best"
+      fi
 
-      - name: Show Failed URLs
-        if: always()
-        run: |
-          if [ -f failed.txt ]; then
-            FAILED=$(wc -l < failed.txt)
-            echo "Failed downloads: $FAILED"
-            cat failed.txt
-          else
-            echo "All downloads successful!"
-          fi
+      cat > download.sh <<'EOF'
+      #!/usr/bin/env bash
 
-      - name: Summary
-        if: always()
-        run: |
-          echo "## Download Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Status | Count |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Total URLs | $TOTAL_URLS |" >> $GITHUB_STEP_SUMMARY
-          echo "| Downloaded | $SUCCESS_COUNT |" >> $GITHUB_STEP_SUMMARY
-          echo "| Failed | $FAILED_COUNT |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ -f failed.txt ] && [ -s failed.txt ]; then
-            echo "### Failed URLs:" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            cat failed.txt >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          if [ "$SUCCESS_COUNT" -gt 0 ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Downloaded Files:" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            ls -lh output/*.mp4 2>/dev/null | awk '{print $NF, "("$5")"}' >> $GITHUB_STEP_SUMMARY || echo "No files" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          fi
+      URL="$1"
+      FORMAT="$2"
+      INDEX="$3"
+
+      USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+
+      ARGS=(
+        --user-agent "$USER_AGENT"
+        --no-playlist
+        --restrict-filenames
+        --merge-output-format mp4
+      )
+
+      if [ -f cookies.txt ]; then
+        ARGS+=(--cookies cookies.txt)
+      fi
+
+      echo "[$INDEX] Checking metadata..."
+
+      if ! yt-dlp "${ARGS[@]}" --get-title "$URL" >/tmp/title.txt 2>/tmp/error.txt; then
+        echo "[$INDEX] Metadata extraction failed"
+        tail -20 /tmp/error.txt || true
+        exit 1
+      fi
+
+      TITLE=$(cat /tmp/title.txt)
+      echo "[$INDEX] Title: $TITLE"
+
+      for TRY in 1 2 3 4 5; do
+
+        echo "[$INDEX] Download attempt $TRY"
+
+        if yt-dlp \
+          "${ARGS[@]}" \
+          -f "$FORMAT" \
+          -o "output/%(id)s.%(ext)s" \
+          "$URL"; then
+
+          echo "[$INDEX] SUCCESS"
+          exit 0
+        fi
+
+        sleep $((TRY * 5))
+      done
+
+      echo "[$INDEX] FAILED"
+      exit 1
+      EOF
+
+      chmod +x download.sh
+
+      INDEX=0
+
+      while IFS= read -r URL; do
+
+        [ -z "$URL" ] && continue
+
+        INDEX=$((INDEX+1))
+
+        ./download.sh "$URL" "$FORMAT" "$INDEX" || true
+
+      done < urls.txt
+
+  - name: Upload Release
+    uses: softprops/action-gh-release@v2
+    if: always()
+    with:
+      tag_name: run-${{ github.run_id }}
+      name: Downloaded Files
+      files: output/*
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
