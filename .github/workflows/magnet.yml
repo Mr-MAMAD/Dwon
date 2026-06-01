@@ -1,10 +1,10 @@
-name: Magnet Torrent Downloader (Fixed)
+name: Magnet Torrent Downloader (Multi Fix)
 
 on:
   workflow_dispatch:
     inputs:
       magnets:
-        description: 'Magnet links (one per line)'
+        description: 'Magnet links (ONE PER LINE)'
         required: true
         type: string
 
@@ -29,28 +29,37 @@ jobs:
         run: |
           set +e
           
-          MAGNETS="${{ github.event.inputs.magnets }}"
-          
           SUCCESS_COUNT=0
           FAILED_LIST=""
           TOTAL_SIZE=0
+          INDEX=0
           
           mkdir -p downloads
           
-          INDEX=0
-          
           while IFS= read -r magnet; do
+            # Clean up the line
             magnet=$(echo "$magnet" | xargs)
+            
+            # Skip empty lines and lines that are not magnet links
             if [ -z "$magnet" ]; then
+              continue
+            fi
+            
+            if ! echo "$magnet" | grep -q "^magnet:"; then
+              echo "⚠️ Skipping non-magnet line: ${magnet:0:80}..."
               continue
             fi
             
             INDEX=$((INDEX + 1))
             
             echo "=========================================="
-            echo "[$INDEX] 🧲 Downloading..."
+            echo "[$INDEX] 🧲 Processing magnet..."
             echo "=========================================="
             
+            # Extract ONLY the first magnet link (in case multiple on one line)
+            magnet=$(echo "$magnet" | grep -oP 'magnet:\?[^ ]+' | head -1)
+            
+            # Extract filename from dn parameter
             FILENAME=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
             
             if [ -z "$FILENAME" ]; then
@@ -58,154 +67,100 @@ jobs:
               FILENAME="torrent_${HASH:0:10}.mp4"
             fi
             
-            FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__\+/_/g')
+            # Clean filename: replace spaces and special chars, keep only one dot for extension
+            FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__\+/_/g' | sed 's/\.\.\+/\./g')
             
             echo "📁 File: $FILENAME"
-            echo "🚀 Downloading..."
+            echo "🚀 Starting download..."
             echo ""
             
-            # Record files before download
+            # Record files before
             ls downloads/ > /tmp/before_${INDEX}.txt 2>/dev/null
             
+            # Download
             aria2c \
               "$magnet" \
               --dir="downloads" \
               --out="$FILENAME" \
               --seed-time=0 \
               --max-upload-limit=10K \
-              --max-overall-upload-limit=50K \
               --bt-max-peers=100 \
-              --bt-request-peer-speed-limit=50M \
-              --max-concurrent-downloads=5 \
               --split=16 \
-              --min-split-size=1M \
-              --connect-timeout=30 \
+              --enable-dht=true \
+              --enable-peer-exchange=true \
+              --bt-enable-lpd=true \
+              --bt-stop-timeout=600 \
               --timeout=600 \
               --max-tries=5 \
               --retry-wait=5 \
               --continue=true \
-              --allow-overwrite=false \
-              --auto-file-renaming=false \
-              --file-allocation=none \
-              --disk-cache=128M \
-              --summary-interval=10 \
               --console-log-level=notice \
-              --enable-dht=true \
-              --enable-dht6=false \
-              --enable-peer-exchange=true \
-              --bt-enable-lpd=true \
-              --bt-tracker-connect-timeout=10 \
-              --bt-tracker-timeout=10 \
-              --dht-entry-point="dht.transmissionbt.com:6881" \
-              --dht-entry-point="router.bittorrent.com:6881" \
-              --dht-entry-point="router.utorrent.com:6881" \
+              --summary-interval=10 \
               2>&1 | tee "/tmp/aria2_${INDEX}.log" || true
             
-            # Find newly created file
+            # Find new file
             ls downloads/ > /tmp/after_${INDEX}.txt 2>/dev/null
             NEW_FILE=$(comm -13 /tmp/before_${INDEX}.txt /tmp/after_${INDEX}.txt 2>/dev/null | head -1)
             
-            # Fallback: check the expected filename
             if [ -z "$NEW_FILE" ]; then
-              if [ -f "downloads/$FILENAME" ]; then
-                NEW_FILE="$FILENAME"
-              else
-                NEW_FILE=$(ls -t downloads/ 2>/dev/null | head -1)
-              fi
+              [ -f "downloads/$FILENAME" ] && NEW_FILE="$FILENAME"
+              [ -z "$NEW_FILE" ] && NEW_FILE=$(ls -t downloads/ 2>/dev/null | head -1)
             fi
             
-            DOWNLOADED_FILE="downloads/$NEW_FILE"
-            
-            # Check result
-            if [ -f "$DOWNLOADED_FILE" ] && [ -n "$NEW_FILE" ]; then
-              SIZE=$(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || echo 0)
+            if [ -f "downloads/$NEW_FILE" ] && [ -n "$NEW_FILE" ]; then
+              SIZE=$(stat -c%s "downloads/$NEW_FILE" 2>/dev/null || echo 0)
               if [ "$SIZE" -gt 102400 ]; then
                 echo ""
-                echo "✅ [$INDEX] Success: $NEW_FILE ($(numfmt --to=iec $SIZE))"
+                echo "✅ [$INDEX] $NEW_FILE ($(numfmt --to=iec $SIZE))"
                 SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
               else
                 echo ""
-                echo "❌ [$INDEX] File too small: $SIZE bytes"
-                rm -f "$DOWNLOADED_FILE"
-                FAILED_LIST="$FAILED_LIST\n- [$INDEX] $FILENAME (size: $SIZE bytes)"
+                echo "❌ [$INDEX] Too small: $SIZE bytes"
+                rm -f "downloads/$NEW_FILE"
+                FAILED_LIST="$FAILED_LIST\n- [$INDEX] $FILENAME (${SIZE} bytes)"
               fi
             else
               echo ""
-              echo "❌ [$INDEX] Download failed"
-              echo "Files in downloads:"
-              ls -lh downloads/ 2>/dev/null
+              echo "❌ [$INDEX] Failed"
               FAILED_LIST="$FAILED_LIST\n- [$INDEX] $FILENAME"
             fi
             
             echo ""
-          done <<< "$MAGNETS"
+          done <<< "${{ github.event.inputs.magnets }}"
           
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
           echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
           
           {
-            echo "# 📊 Download Report"
-            echo ""
-            echo "**Time:** $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "# 📊 Report"
             echo ""
             echo "| Item | Value |"
             echo "|------|-------|"
             echo "| Total | $INDEX |"
             echo "| Success | $SUCCESS_COUNT |"
-            echo "| Total Size | $(numfmt --to=iec $TOTAL_SIZE) |"
+            echo "| Size | $(numfmt --to=iec $TOTAL_SIZE) |"
             echo ""
             
             if [ $SUCCESS_COUNT -gt 0 ]; then
               echo "## ✅ Downloaded"
-              echo ""
-              echo "| # | File | Size |"
-              echo "|---|------|------|"
-              count=1
               for f in downloads/*; do
-                if [ -f "$f" ] && [ $(stat -c%s "$f") -gt 102400 ]; then
-                  echo "| $count | \`$(basename "$f")\` | $(numfmt --to=iec $(stat -c%s "$f")) |"
-                  count=$((count + 1))
-                fi
+                [ -f "$f" ] && echo "- $(basename "$f") ($(numfmt --to=iec $(stat -c%s "$f")))"
               done
             fi
             
-            if [ -n "$FAILED_LIST" ]; then
-              echo ""
-              echo "## ❌ Failed"
-              echo -e "$FAILED_LIST"
-            fi
+            [ -n "$FAILED_LIST" ] && echo -e "\n## ❌ Failed\n$FAILED_LIST"
           } > download_report.md
           
-          if [ "$SUCCESS_COUNT" -eq 0 ]; then
-            echo "❌ No files downloaded!"
-            exit 1
-          fi
+          [ "$SUCCESS_COUNT" -eq 0 ] && exit 1
 
-      - name: Show downloads
-        run: |
-          echo "📁 Downloads:"
-          du -sh downloads/
-          ls -lh downloads/
-
-      - name: Create Release
+      - name: Release
         if: steps.download.outputs.SUCCESS_COUNT != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: torrent-${{ github.run_number }}
-          name: 🧲 Torrent Download #${{ github.run_number }}
+          name: 🧲 Torrent #${{ github.run_number }}
           body_path: download_report.md
-          files: |
-            downloads/*
+          files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: torrent-logs-${{ github.run_number }}
-          path: |
-            /tmp/aria2_*.log
-            download_report.md
-          retention-days: 3
