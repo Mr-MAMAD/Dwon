@@ -83,24 +83,33 @@ jobs:
           FORMAT="$2"
           INDEX="$3"
 
-          USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+          USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
           ARGS=(
             --user-agent "$USER_AGENT"
+            --referer "https://www.pornhub.com/"
+            --add-header "accept-language:en-US,en;q=0.9"
+            --add-header "sec-fetch-site:none"
+            --add-header "sec-fetch-mode:navigate"
+            --add-header "sec-fetch-user:?1"
+            --add-header "upgrade-insecure-requests:1"
+            --force-ipv4
             --no-playlist
             --restrict-filenames
             --merge-output-format mp4
           )
 
+          # cookies (واقعی)
           if [ -f cookies.txt ]; then
+            echo "Using cookies file"
             ARGS+=(--cookies cookies.txt)
           fi
 
           echo "[$INDEX] Checking metadata..."
 
-          if ! yt-dlp -vU "${ARGS[@]}" --get-title "$URL" >/tmp/title.txt 2>/tmp/error.txt; then
+          if ! yt-dlp "${ARGS[@]}" --get-title "$URL" >/tmp/title.txt 2>/tmp/error.txt; then
             echo "[$INDEX] Metadata extraction failed"
-            tail -20 /tmp/error.txt || true
+            cat /tmp/error.txt || true
             exit 1
           fi
 
