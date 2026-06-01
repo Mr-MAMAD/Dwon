@@ -131,7 +131,7 @@ jobs:
               --geo-bypass
               --legacy-server-connect
               --ignore-no-formats-error
-              -o "output/%(title)s.%(ext)s"
+              -o "output/testname.%(ext)s"
             )
             
             # اضافه کردن cookies اگر وجود داشت
