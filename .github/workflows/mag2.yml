@@ -1,0 +1,239 @@
+name: Magnet Torrent Downloader (Transmission)
+
+on:
+  workflow_dispatch:
+    inputs:
+      magnets:
+        description: 'Magnet links (ONE PER LINE)'
+        required: true
+        type: string
+      wait_minutes:
+        description: 'Max wait per torrent (minutes, default: 15)'
+        required: false
+        default: '15'
+        type: string
+
+jobs:
+  download-torrents:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Transmission
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq transmission-daemon transmission-cli curl
+          # Stop any running instance
+          sudo systemctl stop transmission-daemon 2>/dev/null || true
+          # Create config directory and download folder
+          mkdir -p ~/.config/transmission-daemon
+          mkdir -p downloads
+
+      - name: Configure Transmission
+        run: |
+          cat > ~/.config/transmission-daemon/settings.json << 'EOF'
+          {
+              "download-dir": "/home/runner/work/*/downloads",
+              "incomplete-dir": "/home/runner/work/*/incomplete",
+              "incomplete-dir-enabled": false,
+              "rpc-authentication-required": false,
+              "rpc-whitelist": "127.0.0.1",
+              "rpc-whitelist-enabled": false,
+              "rpc-port": 9091,
+              "peer-port": 51413,
+              "dht-enabled": true,
+              "pex-enabled": true,
+              "lpd-enabled": true,
+              "utp-enabled": true,
+              "encryption": 1,
+              "speed-limit-down": 0,
+              "speed-limit-up": 10,
+              "upload-slots-per-torrent": 0,
+              "peer-limit-global": 200,
+              "peer-limit-per-torrent": 100,
+              "seed-queue-enabled": false,
+              "ratio-limit": 0,
+              "ratio-limit-enabled": false
+          }
+          EOF
+          # Replace * with actual runner user path
+          sed -i "s|/home/runner/work/\*|$PWD|g" ~/.config/transmission-daemon/settings.json
+          # Ensure directories exist
+          mkdir -p downloads incomplete
+
+      - name: Start Transmission Daemon
+        run: |
+          transmission-daemon --config-dir ~/.config/transmission-daemon --download-dir "$PWD/downloads" --foreground &
+          # Wait for daemon to start
+          sleep 3
+          transmission-remote --version
+
+      - name: Download torrents
+        id: download
+        shell: bash
+        run: |
+          set +e
+          
+          WAIT_MINUTES="${{ github.event.inputs.wait_minutes }}"
+          WAIT_SECONDS=$((WAIT_MINUTES * 60))
+          SUCCESS=0
+          FAILED=""
+          INDEX=0
+          
+          while IFS= read -r magnet; do
+            magnet=$(echo "$magnet" | xargs)
+            [ -z "$magnet" ] && continue
+            # Only accept magnet links
+            if ! echo "$magnet" | grep -q "^magnet:"; then
+              echo "⚠️ Skipping non-magnet: ${magnet:0:80}..."
+              continue
+            fi
+            INDEX=$((INDEX + 1))
+            
+            echo "=========================================="
+            echo "[$INDEX] 🧲 Adding magnet..."
+            echo "=========================================="
+            
+            # Extract filename for later search
+            FILENAME=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
+            [ -z "$FILENAME" ] && FILENAME="torrent_${INDEX}"
+            CLEAN=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+            
+            echo "📁 Expected file: $CLEAN"
+            
+            # Record before file list
+            ls downloads/ > /tmp/before_${INDEX}.txt 2>/dev/null
+            
+            # Add magnet to transmission
+            ADD_OUT=$(transmission-remote -a "$magnet" 2>&1)
+            echo "   $ADD_OUT"
+            
+            # Get torrent ID (last added)
+            ID=$(transmission-remote -l | tail -1 | awk '{print $1}' | grep -oP '\d+')
+            if [ -z "$ID" ] || ! echo "$ID" | grep -qE '^[0-9]+$'; then
+              echo "❌ Could not get torrent ID"
+              continue
+            fi
+            
+            echo "Torrent ID: $ID"
+            
+            # Wait for metadata download and check progress
+            START_TIME=$(date +%s)
+            SEEN_SEEDERS=0
+            ZERO_SEED_COUNT=0
+            
+            while true; do
+              sleep 10
+              
+              # Get status line for this torrent
+              STATUS=$(transmission-remote -t "$ID" -i 2>/dev/null)
+              PERCENT=$(echo "$STATUS" | grep "Percent Done" | awk '{print $NF}' | sed 's/%//')
+              SEEDERS=$(echo "$STATUS" | grep -i "Seeds:" | awk '{print $NF}')
+              DOWNLOADED=$(echo "$STATUS" | grep "Downloaded:" | head -1 | awk '{print $2, $3}')
+              STATE=$(echo "$STATUS" | grep "State:" | awk '{print $NF}')
+              
+              if [ -n "$SEEDERS" ] && [ "$SEEDERS" -gt 0 ]; then
+                SEEN_SEEDERS=1
+                ZERO_SEED_COUNT=0
+              else
+                if [ "$SEEN_SEEDERS" -eq 0 ]; then
+                  ZERO_SEED_COUNT=$((ZERO_SEED_COUNT + 1))
+                fi
+              fi
+              
+              echo "   State: $STATE | Seeds: $SEEDERS | Progress: ${PERCENT}%"
+              
+              # Success: download complete
+              if [ "$STATE" = "Seeding" ] || [ "$STATE" = "Stopped" ] && [ "$PERCENT" = "100" ]; then
+                echo "✅ Download completed!"
+                break
+              fi
+              
+              # Skip if no seeds for 5 consecutive checks (50 seconds) and never had seeds
+              if [ "$ZERO_SEED_COUNT" -ge 5 ] && [ "$SEEN_SEEDERS" -eq 0 ]; then
+                echo "⏭️ No seeders found, skipping..."
+                transmission-remote -t "$ID" --remove-and-delete
+                break
+              fi
+              
+              # Overall timeout
+              ELAPSED=$(( $(date +%s) - START_TIME ))
+              if [ "$ELAPSED" -gt "$WAIT_SECONDS" ]; then
+                echo "⏰ Timeout reached (${WAIT_MINUTES} min)"
+                # Remove torrent but keep data if partially downloaded
+                if [ "$PERCENT" -gt 5 ]; then
+                  transmission-remote -t "$ID" --remove
+                else
+                  transmission-remote -t "$ID" --remove-and-delete
+                fi
+                break
+              fi
+            done
+            
+            # Remove torrent from list (data stays if --remove used)
+            transmission-remote -t "$ID" --remove 2>/dev/null || true
+            
+            # Find new file
+            ls downloads/ > /tmp/after_${INDEX}.txt 2>/dev/null
+            NEW_FILE=$(comm -13 /tmp/before_${INDEX}.txt /tmp/after_${INDEX}.txt 2>/dev/null | head -1)
+            if [ -z "$NEW_FILE" ]; then
+              # Try to locate by expected name
+              [ -f "downloads/$CLEAN" ] && NEW_FILE="$CLEAN"
+              [ -z "$NEW_FILE" ] && NEW_FILE=$(ls -t downloads/ 2>/dev/null | head -1)
+            fi
+            
+            if [ -f "downloads/$NEW_FILE" ] && [ -n "$NEW_FILE" ]; then
+              SIZE=$(stat -c%s "downloads/$NEW_FILE" 2>/dev/null || echo 0)
+              if [ "$SIZE" -gt 102400 ]; then
+                echo "✅ Downloaded: $NEW_FILE ($(numfmt --to=iec $SIZE))"
+                SUCCESS=$((SUCCESS + 1))
+              else
+                rm -f "downloads/$NEW_FILE"
+                FAILED="$FAILED\n- [$INDEX] $CLEAN (too small)"
+              fi
+            else
+              FAILED="$FAILED\n- [$INDEX] $CLEAN"
+            fi
+            
+            echo ""
+            echo "--- Moving to next ---"
+            echo ""
+          done <<< "${{ github.event.inputs.magnets }}"
+          
+          # Stop daemon gracefully
+          transmission-remote --exit
+          
+          echo "SUCCESS=$SUCCESS" >> $GITHUB_OUTPUT
+          
+          {
+            echo "# 📊 Transmission Download Report"
+            echo ""
+            echo "| Total | Success |"
+            echo "|-------|---------|"
+            echo "| $INDEX | $SUCCESS |"
+            echo ""
+            if [ $SUCCESS -gt 0 ]; then
+              echo "## ✅ Files"
+              ls -lh downloads/ | grep -v total
+            fi
+            if [ -n "$FAILED" ]; then
+              echo -e "\n## ❌ Failed\n$FAILED"
+            fi
+          } > report.md
+          
+          [ $SUCCESS -eq 0 ] && exit 1
+
+      - name: Release
+        if: steps.download.outputs.SUCCESS != '0'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: torrent-${{ github.run_number }}
+          body_path: report.md
+          files: downloads/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
