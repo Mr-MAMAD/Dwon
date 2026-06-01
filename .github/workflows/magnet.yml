@@ -34,11 +34,16 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 curl
 
+      - name: Debug - Show input magnets
+        run: |
+          echo "=== INPUT MAGNETS ==="
+          echo "${{ github.event.inputs.magnets }}"
+          echo "=== END INPUT ==="
+          echo "Number of lines: $(echo "${{ github.event.inputs.magnets }}" | wc -l)"
+
       - name: Download torrents
         id: download
         shell: bash
-        env:
-          MAGNETS: ${{ github.event.inputs.magnets }}
         run: |
           set +e
 
@@ -47,19 +52,34 @@ jobs:
           TOTAL_TIMEOUT_SEC=$((TOTAL_TIMEOUT_MIN * 60))
 
           SUCCESS_COUNT=0
-          FAILED_LIST=""
           TOTAL_SIZE=0
           INDEX=0
 
+          FAILED_LIST=""
+          
           mkdir -p downloads
+          
+          # Save magnets to a temp file first to preserve line breaks
+          cat > /tmp/magnets.txt << 'MAGNET_EOF'
+          ${{ github.event.inputs.magnets }}
+          MAGNET_EOF
+          
+          echo "=== Processing magnets ==="
+          cat -n /tmp/magnets.txt
+          echo "=========================="
 
-          echo "$MAGNETS" | while IFS= read -r line; do
+          while IFS= read -r line; do
+            # Skip empty lines
+            [ -z "$(echo "$line" | tr -d '[:space:]')" ] && continue
+            
             magnet=$(echo "$line" | grep -oP 'magnet:\?[^ ]+' | head -1)
             [ -z "$magnet" ] && continue
 
             INDEX=$((INDEX + 1))
+            echo ""
             echo "=========================================="
             echo "[$INDEX] 🧲 Processing..."
+            echo "Magnet: $magnet"
             echo "=========================================="
 
             FILENAME=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
@@ -159,19 +179,28 @@ jobs:
                   echo "❌ [$INDEX] File too small: $SIZE bytes"
                 fi
                 rm -f "downloads/$FILENAME"
-                FAILED_LIST="$FAILED_LIST\n- $FILENAME"
+                FAILED_LIST="${FAILED_LIST}\n- ${FILENAME}"
               fi
             else
               echo "❌ [$INDEX] No file created"
-              FAILED_LIST="$FAILED_LIST\n- $FILENAME (no file)"
+              FAILED_LIST="${FAILED_LIST}\n- ${FILENAME} (no file)"
             fi
 
-            echo ""
             echo "--- Moving to next ---"
-            echo ""
-          done
+          done < /tmp/magnets.txt
 
-          # Write outputs
+          echo ""
+          echo "=========================================="
+          echo "FINAL SUMMARY"
+          echo "=========================================="
+          echo "Total processed: $INDEX"
+          echo "Success count: $SUCCESS_COUNT"
+          echo "Total size: $TOTAL_SIZE"
+          echo "Files in downloads:"
+          ls -lah downloads/ || echo "No files found"
+          echo "=========================================="
+
+          # Write outputs (even if zero success, we don't fail the job)
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
           echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
 
@@ -190,10 +219,15 @@ jobs:
               done
             fi
             if [ -n "$FAILED_LIST" ]; then
-              echo -e "\n## ❌ Failed\n$FAILED_LIST"
+              echo ""
+              echo "## ❌ Failed"
+              echo -e "$FAILED_LIST"
             fi
           } > download_report.md
+          
+          cat download_report.md
 
+          # NO exit 1 here – let the job succeed always
           echo "Done processing all magnets. Total success: $SUCCESS_COUNT"
 
       - name: Release
@@ -203,6 +237,7 @@ jobs:
           tag_name: torrent-${{ github.run_number }}
           name: 🧲 Torrent #${{ github.run_number }}
           body_path: download_report.md
-          files: downloads/*
+          files: |
+            downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
