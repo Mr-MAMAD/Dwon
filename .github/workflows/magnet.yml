@@ -1,4 +1,4 @@
-name: Magnet Torrent Downloader (Auto Skip)
+name: Magnet Torrent Downloader (Low Seeds OK)
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ on:
         required: true
         type: string
       stuck_limit:
-        description: 'Skip after X times SD:0 (default: 5)'
+        description: 'Skip after X times SD:0 (default: 15)'
         required: false
-        default: '5'
+        default: '15'
         type: string
 
 jobs:
@@ -78,74 +78,109 @@ jobs:
             
             ls downloads/ > /tmp/before_${INDEX}.txt 2>/dev/null
             
-            # Run aria2 in background
+            # **** کلید کار: --timeout=600 (نه 0) و --bt-stop-timeout=600 ****
             aria2c \
               "$magnet" \
               --dir="downloads" \
               --out="$FILENAME" \
               --seed-time=0 \
-              --max-upload-limit=10K \
-              --bt-max-peers=100 \
+              --max-upload-limit=1K \
+              --bt-max-peers=200 \
+              --bt-request-peer-speed-limit=0 \
               --split=16 \
+              --min-split-size=1M \
+              --connect-timeout=60 \
+              --timeout=600 \
+              --bt-stop-timeout=600 \
+              --max-tries=0 \
+              --retry-wait=30 \
+              --continue=true \
+              --allow-overwrite=false \
+              --auto-file-renaming=false \
+              --file-allocation=none \
+              --disk-cache=128M \
+              --summary-interval=10 \
+              --console-log-level=notice \
               --enable-dht=true \
+              --enable-dht6=true \
               --enable-peer-exchange=true \
               --bt-enable-lpd=true \
-              --bt-stop-timeout=0 \
-              --timeout=0 \
-              --max-tries=0 \
-              --continue=true \
-              --console-log-level=notice \
-              --summary-interval=10 \
+              --bt-tracker-connect-timeout=30 \
+              --bt-tracker-timeout=30 \
+              --dht-entry-point="dht.transmissionbt.com:6881" \
+              --dht-entry-point="router.bittorrent.com:6881" \
+              --dht-entry-point="router.utorrent.com:6881" \
+              --dht-entry-point="dht.aelitis.com:6881" \
               2>&1 | tee "/tmp/aria2_${INDEX}.log" &
             
             ARIA_PID=$!
             
-            # Monitor for SD:0 pattern
+            # نظارت پیشرفته برای پرش از سیدر صفر مطلق
             SD_ZERO_COUNT=0
-            LAST_PROGRESS=""
-            START_TIME=$(date +%s)
+            LAST_SD_LINE=""
+            DOWNLOAD_STARTED=0
+            LAST_SIZE=0
+            STUCK_SIZE_COUNT=0
             
             while kill -0 $ARIA_PID 2>/dev/null; do
               sleep 10
               
-              # Get latest progress line
+              # دریافت آخرین خط دارای SD و DL
               PROGRESS=$(tail -1 "/tmp/aria2_${INDEX}.log" 2>/dev/null | grep "SD:" | tail -1)
               
               if [ -n "$PROGRESS" ]; then
-                # Check if SD:0
-                if echo "$PROGRESS" | grep -q "SD:0"; then
-                  if [ "$PROGRESS" != "$LAST_PROGRESS" ]; then
-                    SD_ZERO_COUNT=$((SD_ZERO_COUNT + 1))
-                    echo "🔴 SD:0 detected ($SD_ZERO_COUNT/$STUCK_LIMIT)"
-                    LAST_PROGRESS="$PROGRESS"
-                  fi
-                else
-                  # Has seeders - reset counter
-                  if [ "$SD_ZERO_COUNT" -gt 0 ]; then
-                    echo "🟢 Seeders found! Resetting counter."
-                  fi
+                # چک کن دانلود واقعی شروع شده (سرعت > 0)
+                if echo "$PROGRESS" | grep -qE "DL:[1-9][0-9]*[KMG]"; then
+                  DOWNLOAD_STARTED=1
                   SD_ZERO_COUNT=0
+                  echo "   📥 $PROGRESS" | grep -oP '\[.*?\].*'
                 fi
                 
-                # Show progress if downloading
-                if echo "$PROGRESS" | grep -q "DL:" && ! echo "$PROGRESS" | grep -q "DL:0B"; then
-                  echo "   $PROGRESS" | grep -oP '\[.*?\].*'
+                # فقط وقتی دانلود هنوز شروع نشده، تعداد SD:0 رو بشمار
+                if [ "$DOWNLOAD_STARTED" -eq 0 ]; then
+                  if echo "$PROGRESS" | grep -q "SD:0"; then
+                    if [ "$PROGRESS" != "$LAST_SD_LINE" ]; then
+                      SD_ZERO_COUNT=$((SD_ZERO_COUNT + 1))
+                      echo "🔍 Finding peers... ($SD_ZERO_COUNT/$STUCK_LIMIT)"
+                      LAST_SD_LINE="$PROGRESS"
+                    fi
+                  else
+                    # سیدر پیدا شده (حتی 1) → صبر کن دانلود شروع بشه
+                    if [ "$SD_ZERO_COUNT" -gt 0 ]; then
+                      echo "🟢 Seeders found! Waiting for download..."
+                    fi
+                    SD_ZERO_COUNT=0
+                  fi
+                fi
+                
+                # تشخیص توقف دانلود (stall) بعد از شروع
+                if [ "$DOWNLOAD_STARTED" -eq 1 ]; then
+                  if [ -f "downloads/$FILENAME" ]; then
+                    SIZE=$(stat -c%s "downloads/$FILENAME" 2>/dev/null || echo 0)
+                    if [ "$SIZE" -eq "$LAST_SIZE" ] && [ "$SIZE" -gt 0 ] && echo "$PROGRESS" | grep -q "DL:0B"; then
+                      STUCK_SIZE_COUNT=$((STUCK_SIZE_COUNT + 1))
+                    else
+                      STUCK_SIZE_COUNT=0
+                    fi
+                    LAST_SIZE=$SIZE
+                  fi
                 fi
               fi
               
-              # Skip if stuck too long
-              if [ "$SD_ZERO_COUNT" -ge "$STUCK_LIMIT" ]; then
+              # پرش: فقط اگر هیچ سیدری پیدا نشه (SD:0 مکرر) و دانلود شروع نشده باشه
+              if [ "$SD_ZERO_COUNT" -ge "$STUCK_LIMIT" ] && [ "$DOWNLOAD_STARTED" -eq 0 ]; then
                 echo ""
-                echo "⏭️ Skipping! $STUCK_LIMIT × SD:0 detected"
+                echo "⏭️ No seeders after ${STUCK_LIMIT} attempts, skipping..."
                 kill -9 $ARIA_PID 2>/dev/null
                 break
               fi
               
-              # Also timeout after 10 minutes total
-              ELAPSED=$(( $(date +%s) - START_TIME ))
-              if [ "$ELAPSED" -gt 600 ]; then
-                echo ""
-                echo "⏰ Timeout (10 minutes)"
+              # توقف اگر دانلود کاملاً قفل شده (۵۰×۱۰ثانیه ≈ ۸ دقیقه بدون تغییر)
+              if [ "$STUCK_SIZE_COUNT" -ge 50 ] && [ "$DOWNLOAD_STARTED" -eq 1 ]; then
+                CURRENT=$(stat -c%s "downloads/$FILENAME" 2>/dev/null || echo 0)
+                if [ "$CURRENT" -gt 1048576 ]; then
+                  echo "⚠️ Download stalled, keeping partial ($(numfmt --to=iec $CURRENT))"
+                fi
                 kill -9 $ARIA_PID 2>/dev/null
                 break
               fi
@@ -153,7 +188,7 @@ jobs:
             
             wait $ARIA_PID 2>/dev/null
             
-            # Check result
+            # بررسی نتیجه
             ls downloads/ > /tmp/after_${INDEX}.txt 2>/dev/null
             NEW_FILE=$(comm -13 /tmp/before_${INDEX}.txt /tmp/after_${INDEX}.txt 2>/dev/null | head -1)
             
@@ -177,7 +212,7 @@ jobs:
               fi
             else
               echo ""
-              echo "❌ [$INDEX] Failed (no seeders)"
+              echo "❌ [$INDEX] Failed (no seeders or error)"
               FAILED_LIST="$FAILED_LIST\n- [$INDEX] $FILENAME (no seeders)"
             fi
             
