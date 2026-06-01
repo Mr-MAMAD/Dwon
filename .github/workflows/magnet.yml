@@ -1,142 +1,219 @@
-name: Magnet Torrent Downloader v2
+name: Magnet Torrent Downloader
 
 on:
   workflow_dispatch:
     inputs:
       magnets:
-        description: 'Magnet links (one per line)'
+        description: 'لینک‌های مگنت (هر خط یک لینک)'
         required: true
         type: string
 
 jobs:
-  build:
+  download-torrents:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    timeout-minutes: 360
     
     steps:
-      - name: Setup
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 curl
-          mkdir -p downloads
 
-      - name: Download
+      - name: Download torrents
+        id: download
         shell: bash
         run: |
-          success=0
-          total=0
+          set +e
           
-          # Create tracker list for better peer discovery
-          cat > /tmp/trackers.txt << 'EOF'
-          udp://tracker.opentrackr.org:1337/announce
-          udp://tracker.torrent.eu.org:451/announce
-          udp://tracker.moeking.me:6969/announce
-          udp://open.stealth.si:80/announce
-          udp://p4p.arenabg.com:1337/announce
-          udp://explodie.org:6969/announce
-          udp://tracker.dler.org:6969/announce
-          udp://9.rarbg.me:2970/announce
-          udp://9.rarbg.to:2840/announce
-          udp://tracker.coppersurfer.tk:6969/announce
-          udp://tracker.internetwarriors.net:1337/announce
-          udp://tracker.leechers-paradise.org:6969/announce
-          udp://tracker.openbittorrent.com:80/announce
-          udp://tracker.pirateparty.gr:6969/announce
-          udp://tracker.cyberia.is:6969/announce
-          http://tracker.opentrackr.org:1337/announce
-          http://tracker.torrent.eu.org:451/announce
-          http://tracker2.myporn.club:8337/announce
-          EOF
+          mapfile -t MAGNET_ARRAY <<< "${{ github.event.inputs.magnets }}"
           
-          while IFS= read -r magnet; do
+          SUCCESS_COUNT=0
+          FAILED_LIST=""
+          TOTAL_SIZE=0
+          
+          mkdir -p downloads
+          
+          INDEX=0
+          for magnet in "${MAGNET_ARRAY[@]}"; do
             magnet=$(echo "$magnet" | xargs)
-            [ -z "$magnet" ] && continue
-            total=$((total+1))
-            
-            echo "=========================================="
-            echo "[$total] Downloading torrent..."
-            echo "=========================================="
-            
-            # Extract name
-            name=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys,urllib.parse;print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
-            [ -z "$name" ] && name="torrent_${total}"
-            clean=$(echo "$name" | sed 's/[^a-zA-Z0-9._-]/_/g')
-            
-            echo "File: $clean"
-            
-            # Add trackers to magnet if not present
-            if ! echo "$magnet" | grep -q "tr="; then
-              echo "Adding trackers to magnet..."
-              tracker_list=$(cat /tmp/trackers.txt | while read tr; do echo -n "&tr=$(python3 -c "import urllib.parse;print(urllib.parse.quote('$tr'))")"; done)
-              magnet="${magnet}${tracker_list}"
+            if [ -z "$magnet" ]; then
+              continue
             fi
             
-            echo "Starting download (timeout: 15 minutes)..."
+            INDEX=$((INDEX + 1))
+            
+            echo "=========================================="
+            echo "[$INDEX] 🧲 مگنت: ${magnet:0:100}..."
+            echo "=========================================="
+            
+            # استخراج نام فایل از magnet link
+            FILENAME=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
+            
+            # اگر نام پیدا نشد از hash استفاده کن
+            if [ -z "$FILENAME" ]; then
+              HASH=$(echo "$magnet" | grep -oP 'btih:\K[^&]+' 2>/dev/null)
+              FILENAME="torrent_${HASH:0:10}.mp4"
+            fi
+            
+            # تمیز کردن نام فایل
+            FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__\+/_/g')
+            
+            echo "📁 نام فایل: $FILENAME"
+            
+            # دانلود با aria2c (پشتیبانی عالی از magnet)
+            echo "🚀 شروع دانلود تورنت..."
             echo ""
             
-            # Download with better settings
+            # aria2c مستقیماً magnet رو ساپورت میکنه
             aria2c \
               "$magnet" \
               --dir="downloads" \
-              --out="$clean" \
+              --out="$FILENAME" \
               --seed-time=0 \
               --max-upload-limit=10K \
-              --bt-max-peers=200 \
-              --bt-request-peer-speed-limit=100M \
+              --max-overall-upload-limit=50K \
+              --bt-max-peers=100 \
+              --bt-request-peer-speed-limit=50M \
+              --max-concurrent-downloads=5 \
               --split=16 \
+              --min-split-size=1M \
+              --connect-timeout=30 \
+              --timeout=600 \
+              --max-tries=5 \
+              --retry-wait=5 \
+              --continue=true \
+              --allow-overwrite=false \
+              --auto-file-renaming=false \
+              --file-allocation=none \
+              --disk-cache=128M \
+              --summary-interval=10 \
+              --console-log-level=notice \
               --enable-dht=true \
-              --enable-dht6=true \
+              --enable-dht6=false \
               --enable-peer-exchange=true \
               --bt-enable-lpd=true \
-              --bt-stop-timeout=900 \
-              --bt-tracker-connect-timeout=30 \
-              --bt-tracker-timeout=30 \
-              --bt-metadata-only=false \
+              --bt-tracker-connect-timeout=10 \
+              --bt-tracker-timeout=10 \
               --dht-entry-point="dht.transmissionbt.com:6881" \
               --dht-entry-point="router.bittorrent.com:6881" \
               --dht-entry-point="router.utorrent.com:6881" \
-              --dht-entry-point="dht.aelitis.com:6881" \
-              --connect-timeout=60 \
-              --timeout=900 \
-              --max-tries=5 \
-              --retry-wait=10 \
-              --continue=true \
-              --console-log-level=notice \
-              --summary-interval=15 \
-              2>&1 || {
-                echo "❌ Failed or timeout"
-                continue
-              }
+              2>&1 | tee "/tmp/aria2_${INDEX}.log" || true
             
-            # Find file
-            file=$(ls -t downloads/ 2>/dev/null | head -1)
-            if [ -n "$file" ]; then
-              size=$(stat -c%s "downloads/$file" 2>/dev/null || echo 0)
-              if [ "$size" -gt 102400 ]; then
-                echo "✅ Downloaded: $file ($(numfmt --to=iec $size))"
-                success=$((success+1))
-              else
-                echo "❌ File too small ($size bytes)"
-                rm -f "downloads/$file"
-              fi
+            ARIA_EXIT=${PIPESTATUS[0]}
+            
+            # aria2 ممکنه فایل رو با اسم دیگه‌ای ذخیره کرده باشه
+            # پیدا کردن فایل دانلود شده
+            DOWNLOADED_FILE=$(find downloads -type f -newer "/tmp/aria2_${INDEX}.log" -size +100k 2>/dev/null | head -1)
+            
+            if [ -z "$DOWNLOADED_FILE" ]; then
+              DOWNLOADED_FILE="downloads/$FILENAME"
             fi
+            
+            # بررسی نتیجه
+            if [ -f "$DOWNLOADED_FILE" ]; then
+              SIZE=$(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || echo 0)
+              if [ "$SIZE" -gt 102400 ]; then
+                echo ""
+                echo "✅ [$INDEX] موفق: $(basename "$DOWNLOADED_FILE") ($(numfmt --to=iec $SIZE))"
+                
+                # rename به اسم درست اگه لازم باشه
+                if [ "$(basename "$DOWNLOADED_FILE")" != "$FILENAME" ]; then
+                  mv "$DOWNLOADED_FILE" "downloads/$FILENAME" 2>/dev/null
+                fi
+                
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
+              else
+                echo ""
+                echo "❌ [$INDEX] حجم کم: $SIZE بایت"
+                FAILED_LIST="$FAILED_LIST\n- [$INDEX] ${magnet:0:80}... (حجم: ${SIZE} بایت)"
+              fi
+            else
+              echo ""
+              echo "❌ [$INDEX] دانلود ناموفق"
+              echo "فایل‌های موجود در downloads:"
+              ls -lh downloads/ 2>/dev/null
+              FAILED_LIST="$FAILED_LIST\n- [$INDEX] ${magnet:0:80}..."
+            fi
+            
             echo ""
-          done <<< "${{ github.event.inputs.magnets }}"
+          done
           
-          echo ""
-          echo "=========================================="
-          echo "Done! $success/$total downloaded"
-          echo "=========================================="
-          ls -lh downloads/
+          echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
+          echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
           
-          [ $success -eq 0 ] && exit 1
+          # گزارش
+          {
+            echo "# 📊 گزارش دانلود تورنت"
+            echo ""
+            echo "**زمان:** $(date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|------|-------|"
+            echo "| کل مگنت‌ها | $INDEX |"
+            echo "| دانلود موفق | $SUCCESS_COUNT |"
+            echo "| حجم کل | $(numfmt --to=iec $TOTAL_SIZE) |"
+            echo ""
+            
+            if [ $SUCCESS_COUNT -gt 0 ]; then
+              echo "## ✅ فایل‌های دانلود شده"
+              echo ""
+              echo "| # | نام فایل | حجم |"
+              echo "|---|----------|-----|"
+              count=1
+              for f in downloads/*; do
+                if [ -f "$f" ] && [ $(stat -c%s "$f") -gt 102400 ]; then
+                  echo "| $count | \`$(basename "$f")\` | $(numfmt --to=iec $(stat -c%s "$f")) |"
+                  count=$((count + 1))
+                fi
+              done
+            fi
+            
+            if [ -n "$FAILED_LIST" ]; then
+              echo ""
+              echo "## ❌ خطاها"
+              echo -e "$FAILED_LIST"
+              echo ""
+              echo "💡 **علت احتمالی:**"
+              echo "- تعداد سیدر کم"
+              echo "- ترکرها در دسترس نبودن"
+              echo "- فایل از تورنت حذف شده"
+            fi
+          } > download_report.md
+          
+          if [ "$SUCCESS_COUNT" -eq 0 ]; then
+            echo "❌ هیچ فایلی دانلود نشد!"
+            exit 1
+          fi
 
-      - name: Release
+      - name: Show downloads
+        run: |
+          echo "📁 فایل‌های دانلود شده:"
+          du -sh downloads/ 2>/dev/null || echo "خالی"
+          ls -lh downloads/ 2>/dev/null || echo "بدون فایل"
+
+      - name: Create Release
+        if: steps.download.outputs.SUCCESS_COUNT != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: torrent-${{ github.run_number }}
-          files: downloads/*
+          name: 🧲 Torrent Download #${{ github.run_number }}
+          body_path: download_report.md
+          files: |
+            downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: torrent-logs-${{ github.run_number }}
+          path: |
+            /tmp/aria2_*.log
+            download_report.md
+          retention-days: 3
