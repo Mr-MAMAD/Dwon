@@ -1,4 +1,4 @@
-name: Magnet Torrent Downloader
+name: Magnet Torrent Downloader v2
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
       - name: Setup
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2
+          sudo apt-get install -y -qq aria2 curl
           mkdir -p downloads
 
       - name: Download
@@ -27,6 +27,28 @@ jobs:
         run: |
           success=0
           total=0
+          
+          # Create tracker list for better peer discovery
+          cat > /tmp/trackers.txt << 'EOF'
+          udp://tracker.opentrackr.org:1337/announce
+          udp://tracker.torrent.eu.org:451/announce
+          udp://tracker.moeking.me:6969/announce
+          udp://open.stealth.si:80/announce
+          udp://p4p.arenabg.com:1337/announce
+          udp://explodie.org:6969/announce
+          udp://tracker.dler.org:6969/announce
+          udp://9.rarbg.me:2970/announce
+          udp://9.rarbg.to:2840/announce
+          udp://tracker.coppersurfer.tk:6969/announce
+          udp://tracker.internetwarriors.net:1337/announce
+          udp://tracker.leechers-paradise.org:6969/announce
+          udp://tracker.openbittorrent.com:80/announce
+          udp://tracker.pirateparty.gr:6969/announce
+          udp://tracker.cyberia.is:6969/announce
+          http://tracker.opentrackr.org:1337/announce
+          http://tracker.torrent.eu.org:451/announce
+          http://tracker2.myporn.club:8337/announce
+          EOF
           
           while IFS= read -r magnet; do
             magnet=$(echo "$magnet" | xargs)
@@ -37,34 +59,49 @@ jobs:
             echo "[$total] Downloading torrent..."
             echo "=========================================="
             
-            # Extract filename from magnet
+            # Extract name
             name=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys,urllib.parse;print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
             [ -z "$name" ] && name="torrent_${total}"
             clean=$(echo "$name" | sed 's/[^a-zA-Z0-9._-]/_/g')
             
             echo "File: $clean"
+            
+            # Add trackers to magnet if not present
+            if ! echo "$magnet" | grep -q "tr="; then
+              echo "Adding trackers to magnet..."
+              tracker_list=$(cat /tmp/trackers.txt | while read tr; do echo -n "&tr=$(python3 -c "import urllib.parse;print(urllib.parse.quote('$tr'))")"; done)
+              magnet="${magnet}${tracker_list}"
+            fi
+            
+            echo "Starting download (timeout: 15 minutes)..."
             echo ""
             
-            # Download with aria2
+            # Download with better settings
             aria2c \
               "$magnet" \
               --dir="downloads" \
               --out="$clean" \
               --seed-time=0 \
               --max-upload-limit=10K \
-              --bt-max-peers=100 \
+              --bt-max-peers=200 \
+              --bt-request-peer-speed-limit=100M \
               --split=16 \
               --enable-dht=true \
-              --enable-dht6=false \
+              --enable-dht6=true \
               --enable-peer-exchange=true \
               --bt-enable-lpd=true \
-              --bt-stop-timeout=300 \
-              --bt-tracker-connect-timeout=10 \
-              --bt-tracker-timeout=10 \
-              --connect-timeout=30 \
-              --timeout=300 \
-              --max-tries=3 \
-              --retry-wait=5 \
+              --bt-stop-timeout=900 \
+              --bt-tracker-connect-timeout=30 \
+              --bt-tracker-timeout=30 \
+              --bt-metadata-only=false \
+              --dht-entry-point="dht.transmissionbt.com:6881" \
+              --dht-entry-point="router.bittorrent.com:6881" \
+              --dht-entry-point="router.utorrent.com:6881" \
+              --dht-entry-point="dht.aelitis.com:6881" \
+              --connect-timeout=60 \
+              --timeout=900 \
+              --max-tries=5 \
+              --retry-wait=10 \
               --continue=true \
               --console-log-level=notice \
               --summary-interval=15 \
@@ -73,8 +110,8 @@ jobs:
                 continue
               }
             
-            # Find downloaded file
-            file=$(ls -t downloads/ | head -1)
+            # Find file
+            file=$(ls -t downloads/ 2>/dev/null | head -1)
             if [ -n "$file" ]; then
               size=$(stat -c%s "downloads/$file" 2>/dev/null || echo 0)
               if [ "$size" -gt 102400 ]; then
