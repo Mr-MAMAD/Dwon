@@ -1,4 +1,4 @@
-name: Magnet Torrent Downloader (Multi Fix)
+name: Magnet Torrent Downloader (Auto Skip)
 
 on:
   workflow_dispatch:
@@ -7,12 +7,18 @@ on:
         description: 'Magnet links (ONE PER LINE)'
         required: true
         type: string
+      stuck_limit:
+        description: 'Skip after X times SD:0 (default: 5)'
+        required: false
+        default: '5'
+        type: string
 
 jobs:
   download-torrents:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    timeout-minutes: 360
     
     steps:
       - name: Checkout
@@ -29,6 +35,7 @@ jobs:
         run: |
           set +e
           
+          STUCK_LIMIT="${{ github.event.inputs.stuck_limit }}"
           SUCCESS_COUNT=0
           FAILED_LIST=""
           TOTAL_SIZE=0
@@ -37,29 +44,25 @@ jobs:
           mkdir -p downloads
           
           while IFS= read -r magnet; do
-            # Clean up the line
             magnet=$(echo "$magnet" | xargs)
             
-            # Skip empty lines and lines that are not magnet links
             if [ -z "$magnet" ]; then
               continue
             fi
             
             if ! echo "$magnet" | grep -q "^magnet:"; then
-              echo "⚠️ Skipping non-magnet line: ${magnet:0:80}..."
+              echo "⚠️ Skipping: ${magnet:0:80}..."
               continue
             fi
             
             INDEX=$((INDEX + 1))
             
             echo "=========================================="
-            echo "[$INDEX] 🧲 Processing magnet..."
+            echo "[$INDEX] 🧲 Processing..."
             echo "=========================================="
             
-            # Extract ONLY the first magnet link (in case multiple on one line)
             magnet=$(echo "$magnet" | grep -oP 'magnet:\?[^ ]+' | head -1)
             
-            # Extract filename from dn parameter
             FILENAME=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
             
             if [ -z "$FILENAME" ]; then
@@ -67,17 +70,15 @@ jobs:
               FILENAME="torrent_${HASH:0:10}.mp4"
             fi
             
-            # Clean filename: replace spaces and special chars, keep only one dot for extension
             FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__\+/_/g' | sed 's/\.\.\+/\./g')
             
             echo "📁 File: $FILENAME"
-            echo "🚀 Starting download..."
+            echo "⏱️ Skip after: ${STUCK_LIMIT} × SD:0"
             echo ""
             
-            # Record files before
             ls downloads/ > /tmp/before_${INDEX}.txt 2>/dev/null
             
-            # Download
+            # Run aria2 in background
             aria2c \
               "$magnet" \
               --dir="downloads" \
@@ -89,16 +90,70 @@ jobs:
               --enable-dht=true \
               --enable-peer-exchange=true \
               --bt-enable-lpd=true \
-              --bt-stop-timeout=600 \
-              --timeout=600 \
-              --max-tries=5 \
-              --retry-wait=5 \
+              --bt-stop-timeout=0 \
+              --timeout=0 \
+              --max-tries=0 \
               --continue=true \
               --console-log-level=notice \
               --summary-interval=10 \
-              2>&1 | tee "/tmp/aria2_${INDEX}.log" || true
+              2>&1 | tee "/tmp/aria2_${INDEX}.log" &
             
-            # Find new file
+            ARIA_PID=$!
+            
+            # Monitor for SD:0 pattern
+            SD_ZERO_COUNT=0
+            LAST_PROGRESS=""
+            START_TIME=$(date +%s)
+            
+            while kill -0 $ARIA_PID 2>/dev/null; do
+              sleep 10
+              
+              # Get latest progress line
+              PROGRESS=$(tail -1 "/tmp/aria2_${INDEX}.log" 2>/dev/null | grep "SD:" | tail -1)
+              
+              if [ -n "$PROGRESS" ]; then
+                # Check if SD:0
+                if echo "$PROGRESS" | grep -q "SD:0"; then
+                  if [ "$PROGRESS" != "$LAST_PROGRESS" ]; then
+                    SD_ZERO_COUNT=$((SD_ZERO_COUNT + 1))
+                    echo "🔴 SD:0 detected ($SD_ZERO_COUNT/$STUCK_LIMIT)"
+                    LAST_PROGRESS="$PROGRESS"
+                  fi
+                else
+                  # Has seeders - reset counter
+                  if [ "$SD_ZERO_COUNT" -gt 0 ]; then
+                    echo "🟢 Seeders found! Resetting counter."
+                  fi
+                  SD_ZERO_COUNT=0
+                fi
+                
+                # Show progress if downloading
+                if echo "$PROGRESS" | grep -q "DL:" && ! echo "$PROGRESS" | grep -q "DL:0B"; then
+                  echo "   $PROGRESS" | grep -oP '\[.*?\].*'
+                fi
+              fi
+              
+              # Skip if stuck too long
+              if [ "$SD_ZERO_COUNT" -ge "$STUCK_LIMIT" ]; then
+                echo ""
+                echo "⏭️ Skipping! $STUCK_LIMIT × SD:0 detected"
+                kill -9 $ARIA_PID 2>/dev/null
+                break
+              fi
+              
+              # Also timeout after 10 minutes total
+              ELAPSED=$(( $(date +%s) - START_TIME ))
+              if [ "$ELAPSED" -gt 600 ]; then
+                echo ""
+                echo "⏰ Timeout (10 minutes)"
+                kill -9 $ARIA_PID 2>/dev/null
+                break
+              fi
+            done
+            
+            wait $ARIA_PID 2>/dev/null
+            
+            # Check result
             ls downloads/ > /tmp/after_${INDEX}.txt 2>/dev/null
             NEW_FILE=$(comm -13 /tmp/before_${INDEX}.txt /tmp/after_${INDEX}.txt 2>/dev/null | head -1)
             
@@ -122,24 +177,23 @@ jobs:
               fi
             else
               echo ""
-              echo "❌ [$INDEX] Failed"
-              FAILED_LIST="$FAILED_LIST\n- [$INDEX] $FILENAME"
+              echo "❌ [$INDEX] Failed (no seeders)"
+              FAILED_LIST="$FAILED_LIST\n- [$INDEX] $FILENAME (no seeders)"
             fi
             
+            echo ""
+            echo "--- Moving to next ---"
             echo ""
           done <<< "${{ github.event.inputs.magnets }}"
           
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
-          echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
           
           {
             echo "# 📊 Report"
             echo ""
-            echo "| Item | Value |"
-            echo "|------|-------|"
-            echo "| Total | $INDEX |"
-            echo "| Success | $SUCCESS_COUNT |"
-            echo "| Size | $(numfmt --to=iec $TOTAL_SIZE) |"
+            echo "| Total | Success | Skip Limit |"
+            echo "|-------|---------|------------|"
+            echo "| $INDEX | $SUCCESS_COUNT | $STUCK_LIMIT×SD:0 |"
             echo ""
             
             if [ $SUCCESS_COUNT -gt 0 ]; then
