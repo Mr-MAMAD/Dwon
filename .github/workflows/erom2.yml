@@ -1,10 +1,10 @@
-name: Erome Downloader
+name: Erome Downloader (Smart Split)
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'Direct video URLs (one per line)'
+        description: 'Video URLs (space or newline separated)'
         required: true
         type: string
 
@@ -27,22 +27,27 @@ jobs:
           success=0
           total=0
           
-          while IFS= read -r url; do
+          # Convert spaces and newlines to single URLs per line
+          echo "${{ github.event.inputs.urls }}" | tr ' ' '\n' | while IFS= read -r url; do
             url=$(echo "$url" | xargs)
             [ -z "$url" ] && continue
+            # Accept only valid URLs
+            if ! echo "$url" | grep -qE '^https?://'; then
+              echo "⚠️ Skipping invalid: $url"
+              continue
+            fi
+            
             total=$((total+1))
             
             echo "=========================================="
             echo "[$total] Downloading: $url"
             echo "=========================================="
             
-            # Extract filename from URL
             filename=$(basename "$url" | cut -d'?' -f1)
             [ -z "$filename" ] && filename="video_${total}.mp4"
             
             echo "Saving as: $filename"
             
-            # Download with Referer header
             curl -L \
               -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
               -H "Referer: https://www.erome.com/" \
@@ -55,7 +60,6 @@ jobs:
                 continue
               }
             
-            # Verify
             if [ -f "downloads/$filename" ]; then
               size=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
               if [ "$size" -gt 102400 ]; then
@@ -67,11 +71,11 @@ jobs:
               fi
             fi
             echo ""
-          done <<< "${{ github.event.inputs.urls }}"
+          done
           
           echo ""
           echo "=========================================="
-          echo "Done! Downloaded $success/$total files"
+          echo "Done! Downloaded $success files"
           echo "=========================================="
           ls -lh downloads/
           
@@ -81,6 +85,7 @@ jobs:
           fi
 
       - name: Release
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: erome-${{ github.run_number }}
