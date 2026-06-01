@@ -1,0 +1,105 @@
+name: Magnet Torrent Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      magnets:
+        description: 'Magnet links (one per line)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 360
+    
+    steps:
+      - name: Setup
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2
+          mkdir -p downloads
+
+      - name: Download
+        shell: bash
+        run: |
+          success=0
+          total=0
+          
+          while IFS= read -r magnet; do
+            magnet=$(echo "$magnet" | xargs)
+            [ -z "$magnet" ] && continue
+            total=$((total+1))
+            
+            echo "=========================================="
+            echo "[$total] Downloading torrent..."
+            echo "=========================================="
+            
+            # Extract filename from magnet
+            name=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys,urllib.parse;print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
+            [ -z "$name" ] && name="torrent_${total}"
+            clean=$(echo "$name" | sed 's/[^a-zA-Z0-9._-]/_/g')
+            
+            echo "File: $clean"
+            echo ""
+            
+            # Download with aria2
+            aria2c \
+              "$magnet" \
+              --dir="downloads" \
+              --out="$clean" \
+              --seed-time=0 \
+              --max-upload-limit=10K \
+              --bt-max-peers=100 \
+              --split=16 \
+              --enable-dht=true \
+              --enable-dht6=false \
+              --enable-peer-exchange=true \
+              --bt-enable-lpd=true \
+              --bt-stop-timeout=300 \
+              --bt-tracker-connect-timeout=10 \
+              --bt-tracker-timeout=10 \
+              --connect-timeout=30 \
+              --timeout=300 \
+              --max-tries=3 \
+              --retry-wait=5 \
+              --continue=true \
+              --console-log-level=notice \
+              --summary-interval=15 \
+              2>&1 || {
+                echo "❌ Failed or timeout"
+                continue
+              }
+            
+            # Find downloaded file
+            file=$(ls -t downloads/ | head -1)
+            if [ -n "$file" ]; then
+              size=$(stat -c%s "downloads/$file" 2>/dev/null || echo 0)
+              if [ "$size" -gt 102400 ]; then
+                echo "✅ Downloaded: $file ($(numfmt --to=iec $size))"
+                success=$((success+1))
+              else
+                echo "❌ File too small ($size bytes)"
+                rm -f "downloads/$file"
+              fi
+            fi
+            echo ""
+          done <<< "${{ github.event.inputs.magnets }}"
+          
+          echo ""
+          echo "=========================================="
+          echo "Done! $success/$total downloaded"
+          echo "=========================================="
+          ls -lh downloads/
+          
+          [ $success -eq 0 ] && exit 1
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: torrent-${{ github.run_number }}
+          files: downloads/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
