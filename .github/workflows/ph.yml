@@ -1,155 +1,151 @@
 name: PH Downloader
 
-      on:
-      workflow_dispatch:
-      inputs:
+on:
+  workflow_dispatch:
+    inputs:
       url:
-      description: 'Video URLs'
-      required: true
-      type: string
+        description: "Video URLs"
+        required: true
+        type: string
+
       quality:
-      description: 'Quality'
-      required: true
-      type: choice
-      options:
-      - best
-      - 720p
-      - 480p
+        description: "Quality"
+        required: true
+        type: choice
+        options:
+          - best
+          - 720p
+          - 480p
+
       cookies:
-      description: 'Cookies in Netscape format'
-      required: false
-      type: string
-      
-      jobs:
-      download:
-      runs-on: ubuntu-latest
-      
-      ```
-      permissions:
-        contents: write
-      
-      steps:
-        - uses: actions/checkout@v4
-      
-        - name: Install yt-dlp
-          run: |
-            sudo apt-get update
-            sudo apt-get install -y ffmpeg
-      
-            sudo curl -L \
+        description: "Cookies in Netscape format"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yt-dlp
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+          sudo curl -L \
             https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp \
             -o /usr/local/bin/yt-dlp
-      
-            sudo chmod +x /usr/local/bin/yt-dlp
-      
-            yt-dlp --version
-      
-        - name: Setup Cookies
-          env:
-            INPUT_COOKIES: ${{ github.event.inputs.cookies }}
-          run: |
-            if [ -n "$INPUT_COOKIES" ]; then
-              printf "%s" "$INPUT_COOKIES" > cookies.txt
-              echo "Cookies file created"
-            fi
-      
-        - name: Prepare URLs
-          env:
-            INPUT_URL: ${{ github.event.inputs.url }}
-          run: |
-            echo "$INPUT_URL" \
-            | sed 's/[,[:space:]]\+/\n/g' \
-            | grep -v '^$' \
-            | head -100 > urls.txt
-      
-            echo "Found $(wc -l < urls.txt) URLs"
-      
-        - name: Download
-          run: |
-            mkdir -p output
-      
-            USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-      
-            if [ "${{ github.event.inputs.quality }}" = "720p" ]; then
-              FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
-            elif [ "${{ github.event.inputs.quality }}" = "480p" ]; then
-              FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
-            else
-              FORMAT="bestvideo+bestaudio/best"
-            fi
-      
-            cat > download.sh <<'EOF'
-            #!/usr/bin/env bash
-      
-            URL="$1"
-            FORMAT="$2"
-            INDEX="$3"
-      
-            USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-      
-            ARGS=(
-              --user-agent "$USER_AGENT"
-              --no-playlist
-              --restrict-filenames
-              --merge-output-format mp4
-            )
-      
-            if [ -f cookies.txt ]; then
-              ARGS+=(--cookies cookies.txt)
-            fi
-      
-            echo "[$INDEX] Checking metadata..."
-      
-            if ! yt-dlp "${ARGS[@]}" --get-title "$URL" >/tmp/title.txt 2>/tmp/error.txt; then
-              echo "[$INDEX] Metadata extraction failed"
-              tail -20 /tmp/error.txt || true
-              exit 1
-            fi
-      
-            TITLE=$(cat /tmp/title.txt)
-            echo "[$INDEX] Title: $TITLE"
-      
-            for TRY in 1 2 3 4 5; do
-      
-              echo "[$INDEX] Download attempt $TRY"
-      
-              if yt-dlp \
-                "${ARGS[@]}" \
-                -f "$FORMAT" \
-                -o "output/%(id)s.%(ext)s" \
-                "$URL"; then
-      
-                echo "[$INDEX] SUCCESS"
-                exit 0
-              fi
-      
-              sleep $((TRY * 5))
-            done
-      
-            echo "[$INDEX] FAILED"
+
+          sudo chmod +x /usr/local/bin/yt-dlp
+          yt-dlp --version
+
+      - name: Setup Cookies
+        env:
+          INPUT_COOKIES: ${{ github.event.inputs.cookies }}
+        run: |
+          if [ -n "$INPUT_COOKIES" ]; then
+            printf "%s" "$INPUT_COOKIES" > cookies.txt
+            echo "Cookies file created"
+          fi
+
+      - name: Prepare URLs
+        env:
+          INPUT_URL: ${{ github.event.inputs.url }}
+        run: |
+          echo "$INPUT_URL" \
+          | sed 's/[,[:space:]]\+/\n/g' \
+          | grep -v '^$' \
+          | head -100 > urls.txt
+
+          echo "Found $(wc -l < urls.txt) URLs"
+
+      - name: Download
+        run: |
+          mkdir -p output
+
+          if [ "${{ github.event.inputs.quality }}" = "720p" ]; then
+            FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
+          elif [ "${{ github.event.inputs.quality }}" = "480p" ]; then
+            FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
+          else
+            FORMAT="bestvideo+bestaudio/best"
+          fi
+
+          cat > download.sh <<'EOF'
+          #!/usr/bin/env bash
+
+          URL="$1"
+          FORMAT="$2"
+          INDEX="$3"
+
+          USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+
+          ARGS=(
+            --user-agent "$USER_AGENT"
+            --no-playlist
+            --restrict-filenames
+            --merge-output-format mp4
+          )
+
+          if [ -f cookies.txt ]; then
+            ARGS+=(--cookies cookies.txt)
+          fi
+
+          echo "[$INDEX] Checking metadata..."
+
+          if ! yt-dlp "${ARGS[@]}" --get-title "$URL" >/tmp/title.txt 2>/tmp/error.txt; then
+            echo "[$INDEX] Metadata extraction failed"
+            tail -20 /tmp/error.txt || true
             exit 1
-            EOF
-      
-            chmod +x download.sh
-      
-            INDEX=0
-      
-            while IFS= read -r URL; do
-      
-              [ -z "$URL" ] && continue
-      
-              INDEX=$((INDEX+1))
-      
-              ./download.sh "$URL" "$FORMAT" "$INDEX" || true
-      
-            done < urls.txt
-      
-        - name: Upload Release
-          uses: softprops/action-gh-release@v2
-          if: always()
-          with:
-            tag_name: run-${{ github.run_id }}
-            name: Downloaded Files
-            files: output/*
-          env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          fi
+
+          TITLE=$(cat /tmp/title.txt)
+          echo "[$INDEX] Title: $TITLE"
+
+          for TRY in 1 2 3 4 5; do
+            echo "[$INDEX] Download attempt $TRY"
+
+            if yt-dlp \
+              "${ARGS[@]}" \
+              -f "$FORMAT" \
+              -o "output/%(id)s.%(ext)s" \
+              "$URL"; then
+
+              echo "[$INDEX] SUCCESS"
+              exit 0
+            fi
+
+            sleep $((TRY * 5))
+          done
+
+          echo "[$INDEX] FAILED"
+          exit 1
+          EOF
+
+          chmod +x download.sh
+
+          INDEX=0
+
+          while IFS= read -r URL; do
+            [ -z "$URL" ] && continue
+
+            INDEX=$((INDEX + 1))
+
+            ./download.sh "$URL" "$FORMAT" "$INDEX" || true
+
+          done < urls.txt
+
+      - name: Upload Release
+        if: always()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: run-${{ github.run_id }}
+          name: Downloaded Files
+          files: output/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
