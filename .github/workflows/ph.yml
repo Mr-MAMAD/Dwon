@@ -98,7 +98,7 @@ jobs:
 
           echo "[$INDEX] Checking metadata..."
 
-          if ! yt-dlp "${ARGS[@]}" --get-title "$URL" >/tmp/title.txt 2>/tmp/error.txt; then
+          if ! yt-dlp -vU "${ARGS[@]}" --get-title "$URL" >/tmp/title.txt 2>/tmp/error.txt; then
             echo "[$INDEX] Metadata extraction failed"
             tail -20 /tmp/error.txt || true
             exit 1
