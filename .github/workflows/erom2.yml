@@ -1,52 +1,34 @@
-name: Erome Downloader (Smart Split)
-
-on:
-  workflow_dispatch:
-    inputs:
-      urls:
-        description: 'Video URLs (space or newline separated)'
-        required: true
-        type: string
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    
-    steps:
-      - name: Setup
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl
-          mkdir -p downloads
-
       - name: Download
         shell: bash
         run: |
           success=0
           total=0
+          failed_urls=""     # ذخیره لینک‌های ناموفق
           
-          # Convert spaces and newlines to single URLs per line
-          echo "${{ github.event.inputs.urls }}" | tr ' ' '\n' | while IFS= read -r url; do
+          # تبدیل فاصله‌ها و خط‌های جدید به آدرس‌های مجزا
+          while IFS= read -r url; do
             url=$(echo "$url" | xargs)
             [ -z "$url" ] && continue
-            # Accept only valid URLs
+            
             if ! echo "$url" | grep -qE '^https?://'; then
-              echo "⚠️ Skipping invalid: $url"
+              echo "⚠️ رد کردن آدرس نامعتبر: $url"
+              failed_urls="${failed_urls}${url} (نامعتبر)\n"
               continue
             fi
             
             total=$((total+1))
             
             echo "=========================================="
-            echo "[$total] Downloading: $url"
+            echo "[$total] در حال دانلود: $url"
             echo "=========================================="
             
             filename=$(basename "$url" | cut -d'?' -f1)
             [ -z "$filename" ] && filename="video_${total}.mp4"
             
-            echo "Saving as: $filename"
+            echo "ذخیره به عنوان: $filename"
+            
+            # پرچم برای تشخیص خطای curl
+            download_failed=false
             
             curl -L \
               -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
@@ -55,40 +37,53 @@ jobs:
               --connect-timeout 30 \
               --max-time 600 \
               -o "downloads/$filename" \
-              "$url" 2>&1 || {
-                echo "❌ Failed: $url"
-                continue
-              }
+              "$url" 2>&1 || download_failed=true
+            
+            if [ "$download_failed" = true ]; then
+              echo "❌ خطا در دانلود: $url"
+              failed_urls="${failed_urls}${url} (خطای curl)\n"
+              continue
+            fi
             
             if [ -f "downloads/$filename" ]; then
               size=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
               if [ "$size" -gt 102400 ]; then
-                echo "✅ Downloaded: $filename ($(numfmt --to=iec $size))"
+                echo "✅ دانلود شد: $filename ($(numfmt --to=iec $size))"
                 success=$((success+1))
               else
-                echo "❌ File too small ($size bytes)"
+                echo "❌ فایل خیلی کوچک است ($size بایت)"
+                failed_urls="${failed_urls}${url} (فایل کوچک: ${size} بایت)\n"
                 rm -f "downloads/$filename"
               fi
+            else
+              echo "❌ فایل ایجاد نشد: $filename"
+              failed_urls="${failed_urls}${url} (فایل ذخیره نشد)\n"
             fi
             echo ""
-          done
+          done < <(echo "${{ github.event.inputs.urls }}" | tr ' ' '\n')
           
           echo ""
           echo "=========================================="
-          echo "Done! Downloaded $success files"
+          echo "📊 گزارش نهایی"
           echo "=========================================="
+          echo "کل لینک‌های معتبر: $total"
+          echo "دانلود موفق: $success"
+          echo "دانلود ناموفق: $((total - success))"
+          echo ""
+          
+          if [ -n "$failed_urls" ]; then
+            echo "❌ لینک‌های دانلود نشده:"
+            echo "=========================================="
+            echo -e "$failed_urls"
+            echo "=========================================="
+          fi
+          
+          echo ""
+          echo "فایل‌های دانلود شده:"
           ls -lh downloads/
           
           if [ $success -eq 0 ]; then
-            echo "No files downloaded!"
+            echo ""
+            echo "⛔ هیچ فایلی با موفقیت دانلود نشد!"
             exit 1
           fi
-
-      - name: Release
-        if: success()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: erome-${{ github.run_number }}
-          files: downloads/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
