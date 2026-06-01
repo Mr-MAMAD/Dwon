@@ -1,11 +1,33 @@
+name: Erome Downloader (Smart Split)
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Video URLs (space or newline separated)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Setup
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl
+          mkdir -p downloads
+
       - name: Download
         shell: bash
         run: |
           success=0
           total=0
-          failed_urls=""     # ذخیره لینک‌های ناموفق
+          failed_urls=""
           
-          # تبدیل فاصله‌ها و خط‌های جدید به آدرس‌های مجزا
           while IFS= read -r url; do
             url=$(echo "$url" | xargs)
             [ -z "$url" ] && continue
@@ -27,7 +49,6 @@
             
             echo "ذخیره به عنوان: $filename"
             
-            # پرچم برای تشخیص خطای curl
             download_failed=false
             
             curl -L \
@@ -80,10 +101,19 @@
           
           echo ""
           echo "فایل‌های دانلود شده:"
-          ls -lh downloads/
+          ls -lh downloads/ 2>/dev/null || echo "هیچ فایلی موجود نیست"
           
           if [ $success -eq 0 ]; then
             echo ""
             echo "⛔ هیچ فایلی با موفقیت دانلود نشد!"
             exit 1
           fi
+
+      - name: Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: erome-${{ github.run_number }}
+          files: downloads/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
