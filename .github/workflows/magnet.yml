@@ -1,4 +1,4 @@
-name: Magnet Torrent Downloader (Stable)
+name: Magnet Torrent Downloader (Stable v3)
 
 on:
   workflow_dispatch:
@@ -52,7 +52,6 @@ jobs:
           mkdir -p downloads
 
           while IFS= read -r line; do
-            # Remove leading/trailing spaces, extract first magnet link from line
             magnet=$(echo "$line" | xargs | grep -oP 'magnet:\?[^ ]+' | head -1)
             [ -z "$magnet" ] && continue
 
@@ -61,24 +60,18 @@ jobs:
             echo "[$INDEX] 🧲 Processing..."
             echo "=========================================="
 
-            # Extract filename
             FILENAME=$(echo "$magnet" | grep -oP 'dn=\K[^&]+' 2>/dev/null | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
             if [ -z "$FILENAME" ]; then
               HASH=$(echo "$magnet" | grep -oP 'btih:\K[^&]+' 2>/dev/null)
               FILENAME="torrent_${HASH:0:10}.mp4"
             fi
-            # Clean filename: keep only safe characters
             FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g; s/__\+/_/g; s/\.\.\+/\./g')
             echo "📁 File: $FILENAME"
 
-            # Remove stale file if present
             rm -f "downloads/$FILENAME"
-
-            # Log file for aria2
             LOGFILE="/tmp/aria2_${INDEX}.log"
             > "$LOGFILE"
 
-            # Start aria2 (background)
             aria2c \
               "$magnet" \
               --dir="downloads" \
@@ -103,7 +96,6 @@ jobs:
 
             ARIA_PID=$!
 
-            # Monitor for SD:0
             SD_ZERO_COUNT=0
             LAST_LINE=""
             DOWNLOAD_STARTED=0
@@ -112,18 +104,12 @@ jobs:
             while kill -0 $ARIA_PID 2>/dev/null; do
               sleep 10
 
-              # Get latest line with SD:
               PROGRESS=$(tail -1 "$LOGFILE" 2>/dev/null | grep "SD:" | tail -1)
-
               if [ -n "$PROGRESS" ]; then
-                # Check if download speed > 0
                 if echo "$PROGRESS" | grep -qE "DL:[1-9]"; then
                   DOWNLOAD_STARTED=1
                   SD_ZERO_COUNT=0
-                  echo "   📥 Downloading..."
                 fi
-
-                # If download hasn't started yet, count SD:0
                 if [ "$DOWNLOAD_STARTED" -eq 0 ]; then
                   if echo "$PROGRESS" | grep -q "SD:0"; then
                     if [ "$PROGRESS" != "$LAST_LINE" ]; then
@@ -132,20 +118,17 @@ jobs:
                       LAST_LINE="$PROGRESS"
                     fi
                   else
-                    # Seeders appeared (even 1)
                     SD_ZERO_COUNT=0
                   fi
                 fi
               fi
 
-              # Skip if stuck too many times without seeders
               if [ "$SD_ZERO_COUNT" -ge "$STUCK_LIMIT" ] && [ "$DOWNLOAD_STARTED" -eq 0 ]; then
                 echo "⏭️ No seeders after $STUCK_LIMIT checks, skipping..."
                 kill -9 $ARIA_PID 2>/dev/null
                 break
               fi
 
-              # Global timeout
               ELAPSED=$(( $(date +%s) - START_TIME ))
               if [ "$ELAPSED" -gt "$TOTAL_TIMEOUT_SEC" ]; then
                 echo "⏰ Timeout (${TOTAL_TIMEOUT_MIN} min)"
@@ -156,21 +139,29 @@ jobs:
 
             wait $ARIA_PID 2>/dev/null
 
-            # Check result
+            COMPLETED=0
+            if grep -q "Download complete:" "$LOGFILE"; then
+              COMPLETED=1
+            fi
+
             if [ -f "downloads/$FILENAME" ]; then
               SIZE=$(stat -c%s "downloads/$FILENAME" 2>/dev/null || echo 0)
-              if [ "$SIZE" -gt 102400 ]; then
+              if [ "$COMPLETED" -eq 1 ] && [ "$SIZE" -gt 102400 ]; then
                 echo "✅ [$INDEX] $FILENAME ($(numfmt --to=iec $SIZE))"
                 SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
               else
-                echo "❌ [$INDEX] File too small: $SIZE bytes"
+                if [ "$COMPLETED" -eq 0 ]; then
+                  echo "❌ [$INDEX] Incomplete download (stopped before finish)"
+                else
+                  echo "❌ [$INDEX] File too small: $SIZE bytes"
+                fi
                 rm -f "downloads/$FILENAME"
-                FAILED_LIST="$FAILED_LIST\n- $FILENAME (small file)"
+                FAILED_LIST="$FAILED_LIST\n- $FILENAME"
               fi
             else
-              echo "❌ [$INDEX] Download failed"
-              FAILED_LIST="$FAILED_LIST\n- $FILENAME (no data)"
+              echo "❌ [$INDEX] No file created"
+              FAILED_LIST="$FAILED_LIST\n- $FILENAME (no file)"
             fi
 
             echo ""
@@ -178,9 +169,11 @@ jobs:
             echo ""
           done <<< "${{ github.event.inputs.magnets }}"
 
+          # Write outputs (even if zero success, we don't fail the job)
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
+          echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
 
-          # Report
+          # Write report
           {
             echo "# 📊 Download Report"
             echo ""
@@ -190,19 +183,17 @@ jobs:
             echo ""
             if [ $SUCCESS_COUNT -gt 0 ]; then
               echo "## ✅ Downloaded"
-              echo ""
               for f in downloads/*; do
                 [ -f "$f" ] && echo "- \`$(basename "$f")\` ($(numfmt --to=iec $(stat -c%s "$f")))"
               done
             fi
             if [ -n "$FAILED_LIST" ]; then
-              echo ""
-              echo "## ❌ Failed"
-              echo -e "$FAILED_LIST"
+              echo -e "\n## ❌ Failed\n$FAILED_LIST"
             fi
           } > download_report.md
 
-          [ $SUCCESS_COUNT -eq 0 ] && exit 1
+          # NO exit 1 here – let the job succeed always
+          echo "Done processing all magnets. Total success: $SUCCESS_COUNT"
 
       - name: Release
         if: steps.download.outputs.SUCCESS_COUNT != '0'
