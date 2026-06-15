@@ -11,12 +11,12 @@ on:
         description: 'Referer URL'
         required: false
         type: string
-        default: 'https://trafficdeposit.com/'
+        default: 'https://sxyprn.com/'
       origin:
         description: 'Origin URL'
         required: false
         type: string
-        default: 'https://trafficdeposit.com'
+        default: 'https://sxyprn.com'
 
 jobs:
   build:
