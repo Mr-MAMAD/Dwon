@@ -8,15 +8,15 @@ on:
         required: true
         type: string
       referer:
-        description: 'Referer URL'
+        description: 'Referer URL (پیش‌فرض: https://trafficdeposit.com/)'
         required: false
         type: string
-        default: ''
+        default: 'https://sxyprn.com/'
       origin:
-        description: 'Origin URL'
+        description: 'Origin URL (پیش‌فرض: https://trafficdeposit.com)'
         required: false
         type: string
-        default: ''
+        default: 'https://sxyprn.com'
 
 jobs:
   build:
@@ -25,218 +25,97 @@ jobs:
       contents: write
 
     steps:
-      - name: Setup
+      - name: Setup environment
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq curl wget
           mkdir -p downloads
 
-      - name: Download
+      - name: Download videos
         shell: bash
         run: |
           success=0
           total=0
-          failed_urls=""
-
+          
           REFERER="${{ github.event.inputs.referer }}"
           ORIGIN="${{ github.event.inputs.origin }}"
-
-          # اگر Referer تنظیم نشده، از خود لینک استخراج کن
-          if [ -z "$REFERER" ]; then
-            REFERER="https://trafficdeposit.com/"
-          fi
-          if [ -z "$ORIGIN" ]; then
-            ORIGIN="https://trafficdeposit.com"
-          fi
-
-          echo "🔗 Referer: $REFERER"
-          echo "🔗 Origin: $ORIGIN"
+          
+          echo "Referer: $REFERER"
+          echo "Origin: $ORIGIN"
           echo ""
 
-          while IFS= read -r url; do
+          # تبدیل URL ها به خطوط جداگانه
+          echo "${{ github.event.inputs.urls }}" | tr ' ' '\n' | while IFS= read -r url; do
             url=$(echo "$url" | xargs)
             [ -z "$url" ] && continue
-
+            
             if ! echo "$url" | grep -qE '^https?://'; then
               echo "⚠️ رد کردن آدرس نامعتبر: $url"
-              failed_urls="${failed_urls}${url} (نامعتبر)\n"
               continue
             fi
 
-            total=$((total+1))
-
+            total=$((total + 1))
+            
             echo "=========================================="
-            echo "[$total] در حال دانلود: $url"
+            echo "[$total] دانلود: $url"
             echo "=========================================="
 
-            # تعیین نام فایل بر اساس URL
-            if echo "$url" | grep -q '\.vid'; then
-              filename="video_${total}.mp4"
-            else
-              filename=$(basename "$url" | cut -d'?' -f1)
-              [ -z "$filename" ] && filename="video_${total}.mp4"
-            fi
+            # نام فایل
+            filename="video_${total}.mp4"
+            echo "ذخیره به عنوان: $filename"
 
-            echo "📁 ذخیره به عنوان: $filename"
-
-            download_failed=false
-            http_code=0
-
-            # اول بررسی کنیم سرور چه پاسخی میده
-            echo "🔍 بررسی پاسخ سرور..."
-            response_headers=$(curl -sI -L \
+            # دانلود با curl
+            curl -L \
+              --max-time 300 \
+              --retry 3 \
+              --retry-delay 5 \
               -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
               -H "Referer: $REFERER" \
               -H "Origin: $ORIGIN" \
               -H "Accept: */*" \
-              --max-time 10 \
-              "$url" 2>&1)
-            
-            http_code=$(echo "$response_headers" | grep -i "^HTTP" | tail -1 | awk '{print $2}')
-            content_type=$(echo "$response_headers" | grep -i "content-type" | tail -1 | cut -d' ' -f2 | tr -d '\r')
-            content_length=$(echo "$response_headers" | grep -i "content-length" | tail -1 | cut -d' ' -f2 | tr -d '\r')
-            location=$(echo "$response_headers" | grep -i "^location:" | tail -1 | cut -d' ' -f2 | tr -d '\r')
-
-            echo "HTTP Code: $http_code"
-            echo "Content-Type: $content_type"
-            echo "Content-Length: $content_length"
-            echo "Location: $location"
-
-            # اگر ریدایرکت داره، از لینک جدید استفاده کن
-            if [ -n "$location" ] && [ "$http_code" != "200" ]; then
-              echo "🔄 ریدایرکت به: $location"
-              url="$location"
-            fi
-
-            # اگر سرور پاسخ 200 یا 206 میده، دانلود کن
-            if [ "$http_code" = "200" ] || [ "$http_code" = "206" ] || [ "$http_code" = "302" ] || [ "$http_code" = "301" ]; then
-              echo "🔄 شروع دانلود..."
-              
-              # روش 1: دانلود مستقیم با curl
-              if curl -L \
-                --connect-timeout 30 \
-                --max-time 600 \
-                --retry 5 \
-                --retry-delay 10 \
-                --retry-max-time 300 \
-                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-                -H "Referer: $REFERER" \
-                -H "Origin: $ORIGIN" \
-                -H "Accept: */*" \
-                -H "Accept-Encoding: identity;q=1, *;q=0" \
-                -H "Accept-Language: en-US,en;q=0.9" \
-                -H "Connection: keep-alive" \
-                -H "Sec-Fetch-Dest: video" \
-                -H "Sec-Fetch-Mode: no-cors" \
-                -H "Sec-Fetch-Site: cross-site" \
-                -H "Cache-Control: no-cache" \
-                -H "Pragma: no-cache" \
-                -H "DNT: 1" \
-                --compressed \
-                -o "downloads/$filename" \
-                "$url" 2>&1; then
-                
-                # چک کردن سایز فایل
-                if [ -f "downloads/$filename" ]; then
-                  size=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
-                  if [ "$size" -gt 10240 ]; then  # حداقل 10KB
-                    echo "✅ دانلود شد: $filename ($(numfmt --to=iec $size 2>/dev/null || echo "${size} bytes"))"
-                    success=$((success+1))
+              -o "downloads/$filename" \
+              "$url" || {
+                echo "❌ curl failed, trying wget..."
+                wget --timeout=60 --tries=3 \
+                  --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                  --referer="$REFERER" \
+                  -O "downloads/$filename" \
+                  "$url" || {
+                    echo "❌ دانلود ناموفق"
                     continue
-                  else
-                    echo "⚠️ فایل خیلی کوچک ($size بایت) - احتمالاً خطا در پاسخ سرور"
-                    echo "محتوای فایل:"
-                    head -c 200 "downloads/$filename"
-                    rm -f "downloads/$filename"
-                  fi
-                fi
-              fi
-              
-              # روش 2: دانلود با Python requests
-              echo "🔄 تلاش با Python..."
-              python3 -c "
-import urllib.request
-import sys
+                  }
+              }
 
-url = '$url'
-filename = 'downloads/$filename'
-
-headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Referer': '$REFERER',
-    'Origin': '$ORIGIN',
-    'Accept': '*/*',
-    'Connection': 'keep-alive',
-}
-
-req = urllib.request.Request(url, headers=headers)
-try:
-    with urllib.request.urlopen(req, timeout=30) as response:
-        with open(filename, 'wb') as f:
-            f.write(response.read())
-    print('Python download successful')
-except Exception as e:
-    print(f'Python error: {e}')
-    sys.exit(1)
-" 2>&1 || download_failed=true
-
-            else
-              echo "❌ سرور پاسخ خطا داد: HTTP $http_code"
-              echo "پاسخ کامل سرور:"
-              echo "$response_headers"
-              download_failed=true
-            fi
-
-            # بررسی نهایی
+            # بررسی فایل
             if [ -f "downloads/$filename" ]; then
               size=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
               if [ "$size" -gt 10240 ]; then
-                echo "✅ دانلود شد: $filename ($(numfmt --to=iec $size 2>/dev/null || echo "${size} bytes"))"
-                success=$((success+1))
-                download_failed=false
+                echo "✅ موفق: $filename ($(numfmt --to=iec $size))"
+                success=$((success + 1))
               else
-                echo "❌ فایل خیلی کوچک ($size بایت)"
-                head -c 500 "downloads/$filename"
+                echo "❌ فایل کوچک: $size بایت"
                 rm -f "downloads/$filename"
-                download_failed=true
               fi
             fi
-
-            if [ "$download_failed" = true ]; then
-              echo "❌ دانلود ناموفق: $url"
-              failed_urls="${failed_urls}${url}\n"
-            fi
-
             echo ""
-          done < <(echo "${{ github.event.inputs.urls }}" | tr ' ' '\n')
+          done
 
           echo ""
           echo "=========================================="
-          echo "📊 گزارش نهایی"
-          echo "=========================================="
-          echo "کل: $total | موفق: $success | ناموفق: $((total - success))"
-          echo ""
-
-          if [ -n "$failed_urls" ]; then
-            echo "❌ لینک‌های ناموفق:"
-            echo -e "$failed_urls"
-          fi
-
-          echo ""
-          echo "📁 فایل‌های دانلود شده:"
+          echo "فایل‌های دانلود شده:"
           ls -lh downloads/ 2>/dev/null || echo "هیچ فایلی موجود نیست"
-
-          if [ $success -eq 0 ]; then
-            echo ""
-            echo "⛔ دانلود ناموفق!"
+          
+          # چک کردن حداقل یک فایل موفق
+          if [ $(ls -1 downloads/ 2>/dev/null | wc -l) -eq 0 ]; then
+            echo "⛔ هیچ فایلی دانلود نشد!"
             exit 1
           fi
 
-      - name: Release
+      - name: Upload to release
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: erome-${{ github.run_number }}
+          tag_name: download-${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
