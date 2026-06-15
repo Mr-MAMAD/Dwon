@@ -8,12 +8,17 @@ on:
         required: true
         type: string
       referer:
-        description: 'Referer URL (e.g. https://example.com/)'
+        description: 'Referer URL (leave empty for auto-detect)'
         required: false
         type: string
         default: ''
       origin:
-        description: 'Origin URL (e.g. https://example.com)'
+        description: 'Origin URL (leave empty for auto-detect)'
+        required: false
+        type: string
+        default: ''
+      custom_headers:
+        description: 'Additional headers (format: Header: Value, one per line)'
         required: false
         type: string
         default: ''
@@ -28,7 +33,7 @@ jobs:
       - name: Setup
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl
+          sudo apt-get install -y -qq curl wget
           mkdir -p downloads
 
       - name: Download
@@ -38,16 +43,15 @@ jobs:
           total=0
           failed_urls=""
 
-          # گرفتن Referer و Origin از ورودی‌ها
+          # گرفتن مقادیر از ورودی‌ها
           REFERER="${{ github.event.inputs.referer }}"
           ORIGIN="${{ github.event.inputs.origin }}"
+          CUSTOM_HEADERS="${{ github.event.inputs.custom_headers }}"
 
-          # اگر خالی بودن، مقدار پیش‌فرض خالی بمونه
-          [ -z "$REFERER" ] && REFERER=""
-          [ -z "$ORIGIN" ] && ORIGIN=""
-
-          echo "🔗 Referer: ${REFERER:-'تنظیم نشده'}"
-          echo "🔗 Origin: ${ORIGIN:-'تنظیم نشده'}"
+          # اگر Referer خالی بود، از دامنه لینک استخراج کن
+          # ولی برای این لینک خاص، بهتره تنظیم بشه
+          echo "🔗 Referer: ${REFERER:-'تنظیم نشده (auto)'}"
+          echo "🔗 Origin: ${ORIGIN:-'تنظیم نشده (auto)'}"
           echo ""
 
           while IFS= read -r url; do
@@ -66,31 +70,102 @@ jobs:
             echo "[$total] در حال دانلود: $url"
             echo "=========================================="
 
-            # استخراج نام فایل از پارامتر file اگر وجود داشته باشد
+            # استخراج نام فایل
             if echo "$url" | grep -q 'file='; then
               file_param=$(echo "$url" | sed -n 's/.*file=\([^&]*\).*/\1/p' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
               filename=$(basename "$file_param")
             else
-              filename=$(basename "$url" | cut -d'?' -f1)
+              # استخراج نام فایل از آخرین بخش URL
+              filename=$(echo "$url" | sed 's/\?.*//' | xargs basename)
             fi
 
-            [ -z "$filename" ] && filename="video_${total}.mp4"
-            echo "ذخیره به عنوان: $filename"
+            # اگر نام فایل معتبر نیست یا پسوند نداره
+            if [ -z "$filename" ] || ! echo "$filename" | grep -q '\.'; then
+              # چک کردن Content-Type برای تعیین پسوند
+              content_type=$(curl -sI -L "$url" | grep -i "content-type" | tail -1 | cut -d' ' -f2 | tr -d '\r')
+              case "$content_type" in
+                *video/mp4*) ext="mp4" ;;
+                *video/webm*) ext="webm" ;;
+                *video/x-matroska*) ext="mkv" ;;
+                *video/*) ext="mp4" ;;
+                *) ext="vid" ;;
+              esac
+              filename="video_${total}.${ext}"
+            fi
+
+            echo "📁 ذخیره به عنوان: $filename"
 
             download_failed=false
 
-            # ساخت دستور curl با هدرهای دلخواه
-            CURL_CMD="curl -L --connect-timeout 30 -o \"downloads/$filename\""
-            CURL_CMD="$CURL_CMD -H \"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\""
-            
-            [ -n "$REFERER" ] && CURL_CMD="$CURL_CMD -H \"Referer: $REFERER\""
-            [ -n "$ORIGIN" ] && CURL_CMD="$CURL_CMD -H \"Origin: $ORIGIN\""
-            
-            CURL_CMD="$CURL_CMD \"$url\" 2>&1"
+            # ساخت آرایه‌ای از هدرها
+            HEADERS=()
+            HEADERS+=("-H" "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            HEADERS+=("-H" "Accept: */*")
+            HEADERS+=("-H" "Accept-Language: en-US,en;q=0.9")
+            HEADERS+=("-H" "Accept-Encoding: identity")
+            HEADERS+=("-H" "Connection: keep-alive")
+            HEADERS+=("-H" "Sec-Fetch-Dest: video")
+            HEADERS+=("-H" "Sec-Fetch-Mode: no-cors")
+            HEADERS+=("-H" "Sec-Fetch-Site: cross-site")
+            HEADERS+=("-H" "Pragma: no-cache")
+            HEADERS+=("-H" "Cache-Control: no-cache")
 
-            eval $CURL_CMD || download_failed=true
+            # تنظیم Referer
+            if [ -n "$REFERER" ]; then
+              HEADERS+=("-H" "Referer: $REFERER")
+              echo "🔗 استفاده از Referer سفارشی: $REFERER"
+            else
+              # استخراج خودکار Referer از دامنه
+              auto_referer=$(echo "$url" | sed -E 's|(https?://[^/]+).*|\1/|')
+              HEADERS+=("-H" "Referer: $auto_referer")
+              echo "🔗 Referer خودکار: $auto_referer"
+            fi
 
-            if [ "$download_failed" = true ]; then
+            # تنظیم Origin
+            if [ -n "$ORIGIN" ]; then
+              HEADERS+=("-H" "Origin: $ORIGIN")
+              echo "🔗 استفاده از Origin سفارشی: $ORIGIN"
+            else
+              # استخراج خودکار Origin
+              auto_origin=$(echo "$url" | sed -E 's|(https?://[^/]+).*|\1|')
+              HEADERS+=("-H" "Origin: $auto_origin")
+              echo "🔗 Origin خودکار: $auto_origin"
+            fi
+
+            # اضافه کردن هدرهای سفارشی
+            if [ -n "$CUSTOM_HEADERS" ]; then
+              while IFS= read -r header; do
+                [ -n "$header" ] && HEADERS+=("-H" "$header")
+              done <<< "$CUSTOM_HEADERS"
+            fi
+
+            # روش 1: استفاده از curl با هدرهای کامل
+            echo "🔄 تلاش با روش curl..."
+            if curl -L \
+              --connect-timeout 30 \
+              --max-time 300 \
+              --retry 3 \
+              --retry-delay 5 \
+              -o "downloads/$filename" \
+              "${HEADERS[@]}" \
+              "$url" 2>&1 | tee curl_output.log; then
+              echo "✅ curl اجرا شد"
+            else
+              # روش 2: استفاده از wget به عنوان fallback
+              echo "🔄 تلاش با روش wget..."
+              if wget --timeout=30 --tries=3 \
+                --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                ${REFERER:+--referer="$REFERER"} \
+                -O "downloads/$filename" \
+                "$url" 2>&1; then
+                echo "✅ wget اجرا شد"
+              else
+                download_failed=true
+              fi
+            fi
+
+            # بررسی فایل دانلود شده
+            if [ "$download_failed" = true ] || [ ! -f "downloads/$filename" ]; then
               echo "❌ خطا در دانلود: $url"
               failed_urls="${failed_urls}${url} (خطای curl)\n"
               continue
@@ -98,11 +173,14 @@ jobs:
 
             if [ -f "downloads/$filename" ]; then
               size=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
-              if [ "$size" -gt 102400 ]; then
-                echo "✅ دانلود شد: $filename ($(numfmt --to=iec $size))"
+              if [ "$size" -gt 1024 ]; then  # کاهش حداقل سایز به 1KB برای فایل‌های کوچک
+                echo "✅ دانلود شد: $filename ($(numfmt --to=iec $size 2>/dev/null || echo "${size} bytes"))"
                 success=$((success+1))
               else
                 echo "❌ فایل خیلی کوچک است ($size بایت)"
+                # نمایش محتوای فایل برای دیباگ
+                echo "محتوای فایل:"
+                head -c 500 "downloads/$filename" | cat -v
                 failed_urls="${failed_urls}${url} (فایل کوچک: ${size} بایت)\n"
                 rm -f "downloads/$filename"
               fi
