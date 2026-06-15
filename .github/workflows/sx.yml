@@ -236,7 +236,7 @@ except Exception as e:
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: sx-${{ github.run_number }}
+          tag_name: erome-${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
