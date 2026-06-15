@@ -7,6 +7,16 @@ on:
         description: 'Video URLs (space or newline separated)'
         required: true
         type: string
+      referer:
+        description: 'Referer URL (e.g. https://example.com/)'
+        required: false
+        type: string
+        default: ''
+      origin:
+        description: 'Origin URL (e.g. https://example.com)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   build:
@@ -27,6 +37,18 @@ jobs:
           success=0
           total=0
           failed_urls=""
+
+          # گرفتن Referer و Origin از ورودی‌ها
+          REFERER="${{ github.event.inputs.referer }}"
+          ORIGIN="${{ github.event.inputs.origin }}"
+
+          # اگر خالی بودن، مقدار پیش‌فرض خالی بمونه
+          [ -z "$REFERER" ] && REFERER=""
+          [ -z "$ORIGIN" ] && ORIGIN=""
+
+          echo "🔗 Referer: ${REFERER:-'تنظیم نشده'}"
+          echo "🔗 Origin: ${ORIGIN:-'تنظیم نشده'}"
+          echo ""
 
           while IFS= read -r url; do
             url=$(echo "$url" | xargs)
@@ -57,13 +79,16 @@ jobs:
 
             download_failed=false
 
-            curl -L \
-              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              -H "Referer: https://sxyprn.com/" \
-              -H "Origin: https://sxyprn.com" \
-              --connect-timeout 30 \
-              -o "downloads/$filename" \
-              "$url" 2>&1 || download_failed=true
+            # ساخت دستور curl با هدرهای دلخواه
+            CURL_CMD="curl -L --connect-timeout 30 -o \"downloads/$filename\""
+            CURL_CMD="$CURL_CMD -H \"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\""
+            
+            [ -n "$REFERER" ] && CURL_CMD="$CURL_CMD -H \"Referer: $REFERER\""
+            [ -n "$ORIGIN" ] && CURL_CMD="$CURL_CMD -H \"Origin: $ORIGIN\""
+            
+            CURL_CMD="$CURL_CMD \"$url\" 2>&1"
+
+            eval $CURL_CMD || download_failed=true
 
             if [ "$download_failed" = true ]; then
               echo "❌ خطا در دانلود: $url"
