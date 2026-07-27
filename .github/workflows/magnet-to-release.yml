@@ -7,10 +7,6 @@ on:
         description: 'لینک مگنت'
         required: true
         type: string
-      release_tag:
-        description: 'نام تگ ریلیز (مثلا v1.0.0)'
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -41,12 +37,16 @@ jobs:
       - name: List downloaded files
         run: ls -lh downloads
 
+      - name: Generate release tag
+        id: tag
+        run: echo "tag=release-$(date +'%Y%m%d-%H%M%S')-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release with assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ inputs.release_tag }}" \
+          gh release create "${{ steps.tag.outputs.tag }}" \
             downloads/* \
-            --title "${{ inputs.release_tag }}" \
+            --title "${{ steps.tag.outputs.tag }}" \
             --notes "دانلود شده از مگنت لینک به‌صورت خودکار" \
             --repo "${{ github.repository }}"
