@@ -1,0 +1,45 @@
+name: Download Magnet to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      magnet_link:
+        description: 'لینک مگنت'
+        required: true
+        type: string
+      release_tag:
+        description: 'نام تگ ریلیز (مثلا v1.0.0)'
+        required: true
+        type: string
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340   # نزدیک به حداکثر ۶ ساعت
+    steps:
+      - name: Install aria2
+        run: sudo apt-get update && sudo apt-get install -y aria2
+
+      - name: Download via magnet link
+        run: |
+          mkdir -p downloads
+          aria2c \
+            --dir=downloads \
+            --seed-time=0 \
+            --seed-ratio=0.0 \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --bt-stop-timeout=300 \
+            "${{ inputs.magnet_link }}"
+
+      - name: List downloaded files
+        run: ls -lh downloads
+
+      - name: Create GitHub Release with assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.release_tag }}" \
+            downloads/* \
+            --title "${{ inputs.release_tag }}" \
+            --notes "دانلود شده از مگنت لینک به‌صورت خودکار"
