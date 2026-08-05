@@ -1,0 +1,66 @@
+name: dood Videos and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      links:
+        description: "لینک‌ها را وارد کنید (هر خط یک لینک)"
+        required: false
+        default: ""
+      workers:
+        description: "تعداد دانلود همزمان"
+        required: false
+        default: "4"
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yt-dlp requests
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+
+      - name: Prepare links file
+        run: |
+          if [ -n "${{ github.event.inputs.links }}" ]; then
+            printf '%s\n' "${{ github.event.inputs.links }}" > links.txt
+          elif [ -f links.txt ]; then
+            echo "استفاده از links.txt موجود در ریپو"
+          else
+            echo "هیچ لینکی مشخص نشده (نه از ورودی، نه از فایل links.txt)"
+            exit 1
+          fi
+          echo "لینک‌های نهایی:"
+          cat links.txt
+
+      - name: Download videos (parallel)
+        run: |
+          python scripts/download_videos.py \
+            --links-file links.txt \
+            --workers "${{ github.event.inputs.workers }}"
+
+      - name: List downloaded files
+        run: ls -lh downloads || echo "هیچ فایلی دانلود نشد"
+
+      - name: Create Release and Upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: run-${{ github.run_number }}
+          name: "دانلود ویدیو - Run #${{ github.run_number }}"
+          files: downloads/*.mp4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
