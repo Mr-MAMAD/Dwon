@@ -1,4 +1,4 @@
-name: Yes Downloader (Smart Split)
+name: erop Downloader (Smart Split)
 
 on:
   workflow_dispatch:
