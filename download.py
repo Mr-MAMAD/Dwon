@@ -125,7 +125,7 @@ def download_with_curl_cffi(url, output_dir):
     warmup_session(session, url)
 
     parsed = urlparse(url)
-    referer = f"{parsed.scheme}://{parsed.netloc}/"
+    referer = "https://sxyprn.com"  # آدرس دقیق صفحه‌ای که لینک را از آن برداشته‌اید
     session.headers.update({"Referer": referer})
 
     resp = session.get(url, timeout=60, allow_redirects=True)
