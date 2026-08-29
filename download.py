@@ -4,7 +4,7 @@ import re
 import sys
 import time
 import argparse
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urljoin
 
 try:
     import requests
@@ -14,36 +14,49 @@ except ImportError:
     print("نصب requests لازم است: pip install requests")
     sys.exit(1)
 
-# تلاش برای استفاده از curl_cffi در صورت نصب بودن
 try:
     from curl_cffi import requests as curl_requests
     HAS_CURL_CFFI = True
 except ImportError:
     HAS_CURL_CFFI = False
 
+# هدرهای کامل مرورگر کروم
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.google.com/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9,fa;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 }
 
 def extract_real_url(html):
     """استخراج لینک واقعی از متا رفرش یا جاوااسکریپت"""
-    # متا رفرش
     m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\']\d+;\s*url=([^"\']+)', html, re.I)
     if m:
         return m.group(1).strip()
-    # window.location
     m = re.search(r'(?:window\.location|location\.href)\s*=\s*["\']([^"\']+)', html, re.I)
     if m:
         return m.group(1).strip()
-    # لینک مستقیم داخل تگ a با متن Download
     m = re.search(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>\s*(?:Download|دانلود)', html, re.I)
     if m:
         return m.group(1).strip()
     return None
+
+def warmup_session(session, url):
+    """درخواست اولیه به صفحه اصلی دامنه برای دریافت کوکی‌ها"""
+    parsed = urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}/"
+    try:
+        session.get(base_url, headers=HEADERS, timeout=30, allow_redirects=True)
+        print(f"✅ کوکی‌ها از {base_url} دریافت شد")
+    except Exception as e:
+        print(f"⚠️ خطا در warmup (ادامه می‌دهیم): {e}")
 
 def download_with_requests(url, output_dir):
     session = requests.Session()
@@ -53,6 +66,14 @@ def download_with_requests(url, output_dir):
     session.mount("https://", adapter)
     session.headers.update(HEADERS)
 
+    # گرم‌کردن نشست با کوکی‌های دامنه
+    warmup_session(session, url)
+
+    # تنظیم Referer به ریشه دامنه
+    parsed = urlparse(url)
+    referer = f"{parsed.scheme}://{parsed.netloc}/"
+    session.headers.update({"Referer": referer})
+
     resp = session.get(url, stream=True, timeout=60, allow_redirects=True)
     resp.raise_for_status()
 
@@ -61,6 +82,7 @@ def download_with_requests(url, output_dir):
         html = resp.text
         real_url = extract_real_url(html)
         if real_url:
+            real_url = urljoin(resp.url, real_url)  # حل لینک نسبی
             print(f"لینک واقعی پیدا شد: {real_url}")
             resp = session.get(real_url, stream=True, timeout=60, allow_redirects=True)
             resp.raise_for_status()
@@ -91,17 +113,31 @@ def download_with_requests(url, output_dir):
     return filepath
 
 def download_with_curl_cffi(url, output_dir):
-    """نسخه پشتیبان با curl_cffi برای دور زدن محافظت‌های TLS"""
+    """نسخه پشتیبان با curl_cffi"""
     if not HAS_CURL_CFFI:
         raise ImportError("curl_cffi نصب نیست")
-    resp = curl_requests.get(url, headers=HEADERS, impersonate="chrome", timeout=60)
+
+    # curl_cffi session
+    session = curl_requests.Session(impersonate="chrome")
+    session.headers.update(HEADERS)
+
+    # warmup
+    warmup_session(session, url)
+
+    parsed = urlparse(url)
+    referer = f"{parsed.scheme}://{parsed.netloc}/"
+    session.headers.update({"Referer": referer})
+
+    resp = session.get(url, timeout=60, allow_redirects=True)
     resp.raise_for_status()
 
     if "text/html" in resp.headers.get("Content-Type", ""):
         html = resp.text
         real_url = extract_real_url(html)
         if real_url:
-            resp = curl_requests.get(real_url, headers=HEADERS, impersonate="chrome", timeout=60)
+            real_url = urljoin(str(resp.url), real_url)
+            print(f"لینک واقعی پیدا شد: {real_url}")
+            resp = session.get(real_url, timeout=60, allow_redirects=True)
             resp.raise_for_status()
         else:
             raise RuntimeError("پاسخ HTML است اما لینک واقعی یافت نشد")
@@ -113,7 +149,7 @@ def download_with_curl_cffi(url, output_dir):
         if fname_match:
             filename = fname_match[-1]
     if not filename:
-        filename = os.path.basename(urlparse(resp.url).path)
+        filename = os.path.basename(urlparse(str(resp.url)).path)
     if not filename:
         filename = "download.file"
     filename = unquote(filename)
