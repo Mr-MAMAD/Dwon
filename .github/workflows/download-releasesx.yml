@@ -1,0 +1,40 @@
+name: Download and Release
+
+on:
+  workflow_dispatch:          # اجرای دستی
+  push:
+    paths:
+      - links.txt             # با تغییر links.txt اجرا شود
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # لازم برای ساخت Release
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+          # نصب curl_cffi برای دور زدن محافظت‌های قوی (اختیاری)
+          pip install curl_cffi
+
+      - name: Download files
+        run: |
+          python download.py links.txt downloads
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: download-${{ github.run_number }}-${{ github.run_attempt }}
+          files: downloads/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
