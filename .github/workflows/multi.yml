@@ -40,21 +40,46 @@ jobs:
             --max-connection-per-server=16 \
             --split=16 \
             --bt-stop-timeout=300 \
-            --continue=true
+            --bt-tracker-timeout=60 \
+            --timeout=60 \
+            --max-tries=3 \
+            --retry-wait=10 \
+            --continue=true \
+            --summary-interval=30 \
+            || echo "برخی دانلودها با خطا مواجه شدند، ادامه می‌دهیم..."
 
       - name: List downloaded files
-        run: ls -lhR downloads
+        run: |
+          echo "فایل‌های با موفقیت دانلودشده:"
+          ls -lhR downloads || echo "هیچ فایلی دانلود نشد!"
+
+      - name: Check if any file was downloaded
+        id: check
+        run: |
+          if [ -z "$(find downloads -type f 2>/dev/null)" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Generate release tag
+        if: steps.check.outputs.found == 'true'
         id: tag
         run: echo "tag=release-$(date +'%Y%m%d-%H%M%S')-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release with assets
+        if: steps.check.outputs.found == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ steps.tag.outputs.tag }}" \
             downloads/* \
             --title "${{ steps.tag.outputs.tag }}" \
-            --notes "دانلود شده از چند مگنت لینک به‌صورت خودکار" \
+            --notes "دانلود شده از چند مگنت لینک به‌صورت خودکار. توجه: ممکن است برخی لینک‌ها به دلیل نبود سیدر یا خطا دانلود نشده باشند." \
             --repo "${{ github.repository }}"
+
+      - name: Fail workflow if nothing downloaded
+        if: steps.check.outputs.found == 'false'
+        run: |
+          echo "هیچ فایلی از هیچ‌کدام از لینک‌ها دانلود نشد."
+          exit 1
