@@ -1,0 +1,60 @@
+name: Download Multiple Magnets to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      magnet_links:
+        description: 'لینک‌های مگنت (هر کدام در یک خط جدا)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install aria2
+        run: sudo apt-get update && sudo apt-get install -y aria2
+
+      - name: Prepare magnet list file
+        run: |
+          mkdir -p downloads
+          printf '%s\n' "${{ inputs.magnet_links }}" | sed '/^\s*$/d' > magnets.txt
+          echo "--- لینک‌های دریافت‌شده ---"
+          cat magnets.txt
+
+      - name: Download all magnets concurrently
+        run: |
+          aria2c \
+            --dir=downloads \
+            --input-file=magnets.txt \
+            --max-concurrent-downloads=5 \
+            --seed-time=0 \
+            --seed-ratio=0.0 \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --bt-stop-timeout=300 \
+            --continue=true
+
+      - name: List downloaded files
+        run: ls -lhR downloads
+
+      - name: Generate release tag
+        id: tag
+        run: echo "tag=release-$(date +'%Y%m%d-%H%M%S')-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release with assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            downloads/* \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --notes "دانلود شده از چند مگنت لینک به‌صورت خودکار" \
+            --repo "${{ github.repository }}"
