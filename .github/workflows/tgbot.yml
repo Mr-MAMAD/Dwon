@@ -1,0 +1,53 @@
+name: Send files to Telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'یک یا چند لینک مستقیم (لینک‌ها را با کاما , از هم جدا کنید)'
+        required: true
+        type: string
+
+jobs:
+  send-to-telegram:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and send each file
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          URLS: ${{ github.event.inputs.urls }}
+        run: |
+          IFS=',' read -ra URL_ARRAY <<< "$URLS"
+
+          for raw_url in "${URL_ARRAY[@]}"; do
+            url=$(echo "$raw_url" | xargs)
+            [ -z "$url" ] && continue
+
+            filename=$(basename "$url")
+            echo "==> در حال دانلود: $filename"
+
+            if ! curl -L -f -s -o "$filename" "$url"; then
+              echo "!! خطا در دانلود: $url"
+              continue
+            fi
+
+            size_mb=$(( $(stat -c%s "$filename") / 1024 / 1024 ))
+            echo "حجم فایل: ${size_mb}MB"
+
+            ext_lower=$(echo "${filename##*.}" | tr '[:upper:]' '[:lower:]')
+            case "$ext_lower" in
+              mp4|mov|mkv|avi|webm) method="sendVideo"; field="video" ;;
+              jpg|jpeg|png|webp)    method="sendPhoto"; field="photo" ;;
+              gif)                  method="sendAnimation"; field="animation" ;;
+              *)                    method="sendDocument"; field="document" ;;
+            esac
+
+            echo "==> در حال ارسال به تلگرام ($method)"
+            curl -s -F "chat_id=${CHAT_ID}" -F "${field}=@${filename}" \
+              "https://api.telegram.org/bot${BOT_TOKEN}/${method}" | head -c 300
+            echo
+            echo "----"
+
+            rm -f "$filename"
+          done
