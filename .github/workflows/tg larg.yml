@@ -20,16 +20,28 @@ jobs:
           docker run -d --name tg-api -p 8081:8081 \
             -e TELEGRAM_API_ID="${API_ID}" \
             -e TELEGRAM_API_HASH="${API_HASH}" \
-            divideprojects/docker-telegram-bot-api:latest
+            aiogram/telegram-bot-api:latest
 
           echo "در حال صبر برای بالا آمدن سرور محلی..."
+          ready=""
           for i in $(seq 1 30); do
-            if curl -s "http://localhost:8081" > /dev/null 2>&1; then
-              echo "سرور آماده است"
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8081 2>/dev/null || echo "000")
+            echo "تلاش $i - کد پاسخ: $code"
+            if [ "$code" != "000" ]; then
+              ready="yes"
               break
             fi
             sleep 2
           done
+
+          echo "===== وضعیت کانتینر ====="
+          docker ps -a
+          echo "===== لاگ کانتینر ====="
+          docker logs tg-api --tail 100 || true
+
+          if [ -z "$ready" ]; then
+            echo "!! سرور محلی هیچ‌وقت روی پورت 8081 پاسخ نداد. به لاگ بالا نگاه کنید — احتمالاً API_ID/API_HASH اشتباه است."
+          fi
 
       - name: Download and send each file
         env:
@@ -48,7 +60,7 @@ jobs:
             filename=$(basename "$url")
             echo "==> در حال دانلود: $filename"
 
-            if ! curl -L -f -s -o "$filename" "$url"; then
+            if ! curl -L -f -sS -o "$filename" "$url"; then
               echo "!! خطا در دانلود: $url"
               continue
             fi
@@ -65,13 +77,17 @@ jobs:
             esac
 
             echo "==> در حال ارسال به تلگرام از طریق سرور محلی ($method)"
-            curl -s -F "chat_id=${CHAT_ID}" -F "${field}=@${filename}" \
-              "${API_BASE}/${method}" | head -c 300
-            echo
+            curl -sS -w "\nHTTP_CODE:%{http_code}\n" \
+              -F "chat_id=${CHAT_ID}" -F "${field}=@${filename}" \
+              "${API_BASE}/${method}"
             echo "----"
 
             rm -f "$filename"
           done
+
+      - name: Show local server logs (debug)
+        if: always()
+        run: docker logs tg-api --tail 150 || true
 
       - name: Stop local server
         if: always()
