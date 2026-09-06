@@ -1,0 +1,78 @@
+name: Send large files to Telegram (Local Bot API Server)
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'یک یا چند لینک مستقیم (لینک‌ها را با کاما , از هم جدا کنید)'
+        required: true
+        type: string
+
+jobs:
+  send-to-telegram:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start local Telegram Bot API server
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          docker run -d --name tg-api -p 8081:8081 \
+            -e TELEGRAM_API_ID="${API_ID}" \
+            -e TELEGRAM_API_HASH="${API_HASH}" \
+            divideprojects/docker-telegram-bot-api:latest
+
+          echo "در حال صبر برای بالا آمدن سرور محلی..."
+          for i in $(seq 1 30); do
+            if curl -s "http://localhost:8081" > /dev/null 2>&1; then
+              echo "سرور آماده است"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Download and send each file
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          URLS: ${{ github.event.inputs.urls }}
+        run: |
+          API_BASE="http://localhost:8081/bot${BOT_TOKEN}"
+
+          IFS=',' read -ra URL_ARRAY <<< "$URLS"
+
+          for raw_url in "${URL_ARRAY[@]}"; do
+            url=$(echo "$raw_url" | xargs)
+            [ -z "$url" ] && continue
+
+            filename=$(basename "$url")
+            echo "==> در حال دانلود: $filename"
+
+            if ! curl -L -f -s -o "$filename" "$url"; then
+              echo "!! خطا در دانلود: $url"
+              continue
+            fi
+
+            size_mb=$(( $(stat -c%s "$filename") / 1024 / 1024 ))
+            echo "حجم فایل: ${size_mb}MB"
+
+            ext_lower=$(echo "${filename##*.}" | tr '[:upper:]' '[:lower:]')
+            case "$ext_lower" in
+              mp4|mov|mkv|avi|webm) method="sendVideo"; field="video" ;;
+              jpg|jpeg|png|webp)    method="sendPhoto"; field="photo" ;;
+              gif)                  method="sendAnimation"; field="animation" ;;
+              *)                    method="sendDocument"; field="document" ;;
+            esac
+
+            echo "==> در حال ارسال به تلگرام از طریق سرور محلی ($method)"
+            curl -s -F "chat_id=${CHAT_ID}" -F "${field}=@${filename}" \
+              "${API_BASE}/${method}" | head -c 300
+            echo
+            echo "----"
+
+            rm -f "$filename"
+          done
+
+      - name: Stop local server
+        if: always()
+        run: docker stop tg-api || true
