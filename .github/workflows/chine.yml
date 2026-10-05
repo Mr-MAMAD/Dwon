@@ -1,0 +1,90 @@
+name: Download M3U8 Videos
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "M3U8 URLs separated by spaces"
+        required: true
+        type: string
+
+      release_tag:
+        description: "Release tag"
+        required: true
+        default: "videos"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Create output directory
+        run: |
+          mkdir -p output
+
+      - name: Download and convert videos
+        env:
+          URLS: ${{ inputs.urls }}
+        run: |
+          set -e
+
+          counter=1
+
+          for url in $URLS; do
+
+            echo "========================================="
+            echo "Processing video $counter"
+            echo "URL: $url"
+            echo "========================================="
+
+            output="output/video-${counter}.mp4"
+
+            ffmpeg \
+              -i "$url" \
+              -c copy \
+              -bsf:a aac_adtstoasc \
+              -movflags +faststart \
+              "$output"
+
+            echo "Created: $output"
+
+            counter=$((counter + 1))
+
+          done
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release exists: $TAG"
+          else
+            echo "Creating release: $TAG"
+
+            gh release create "$TAG" \
+              --title "Videos" \
+              --notes "Downloaded videos"
+          fi
+
+      - name: Upload MP4 files to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          for file in output/*.mp4; do
+
+            echo "Uploading: $file"
+
+            gh release upload "$TAG" "$file" --clobber
+
+          done
