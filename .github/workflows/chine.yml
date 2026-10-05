@@ -1,3 +1,4 @@
+```yaml
 name: Download M3U8 Videos
 
 on:
@@ -41,6 +42,11 @@ jobs:
 
           for url in $URLS; do
 
+            # Remove Markdown formatting if the URL was pasted as:
+            # [https://example.com/video.m3u8](https://example.com/video.m3u8)
+
+            url=$(echo "$url" | sed 's/^\[//' | sed 's/\].*$//')
+
             echo "========================================="
             echo "Processing video $counter"
             echo "URL: $url"
@@ -49,6 +55,8 @@ jobs:
             output="output/video-${counter}.mp4"
 
             ffmpeg \
+              -headers $'Referer: https://missav.ws/\r\nOrigin: https://missav.ws\r\n' \
+              -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36" \
               -i "$url" \
               -c copy \
               -bsf:a aac_adtstoasc \
@@ -88,3 +96,4 @@ jobs:
             gh release upload "$TAG" "$file" --clobber
 
           done
+```
