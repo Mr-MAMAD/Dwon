@@ -53,10 +53,14 @@ jobs:
             fi
 
             [ -z "$filename" ] && filename="video_${total}.mp4"
-
             extension="${filename##*.}"
             basename_without_ext="${filename%.*}"
-            filename="${basename_without_ext:0:5}${total}.${extension}"
+
+            if [ "$basename_without_ext" = "$filename" ]; then
+              filename="${filename:0:5}${total}"
+            else
+              filename="${basename_without_ext:0:5}${total}.${extension}"
+            fi
 
             echo "ذخیره به عنوان: $filename"
 
