@@ -62,7 +62,7 @@ jobs:
               -H "Referer: https://javtiful.com/" \
               -H "Origin: https://javtiful.com" \
               --connect-timeout 30 \
-              -o "downloads/video-$counter.mp4" \
+              -o "downloads/video-$counter" \
               "$url" 2>&1 || download_failed=true
 
             if [ "$download_failed" = true ]; then
