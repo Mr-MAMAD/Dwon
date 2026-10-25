@@ -1,4 +1,4 @@
-name: vidara Downloader (Smart Split)
+name: flamingo Downloader (Smart Split)
 
 on:
   workflow_dispatch:
@@ -59,8 +59,8 @@ jobs:
 
             curl -L \
               -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              -H "Referer: https://vidara.so/" \
-              -H "Origin: https://vidara.so" \
+              -H "Referer: https://playmogo.com/" \
+              -H "Origin: https://playmogo.com" \
               --connect-timeout 30 \
               -o "downloads/$filename" \
               "$url" 2>&1 || download_failed=true
