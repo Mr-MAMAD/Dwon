@@ -18,28 +18,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install WireGuard
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq wireguard-tools resolvconf
-
-      - name: Connect WireGuard
-        env:
-          WG_CONFIG: ${{ secrets.WG_CONFIG }}
-        run: |
-          echo "IP before: $(curl -s --max-time 20 https://api.ipify.org || echo unknown)"
-          echo "$WG_CONFIG" | sudo tee /etc/wireguard/wg0.conf > /dev/null
-          sudo chmod 600 /etc/wireguard/wg0.conf
-          sudo wg-quick up wg0
-          echo "IP after: $(curl -s --max-time 20 https://api.ipify.org || echo unknown)"
-          echo "Country: $(curl -s --max-time 20 https://ipinfo.io/country || echo unknown)"
-
-      - name: Setup Playwright
+      - name: Install tools (no VPN)
         run: |
           mkdir -p downloads
-          npm init -y >/dev/null 2>&1
-          npm install playwright >/dev/null 2>&1
-          npx playwright install --with-deps chromium >/dev/null 2>&1
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools resolvconf
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
 
       - name: Write script
         shell: bash
@@ -138,7 +124,6 @@ jobs:
                 console.log('  Title:', await page.title().catch(() => '?'));
                 await page.waitForTimeout(5000);
 
-                // رد کردن صفحه‌ی تأیید سن / کوکی
                 const clickTexts = ['Enter', 'I am 18', "I'm 18", 'I am over 18', 'Agree', 'Accept', 'Continue', 'Yes', 'ENTER'];
                 for (const t of clickTexts) {
                   try {
@@ -235,7 +220,18 @@ jobs:
           })();
           EOF
 
-      - name: Find and download
+      - name: Connect WireGuard
+        env:
+          WG_CONFIG: ${{ secrets.WG_CONFIG }}
+        run: |
+          echo "IP before: $(curl -s --max-time 20 https://api.ipify.org || echo unknown)"
+          echo "$WG_CONFIG" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          sudo chmod 600 /etc/wireguard/wg0.conf
+          sudo wg-quick up wg0
+          echo "IP after: $(curl -s --max-time 20 https://api.ipify.org || echo unknown)"
+          echo "Country: $(curl -s --max-time 20 https://ipinfo.io/country || echo unknown)"
+
+      - name: Find and download (inside VPN)
         id: grab
         continue-on-error: true
         env:
