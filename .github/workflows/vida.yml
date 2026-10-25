@@ -1,11 +1,12 @@
-name: flamingo Downloader (Smart Split)
+name: Downloader (Find Video)
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'Video URLs (space or newline separated)'
+        description: 'Page URLs (space or newline separated)'
         required: true
+        default: 'https://vidara.so/v/cpbnwULfofbCA'
         type: string
 
 jobs:
@@ -15,110 +16,268 @@ jobs:
       contents: write
 
     steps:
-      - name: Setup
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl
-          mkdir -p downloads
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Download
+      - name: Install tools
+        run: |
+          mkdir -p downloads
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Write script
         shell: bash
         run: |
-          success=0
-          total=0
-          failed_urls=""
+          cat > grab.js << 'EOF'
+          const { chromium } = require('playwright');
+          const { spawnSync } = require('child_process');
+          const fs = require('fs');
+          const path = require('path');
 
-          while IFS= read -r url; do
-            url=$(echo "$url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            [ -z "$url" ] && continue
+          const FILE_RE = /\.(mp4|webm|mkv|mov|m4v|vid)(\?|#|$)/i;
+          const HLS_RE = /\.m3u8(\?|#|$)/i;
+          const urls = (process.env.URLS || '').split(/\s+/).filter(u => /^https?:\/\//.test(u));
+          const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+          const MIN_SIZE = 102400;
 
-            if ! echo "$url" | grep -qE '^https?://'; then
-              echo "⚠️ رد کردن آدرس نامعتبر: $url"
-              failed_urls="${failed_urls}${url} (نامعتبر)\n"
-              continue
-            fi
+          function pageId(u, i) {
+            try {
+              const last = path.basename(new URL(u).pathname);
+              return last || `video_${i}`;
+            } catch (e) { return `video_${i}`; }
+          }
 
-            total=$((total+1))
+          function fileNameFrom(u, i, k) {
+            try {
+              const n = path.basename(new URL(u).pathname);
+              if (n && FILE_RE.test(n)) return n;
+            } catch (e) {}
+            return `video_${i}_${k}.mp4`;
+          }
 
-            echo "=========================================="
-            echo "[$total] در حال دانلود: $url"
-            echo "=========================================="
+          async function downloadDirect(ctx, url, referer, out) {
+            const res = await ctx.request.get(url, {
+              headers: { Referer: referer, Accept: '*/*' },
+              maxRedirects: 10,
+              timeout: 1800000
+            });
+            console.log('  Final URL:', res.url());
+            console.log('  Status:', res.status());
+            if (!res.ok()) return false;
+            fs.writeFileSync(out, await res.body());
+            const size = fs.statSync(out).size;
+            if (size < MIN_SIZE) { console.log('  Too small:', size); fs.unlinkSync(out); return false; }
+            console.log(`  OK: ${out} (${size} bytes)`);
+            return true;
+          }
 
-            # استخراج نام فایل از پارامتر file اگر وجود داشته باشد
-            if echo "$url" | grep -q 'file='; then
-              file_param=$(echo "$url" | sed -n 's/.*file=\([^&]*\).*/\1/p' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-              filename=$(basename "$file_param")
-            else
-              filename=$(basename "$url" | cut -d'?' -f1)
-            fi
+          function downloadHls(url, referer, out) {
+            const origin = new URL(referer).origin;
+            const r = spawnSync('ffmpeg', [
+              '-y', '-loglevel', 'error',
+              '-user_agent', UA,
+              '-headers', `Referer: ${referer}\r\nOrigin: ${origin}\r\n`,
+              '-i', url,
+              '-c', 'copy',
+              '-bsf:a', 'aac_adtstoasc',
+              out
+            ], { stdio: 'inherit' });
+            if (r.status !== 0 || !fs.existsSync(out)) return false;
+            const size = fs.statSync(out).size;
+            if (size < MIN_SIZE) { console.log('  Too small:', size); fs.unlinkSync(out); return false; }
+            console.log(`  OK: ${out} (${size} bytes)`);
+            return true;
+          }
 
-            [ -z "$filename" ] && filename="video_${total}.mp4"
-            echo "ذخیره به عنوان: $filename"
+          (async () => {
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox', '--disable-blink-features=AutomationControlled']
+            });
+            let success = 0;
 
-            download_failed=false
+            for (let i = 0; i < urls.length; i++) {
+              const pageUrl = urls[i];
+              console.log(`\n[${i + 1}] ${pageUrl}`);
+              const ctx = await browser.newContext({
+                userAgent: UA,
+                viewport: { width: 1280, height: 720 },
+                locale: 'en-US'
+              });
+              await ctx.addInitScript(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+              });
 
-            curl -L \
-              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              -H "Referer: https://playmogo.com/" \
-              -H "Origin: https://playmogo.com" \
-              --connect-timeout 30 \
-              -o "downloads/$filename" \
-              "$url" 2>&1 || download_failed=true
+              try {
+                const direct = [];
+                const hls = [];
+                const seen = new Set();
 
-            if [ "$download_failed" = true ]; then
-              echo "❌ خطا در دانلود: $url"
-              failed_urls="${failed_urls}${url} (خطای curl)\n"
-              continue
-            fi
+                const add = (u, why) => {
+                  if (!u || seen.has(u) || !/^https?:/i.test(u)) return;
+                  if (HLS_RE.test(u)) { seen.add(u); hls.push(u); console.log(`  Found HLS (${why}):`, u); }
+                  else if (FILE_RE.test(u)) { seen.add(u); direct.push(u); console.log(`  Found file (${why}):`, u); }
+                };
 
-            if [ -f "downloads/$filename" ]; then
-              size=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
-              if [ "$size" -gt 102400 ]; then
-                echo "✅ دانلود شد: $filename ($(numfmt --to=iec $size))"
-                success=$((success+1))
-              else
-                echo "❌ فایل خیلی کوچک است ($size بایت)"
-                failed_urls="${failed_urls}${url} (فایل کوچک: ${size} بایت)\n"
-                rm -f "downloads/$filename"
-              fi
-            else
-              echo "❌ فایل ایجاد نشد: $filename"
-              failed_urls="${failed_urls}${url} (فایل ذخیره نشد)\n"
-            fi
-            echo ""
-          done < <(echo "${{ github.event.inputs.urls }}" | tr ' ' '\n')
+                const page = await ctx.newPage();
 
-          echo ""
-          echo "=========================================="
-          echo "📊 گزارش نهایی"
-          echo "=========================================="
-          echo "کل لینک‌های معتبر: $total"
-          echo "دانلود موفق: $success"
-          echo "دانلود ناموفق: $((total - success))"
-          echo ""
+                // بستن پاپ‌آپ‌های تبلیغاتی
+                ctx.on('page', async p => {
+                  if (p !== page) { console.log('  Closing popup:', p.url()); await p.close().catch(() => {}); }
+                });
 
-          if [ -n "$failed_urls" ]; then
-            echo "❌ لینک‌های دانلود نشده:"
-            echo "=========================================="
-            echo -e "$failed_urls"
-            echo "=========================================="
-          fi
+                page.on('request', r => add(r.url(), 'request'));
+                page.on('response', r => {
+                  const ct = (r.headers()['content-type'] || '').toLowerCase();
+                  if (ct.startsWith('video/')) add(r.url(), 'content-type');
+                  if (ct.includes('mpegurl')) add(r.url(), 'content-type');
+                });
 
-          echo ""
-          echo "فایل‌های دانلود شده:"
-          ls -lh downloads/ 2>/dev/null || echo "هیچ فایلی موجود نیست"
+                const resp = await page.goto(pageUrl, { waitUntil: 'load', timeout: 90000 }).catch(e => { console.log('  goto error:', e.message); return null; });
+                console.log('  Page status:', resp ? resp.status() : 'none');
+                console.log('  Final page URL:', page.url());
+                console.log('  Title:', await page.title().catch(() => '?'));
+                await page.waitForTimeout(4000);
 
-          if [ $success -eq 0 ]; then
-            echo ""
-            echo "⛔ هیچ فایلی با موفقیت دانلود نشد!"
-            exit 1
-          fi
+                const readFromDom = async () => {
+                  for (const frame of page.frames()) {
+                    try {
+                      const base = frame.url() || pageUrl;
+                      const vals = await frame.evaluate(() => {
+                        const out = [];
+                        document.querySelectorAll('video, video source, source').forEach(v => {
+                          out.push(v.getAttribute('src'));
+                          out.push(v.currentSrc);
+                        });
+                        document.querySelectorAll('meta[itemprop="contentUrl"], meta[property="og:video"], meta[property="og:video:url"]').forEach(m => out.push(m.content));
+                        document.querySelectorAll('a[download]').forEach(a => out.push(a.href));
+                        return out.filter(Boolean);
+                      });
+                      vals.forEach(s => { try { add(new URL(s, base).href, 'dom'); } catch (e) {} });
+                    } catch (e) {}
+                  }
+                };
+
+                const tryPlay = async () => {
+                  for (const frame of page.frames()) {
+                    try {
+                      await frame.evaluate(() => {
+                        document.querySelectorAll('video').forEach(v => { v.muted = true; v.play().catch(() => {}); });
+                      });
+                      for (const sel of ['.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid', '.play-button', '.play', '[class*="play" i]', 'video']) {
+                        const el = await frame.$(sel);
+                        if (el) await el.click({ timeout: 1500, force: true }).catch(() => {});
+                      }
+                    } catch (e) {}
+                  }
+                  await page.mouse.click(640, 360).catch(() => {});
+                };
+
+                await readFromDom();
+
+                // پخش را امتحان کن تا لینک ویدیو در شبکه ظاهر شود
+                for (let t = 0; t < 4 && direct.length + hls.length === 0; t++) {
+                  await tryPlay();
+                  await page.waitForTimeout(4000);
+                  await readFromDom();
+                }
+
+                // کمی صبر تا لینک‌های دیگر هم ثبت شوند
+                if (direct.length + hls.length > 0) {
+                  await page.waitForTimeout(3000);
+                  await readFromDom();
+                }
+
+                // جستجو در HTML و اسکریپت‌ها
+                if (direct.length + hls.length === 0) {
+                  for (const frame of page.frames()) {
+                    try {
+                      const html = (await frame.content()).replace(/\\\//g, '/').replace(/\\u0026/g, '&');
+                      const m = html.match(/https?:\/\/[^"'\s<>\\]+\.(?:mp4|m3u8|webm|mkv|mov|m4v|vid)[^"'\s<>\\]*/gi) || [];
+                      m.forEach(s => add(s, 'html'));
+                    } catch (e) {}
+                  }
+                }
+
+                if (direct.length + hls.length === 0) {
+                  console.log('  No video URL found.');
+                  const text = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 500) : '').catch(() => '');
+                  console.log('  Page text start:\n' + text);
+                  console.log('  Frames:', page.frames().map(f => f.url()).join(' | '));
+                  fs.mkdirSync('debug', { recursive: true });
+                  await page.screenshot({ path: `debug/page_${i + 1}.png`, fullPage: true }).catch(() => {});
+                  fs.writeFileSync(`debug/page_${i + 1}.html`, await page.content().catch(() => ''));
+                  await ctx.close();
+                  continue;
+                }
+
+                let done = false;
+
+                // اول فایل‌های مستقیم
+                let k = 0;
+                for (const target of direct) {
+                  k++;
+                  console.log('  Downloading file:', target);
+                  const out = path.join('downloads', fileNameFrom(target, i + 1, k));
+                  if (await downloadDirect(ctx, target, pageUrl, out)) { done = true; break; }
+                }
+
+                // بعد استریم HLS
+                if (!done) {
+                  let h = 0;
+                  for (const target of hls) {
+                    h++;
+                    console.log('  Downloading HLS with ffmpeg:', target);
+                    const out = path.join('downloads', `${pageId(pageUrl, i + 1)}${hls.length > 1 ? '_' + h : ''}.mp4`);
+                    if (downloadHls(target, pageUrl, out)) { done = true; break; }
+                  }
+                }
+
+                if (done) success++;
+                else console.log('  All candidates failed.');
+              } catch (e) {
+                console.log('  Error:', e.message);
+              }
+              await ctx.close();
+            }
+
+            await browser.close();
+            console.log(`\nSuccess: ${success} / ${urls.length}`);
+            process.exit(success > 0 ? 0 : 1);
+          })();
+          EOF
+
+      - name: Find and download
+        id: grab
+        continue-on-error: true
+        env:
+          URLS: ${{ github.event.inputs.urls }}
+        run: node grab.js
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
+          if-no-files-found: ignore
+
+      - name: List files
+        if: always()
+        run: ls -lh downloads/ || true
 
       - name: Release
-        if: success()
+        if: steps.grab.outcome == 'success'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: asia-${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail if nothing downloaded
+        if: steps.grab.outcome != 'success'
+        run: exit 1
