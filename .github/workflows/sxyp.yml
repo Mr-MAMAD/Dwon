@@ -1,16 +1,11 @@
-name: Downloader (Smart Split)
+name: Downloader (Page to .vid)
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'Video URLs (space or newline separated)'
+        description: 'Page URLs or direct .vid URLs (space or newline separated)'
         required: true
-        type: string
-      referer:
-        description: 'Referer (optional)'
-        required: false
-        default: 'https://trafficdeposit.com/'
         type: string
 
 jobs:
@@ -20,116 +15,167 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Setup
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl
           mkdir -p downloads
+          npm init -y >/dev/null 2>&1
+          npm install playwright >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null 2>&1
 
-      - name: Download
+      - name: Write script
         shell: bash
+        run: |
+          cat > grab.js << 'EOF'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const path = require('path');
+
+          // فقط فایل‌های .vid
+          const VID_RE = /\.vid(\?|#|$)/i;
+          const urls = (process.env.URLS || '').split(/\s+/).filter(u => /^https?:\/\//.test(u));
+
+          function nameFrom(u, i, k) {
+            try {
+              const p = new URL(u);
+              const n = path.basename(p.pathname);
+              if (n && VID_RE.test(n)) return n;
+            } catch (e) {}
+            return `video_${i}_${k}.vid`;
+          }
+
+          async function download(ctx, videoUrl, referer, outPath) {
+            const res = await ctx.request.get(videoUrl, {
+              headers: { Referer: referer, Accept: '*/*' },
+              timeout: 600000
+            });
+            console.log('  Download status:', res.status());
+            if (!res.ok()) return false;
+            fs.writeFileSync(outPath, await res.body());
+            return true;
+          }
+
+          (async () => {
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox']
+            });
+            let success = 0;
+
+            for (let i = 0; i < urls.length; i++) {
+              const pageUrl = urls[i];
+              console.log(`\n[${i + 1}] ${pageUrl}`);
+              const ctx = await browser.newContext({
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport: { width: 1280, height: 720 }
+              });
+
+              try {
+                // لینک مستقیم .vid
+                if (VID_RE.test(pageUrl)) {
+                  const out = path.join('downloads', nameFrom(pageUrl, i + 1, 1));
+                  const origin = new URL(pageUrl).origin + '/';
+                  if (await download(ctx, pageUrl, origin, out)) {
+                    const size = fs.statSync(out).size;
+                    if (size > 102400) { console.log(`  OK: ${out} (${size} bytes)`); success++; }
+                    else { console.log('  File too small, removing.'); fs.unlinkSync(out); }
+                  }
+                  await ctx.close();
+                  continue;
+                }
+
+                const found = new Set();
+                const page = await ctx.newPage();
+
+                const onUrl = (u) => {
+                  if (VID_RE.test(u) && !found.has(u)) {
+                    found.add(u);
+                    console.log('  Found .vid URL:', u);
+                  }
+                };
+                page.on('request', r => onUrl(r.url()));
+                page.on('response', r => onUrl(r.url()));
+
+                await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                await page.waitForTimeout(4000);
+
+                // تلاش برای پخش ویدیو در صفحه و iframe ها
+                for (const frame of page.frames()) {
+                  try {
+                    await frame.evaluate(() => {
+                      document.querySelectorAll('video').forEach(v => {
+                        v.muted = true;
+                        v.play().catch(() => {});
+                      });
+                    });
+                    for (const sel of ['.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid', 'button[aria-label*="Play" i]', '.play-button', '.play', 'video']) {
+                      const el = await frame.$(sel);
+                      if (el) { await el.click({ timeout: 2000 }).catch(() => {}); }
+                    }
+                  } catch (e) {}
+                }
+
+                // منتظر ماندن برای پیدا شدن لینک .vid
+                for (let t = 0; t < 25 && found.size === 0; t++) {
+                  await page.waitForTimeout(1000);
+                }
+
+                // اگر پیدا نشد، src تگ‌های video و HTML فریم‌ها را بررسی کن
+                if (found.size === 0) {
+                  for (const frame of page.frames()) {
+                    try {
+                      const srcs = await frame.evaluate(() =>
+                        Array.from(document.querySelectorAll('video, video source'))
+                          .map(v => v.currentSrc || v.src).filter(Boolean));
+                      srcs.forEach(s => { if (/^https?:/.test(s) && VID_RE.test(s)) found.add(s); });
+
+                      const html = await frame.content();
+                      const m = html.match(/https?:\\?\/\\?\/[^"'\s<>\\]+(?:\\\/[^"'\s<>\\]+)*\.vid[^"'\s<>]*/gi) || [];
+                      m.forEach(s => found.add(s.replace(/\\\//g, '/')));
+                    } catch (e) {}
+                  }
+                }
+
+                if (found.size === 0) {
+                  console.log('  No .vid URL found.');
+                  await page.screenshot({ path: `downloads/debug_${i + 1}.png` }).catch(() => {});
+                  await ctx.close();
+                  continue;
+                }
+
+                let k = 0;
+                for (const target of found) {
+                  k++;
+                  console.log('  Downloading:', target);
+                  const out = path.join('downloads', nameFrom(target, i + 1, k));
+                  if (await download(ctx, target, pageUrl, out)) {
+                    const size = fs.statSync(out).size;
+                    if (size > 102400) { console.log(`  OK: ${out} (${size} bytes)`); success++; }
+                    else { console.log('  File too small, removing.'); fs.unlinkSync(out); }
+                  }
+                }
+              } catch (e) {
+                console.log('  Error:', e.message);
+              }
+              await ctx.close();
+            }
+
+            await browser.close();
+            console.log(`\nSuccess: ${success} file(s)`);
+            process.exit(success > 0 ? 0 : 1);
+          })();
+          EOF
+
+      - name: Find and download
         env:
           URLS: ${{ github.event.inputs.urls }}
-          REFERER: ${{ github.event.inputs.referer }}
-        run: |
-          success=0
-          total=0
-          failed_urls=""
-          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        run: node grab.js
 
-          echo "Runner IP: $(curl -s https://api.ipify.org || echo unknown)"
-
-          while IFS= read -r url; do
-            url=$(echo "$url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            [ -z "$url" ] && continue
-
-            if ! echo "$url" | grep -qE '^https?://'; then
-              echo "Skipping invalid URL: $url"
-              failed_urls="${failed_urls}${url} (invalid)\n"
-              continue
-            fi
-
-            total=$((total+1))
-            echo "=========================================="
-            echo "[$total] Downloading: $url"
-            echo "=========================================="
-
-            if echo "$url" | grep -q 'file='; then
-              file_param=$(echo "$url" | sed -n 's/.*file=\([^&]*\).*/\1/p' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-              filename=$(basename "$file_param")
-            else
-              filename=$(basename "${url%%\?*}")
-            fi
-            [ -z "$filename" ] && filename="video_${total}"
-            echo "Saving as: $filename"
-
-            self_origin=$(echo "$url" | sed -E 's#^(https?://[^/]+).*#\1/#')
-            variants=("NONE" "$REFERER" "$self_origin")
-            ok=false
-
-            for ref in "${variants[@]}"; do
-              refargs=()
-              if [ "$ref" != "NONE" ]; then
-                refargs=(-e "$ref")
-              fi
-              echo "--- Trying referer: $ref"
-
-              code=$(curl -sS -L -A "$UA" -H "Accept: */*" "${refargs[@]}" \
-                --connect-timeout 30 \
-                -D /tmp/headers.txt \
-                -o "downloads/$filename" \
-                -w '%{http_code}' "$url" || echo "000")
-
-              echo "HTTP code: $code"
-              if [ "$code" = "200" ] || [ "$code" = "206" ]; then
-                ok=true
-                break
-              fi
-
-              echo "Response headers:"
-              head -20 /tmp/headers.txt 2>/dev/null || true
-              echo "Body start:"
-              head -c 300 "downloads/$filename" 2>/dev/null || true
-              echo
-              rm -f "downloads/$filename"
-              sleep 2
-            done
-
-            if [ "$ok" != true ]; then
-              echo "FAILED: $url"
-              failed_urls="${failed_urls}${url} (all variants failed)\n"
-              continue
-            fi
-
-            size=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
-            if [ "$size" -le 102400 ]; then
-              echo "File too small ($size bytes)"
-              failed_urls="${failed_urls}${url} (small file: ${size} bytes)\n"
-              rm -f "downloads/$filename"
-              continue
-            fi
-
-            echo "OK: $filename ($(numfmt --to=iec "$size"))"
-            success=$((success+1))
-            echo ""
-          done < <(printf '%s\n' "$URLS" | tr -s ' \t' '\n')
-
-          echo "=========================================="
-          echo "Total valid links: $total"
-          echo "Success: $success"
-          echo "Failed: $((total - success))"
-
-          if [ -n "$failed_urls" ]; then
-            echo "Failed URLs:"
-            echo -e "$failed_urls"
-          fi
-
-          ls -lh downloads/ 2>/dev/null || echo "No files"
-
-          if [ "$success" -eq 0 ]; then
-            echo "No file was downloaded successfully!"
-            exit 1
-          fi
+      - name: List files
+        if: always()
+        run: ls -lh downloads/ || true
 
       - name: Release
         if: success()
