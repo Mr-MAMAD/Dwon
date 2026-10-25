@@ -1,31 +1,3 @@
-name: Downloader (Smart Split)
-
-on:
-  workflow_dispatch:
-    inputs:
-      urls:
-        description: 'Video URLs (space or newline separated)'
-        required: true
-        type: string
-      referer:
-        description: 'Referer (برای trafficdeposit همین پیش‌فرض معمولاً کافی است)'
-        required: false
-        default: 'https://sxyprn.com/'
-        type: string
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Setup
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl
-          mkdir -p downloads
-
       - name: Download
         shell: bash
         env:
@@ -37,7 +9,7 @@ jobs:
           failed_urls=""
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-          ORIGIN=$(echo "$REFERER" | sed -E 's#^(https?://[^/]+).*#\1#')
+          echo "IP خروجی runner: $(curl -s https://api.ipify.org || echo نامشخص)"
 
           while IFS= read -r url; do
             url=$(echo "$url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -50,12 +22,10 @@ jobs:
             fi
 
             total=$((total+1))
-
             echo "=========================================="
             echo "[$total] در حال دانلود: $url"
             echo "=========================================="
 
-            # استخراج نام فایل (بدون تغییر پسوند)
             if echo "$url" | grep -q 'file='; then
               file_param=$(echo "$url" | sed -n 's/.*file=\([^&]*\).*/\1/p' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
               filename=$(basename "$file_param")
@@ -63,22 +33,40 @@ jobs:
               filename=$(basename "${url%%\?*}")
             fi
             [ -z "$filename" ] && filename="video_${total}"
-
             echo "ذخیره به عنوان: $filename"
 
-            if ! curl -fL \
-              -A "$UA" \
-              -H "Accept: */*" \
-              -H "Accept-Language: en-US,en;q=0.9" \
-              -e "$REFERER" \
-              -H "Origin: $ORIGIN" \
-              --connect-timeout 30 \
-              --retry 3 --retry-delay 5 --retry-all-errors \
-              -o "downloads/$filename" \
-              "$url"; then
-              echo "❌ خطا در دانلود: $url"
-              failed_urls="${failed_urls}${url} (خطای curl - احتمالاً لینک منقضی یا مسدود)\n"
+            self_origin=$(echo "$url" | sed -E 's#^(https?://[^/]+).*#\1/#')
+            variants=("NONE" "$REFERER" "$self_origin")
+            ok=false
+
+            for ref in "${variants[@]}"; do
+              refargs=()
+              [ "$ref" != "NONE" ] && refargs=(-e "$ref")
+              echo "--- تلاش با referer: $ref"
+
+              code=$(curl -sS -L -A "$UA" -H "Accept: */*" "${refargs[@]}" \
+                --connect-timeout 30 \
+                -D /tmp/headers.txt \
+                -o "downloads/$filename" \
+                -w '%{http_code}' "$url" || echo "000")
+
+              echo "کد پاسخ: $code"
+              if [ "$code" = "200" ] || [ "$code" = "206" ]; then
+                ok=true
+                break
+              fi
+
+              echo "هدرهای پاسخ سرور:"
+              cat /tmp/headers.txt 2>/dev/null | head -20
+              echo "ابتدای بدنه‌ی پاسخ:"
+              head -c 300 "downloads/$filename" 2>/dev/null; echo
               rm -f "downloads/$filename"
+              sleep 2
+            done
+
+            if [ "$ok" != true ]; then
+              echo "❌ خطا در دانلود: $url"
+              failed_urls="${failed_urls}${url} (همه‌ی حالت‌ها شکست خوردند)\n"
               continue
             fi
 
@@ -106,26 +94,12 @@ jobs:
 
           if [ -n "$failed_urls" ]; then
             echo "❌ لینک‌های دانلود نشده:"
-            echo "=========================================="
             echo -e "$failed_urls"
-            echo "=========================================="
           fi
 
-          echo ""
-          echo "فایل‌های دانلود شده:"
           ls -lh downloads/ 2>/dev/null || echo "هیچ فایلی موجود نیست"
 
           if [ $success -eq 0 ]; then
-            echo ""
             echo "⛔ هیچ فایلی با موفقیت دانلود نشد!"
             exit 1
           fi
-
-      - name: Release
-        if: success()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: asia-${{ github.run_number }}
-          files: downloads/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
