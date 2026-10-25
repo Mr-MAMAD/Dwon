@@ -53,15 +53,6 @@ jobs:
             fi
 
             [ -z "$filename" ] && filename="video_${total}.mp4"
-            extension="${filename##*.}"
-            basename_without_ext="${filename%.*}"
-
-            if [ "$basename_without_ext" = "$filename" ]; then
-              filename="${filename:0:5}${total}"
-            else
-              filename="${basename_without_ext:0:5}${total}.${extension}"
-            fi
-
             echo "ذخیره به عنوان: $filename"
 
             download_failed=false
@@ -127,7 +118,7 @@ jobs:
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: jav-${{ github.run_number }}
+          tag_name: asia-${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
