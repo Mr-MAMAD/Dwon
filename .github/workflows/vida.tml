@@ -1,4 +1,4 @@
-name: VIDARA Downloader (Smart Split)
+name: vidara Downloader (Smart Split)
 
 on:
   workflow_dispatch:
