@@ -1,3 +1,31 @@
+name: Downloader (Smart Split)
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Video URLs (space or newline separated)'
+        required: true
+        type: string
+      referer:
+        description: 'Referer (optional)'
+        required: false
+        default: 'https://trafficdeposit.com/'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Setup
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl
+          mkdir -p downloads
+
       - name: Download
         shell: bash
         env:
@@ -9,21 +37,21 @@
           failed_urls=""
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-          echo "IP خروجی runner: $(curl -s https://api.ipify.org || echo نامشخص)"
+          echo "Runner IP: $(curl -s https://api.ipify.org || echo unknown)"
 
           while IFS= read -r url; do
             url=$(echo "$url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             [ -z "$url" ] && continue
 
             if ! echo "$url" | grep -qE '^https?://'; then
-              echo "⚠️ رد کردن آدرس نامعتبر: $url"
-              failed_urls="${failed_urls}${url} (نامعتبر)\n"
+              echo "Skipping invalid URL: $url"
+              failed_urls="${failed_urls}${url} (invalid)\n"
               continue
             fi
 
             total=$((total+1))
             echo "=========================================="
-            echo "[$total] در حال دانلود: $url"
+            echo "[$total] Downloading: $url"
             echo "=========================================="
 
             if echo "$url" | grep -q 'file='; then
@@ -33,7 +61,7 @@
               filename=$(basename "${url%%\?*}")
             fi
             [ -z "$filename" ] && filename="video_${total}"
-            echo "ذخیره به عنوان: $filename"
+            echo "Saving as: $filename"
 
             self_origin=$(echo "$url" | sed -E 's#^(https?://[^/]+).*#\1/#')
             variants=("NONE" "$REFERER" "$self_origin")
@@ -41,8 +69,10 @@
 
             for ref in "${variants[@]}"; do
               refargs=()
-              [ "$ref" != "NONE" ] && refargs=(-e "$ref")
-              echo "--- تلاش با referer: $ref"
+              if [ "$ref" != "NONE" ]; then
+                refargs=(-e "$ref")
+              fi
+              echo "--- Trying referer: $ref"
 
               code=$(curl -sS -L -A "$UA" -H "Accept: */*" "${refargs[@]}" \
                 --connect-timeout 30 \
@@ -50,56 +80,62 @@
                 -o "downloads/$filename" \
                 -w '%{http_code}' "$url" || echo "000")
 
-              echo "کد پاسخ: $code"
+              echo "HTTP code: $code"
               if [ "$code" = "200" ] || [ "$code" = "206" ]; then
                 ok=true
                 break
               fi
 
-              echo "هدرهای پاسخ سرور:"
-              cat /tmp/headers.txt 2>/dev/null | head -20
-              echo "ابتدای بدنه‌ی پاسخ:"
-              head -c 300 "downloads/$filename" 2>/dev/null; echo
+              echo "Response headers:"
+              head -20 /tmp/headers.txt 2>/dev/null || true
+              echo "Body start:"
+              head -c 300 "downloads/$filename" 2>/dev/null || true
+              echo
               rm -f "downloads/$filename"
               sleep 2
             done
 
             if [ "$ok" != true ]; then
-              echo "❌ خطا در دانلود: $url"
-              failed_urls="${failed_urls}${url} (همه‌ی حالت‌ها شکست خوردند)\n"
+              echo "FAILED: $url"
+              failed_urls="${failed_urls}${url} (all variants failed)\n"
               continue
             fi
 
             size=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
             if [ "$size" -le 102400 ]; then
-              echo "❌ فایل خیلی کوچک است ($size بایت)"
-              failed_urls="${failed_urls}${url} (فایل کوچک: ${size} بایت)\n"
+              echo "File too small ($size bytes)"
+              failed_urls="${failed_urls}${url} (small file: ${size} bytes)\n"
               rm -f "downloads/$filename"
               continue
             fi
 
-            echo "✅ دانلود شد: $filename ($(numfmt --to=iec "$size"))"
+            echo "OK: $filename ($(numfmt --to=iec "$size"))"
             success=$((success+1))
             echo ""
           done < <(printf '%s\n' "$URLS" | tr -s ' \t' '\n')
 
-          echo ""
           echo "=========================================="
-          echo "📊 گزارش نهایی"
-          echo "=========================================="
-          echo "کل لینک‌های معتبر: $total"
-          echo "دانلود موفق: $success"
-          echo "دانلود ناموفق: $((total - success))"
-          echo ""
+          echo "Total valid links: $total"
+          echo "Success: $success"
+          echo "Failed: $((total - success))"
 
           if [ -n "$failed_urls" ]; then
-            echo "❌ لینک‌های دانلود نشده:"
+            echo "Failed URLs:"
             echo -e "$failed_urls"
           fi
 
-          ls -lh downloads/ 2>/dev/null || echo "هیچ فایلی موجود نیست"
+          ls -lh downloads/ 2>/dev/null || echo "No files"
 
-          if [ $success -eq 0 ]; then
-            echo "⛔ هیچ فایلی با موفقیت دانلود نشد!"
+          if [ "$success" -eq 0 ]; then
+            echo "No file was downloaded successfully!"
             exit 1
           fi
+
+      - name: Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: asia-${{ github.run_number }}
+          files: downloads/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
