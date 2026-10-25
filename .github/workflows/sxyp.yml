@@ -1,4 +1,4 @@
-name: Downloader (Page to .vid)
+name: SXYP Downloader (Page to .vid)
 
 on:
   workflow_dispatch:
@@ -49,12 +49,11 @@ jobs:
             try { return new URL(u, base).href; } catch (e) { return null; }
           }
 
-          // دانلود با همان کانتکست مرورگر (کوکی‌ها + ریدایرکت‌ها)
           async function download(ctx, videoUrl, referer, outPath) {
             const res = await ctx.request.get(videoUrl, {
               headers: { Referer: referer, Accept: '*/*' },
               maxRedirects: 10,
-              timeout: 900000
+              timeout: 1800000
             });
             console.log('  Final URL:', res.url());
             console.log('  Status:', res.status());
@@ -67,7 +66,7 @@ jobs:
             return true;
           }
 
-          async function saveIfBig(out) {
+          function saveIfBig(out) {
             const size = fs.statSync(out).size;
             if (size > 102400) { console.log(`  OK: ${out} (${size} bytes)`); return true; }
             console.log('  File too small, removing.');
@@ -95,7 +94,7 @@ jobs:
                 if (VID_RE.test(pageUrl)) {
                   const out = path.join('downloads', nameFrom(pageUrl, i + 1, 1));
                   const origin = new URL(pageUrl).origin + '/';
-                  if (await download(ctx, pageUrl, origin, out) && await saveIfBig(out)) success++;
+                  if (await download(ctx, pageUrl, origin, out) && saveIfBig(out)) success++;
                   await ctx.close();
                   continue;
                 }
@@ -109,49 +108,52 @@ jobs:
                 };
 
                 page.on('request', r => add(r.url(), 'request'));
-                page.on('response', r => add(r.url(), 'response'));
 
                 await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                await page.waitForTimeout(3000);
+                try { await page.waitForSelector('video#player_el, meta[itemprop="contentUrl"]', { timeout: 20000 }); } catch (e) {}
+                await page.waitForTimeout(2000);
 
-                // خواندن src تگ video (آدرس نسبی را کامل می‌کنیم)
-                const readVideoSrcs = async () => {
+                // 1) مستقیم از ساختار این پلیر
+                const readFromPlayer = async () => {
                   for (const frame of page.frames()) {
                     try {
-                      const srcs = await frame.evaluate(() =>
-                        Array.from(document.querySelectorAll('video, video source'))
-                          .map(v => v.getAttribute('src') || v.currentSrc || '').filter(Boolean));
                       const base = frame.url() || pageUrl;
-                      srcs.forEach(s => add(absolute(s, base), 'video src'));
+                      const vals = await frame.evaluate(() => {
+                        const out = [];
+                        document.querySelectorAll('meta[itemprop="contentUrl"]').forEach(m => out.push(m.content));
+                        document.querySelectorAll('video#player_el, video, video source').forEach(v => {
+                          out.push(v.getAttribute('src'));
+                          out.push(v.currentSrc);
+                        });
+                        document.querySelectorAll('.ypsv-download a').forEach(a => out.push(a.href));
+                        return out.filter(Boolean);
+                      });
+                      vals.forEach(s => add(absolute(s, base), 'player'));
                     } catch (e) {}
                   }
                 };
+                await readFromPlayer();
 
-                await readVideoSrcs();
-
-                // اگر چیزی پیدا نشد، پخش را امتحان کن
+                // 2) اگر نبود، پخش را امتحان کن
                 if (found.size === 0) {
                   for (const frame of page.frames()) {
                     try {
                       await frame.evaluate(() => {
-                        document.querySelectorAll('video').forEach(v => {
-                          v.muted = true;
-                          v.play().catch(() => {});
-                        });
+                        document.querySelectorAll('video').forEach(v => { v.muted = true; v.play().catch(() => {}); });
                       });
-                      for (const sel of ['.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid', 'button[aria-label*="Play" i]', '.play-button', '.play', 'video']) {
+                      for (const sel of ['.ypsv-ss', '.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid', 'video']) {
                         const el = await frame.$(sel);
                         if (el) await el.click({ timeout: 2000 }).catch(() => {});
                       }
                     } catch (e) {}
                   }
-                  for (let t = 0; t < 20 && found.size === 0; t++) {
+                  for (let t = 0; t < 15 && found.size === 0; t++) {
                     await page.waitForTimeout(1000);
-                    await readVideoSrcs();
+                    await readFromPlayer();
                   }
                 }
 
-                // آخرین تلاش: جستجو در HTML
+                // 3) جستجو در HTML
                 if (found.size === 0) {
                   for (const frame of page.frames()) {
                     try {
@@ -169,14 +171,13 @@ jobs:
                   continue;
                 }
 
-                // اگر هم لینک /cdn8/ (اولیه) و هم لینک نهایی /widi/ پیدا شد، هر دو یک فایل‌اند؛
-                // فقط تا اولین دانلود موفق ادامه می‌دهیم.
+                // همه‌ی آدرس‌های پیدا شده یک فایل‌اند؛ تا اولین موفقیت ادامه می‌دهیم
                 let k = 0;
                 for (const target of found) {
                   k++;
                   console.log('  Downloading:', target);
                   const out = path.join('downloads', nameFrom(target, i + 1, k));
-                  if (await download(ctx, target, pageUrl, out) && await saveIfBig(out)) {
+                  if (await download(ctx, target, pageUrl, out) && saveIfBig(out)) {
                     success++;
                     break;
                   }
