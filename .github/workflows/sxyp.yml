@@ -1,4 +1,4 @@
-name: SXYP Downloader (Page to .vid)
+name: Downloader (Page to .vid)
 
 on:
   workflow_dispatch:
@@ -35,7 +35,7 @@ jobs:
 
           const VID_RE = /\.vid(\?|#|$)/i;
           const urls = (process.env.URLS || '').split(/\s+/).filter(u => /^https?:\/\//.test(u));
-          const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+          const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
           function nameFrom(u, i, k) {
             try {
@@ -77,7 +77,11 @@ jobs:
           (async () => {
             const browser = await chromium.launch({
               headless: true,
-              args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox']
+              args: [
+                '--autoplay-policy=no-user-gesture-required',
+                '--no-sandbox',
+                '--disable-blink-features=AutomationControlled'
+              ]
             });
             let success = 0;
 
@@ -86,11 +90,14 @@ jobs:
               console.log(`\n[${i + 1}] ${pageUrl}`);
               const ctx = await browser.newContext({
                 userAgent: UA,
-                viewport: { width: 1280, height: 720 }
+                viewport: { width: 1280, height: 720 },
+                locale: 'en-US'
+              });
+              await ctx.addInitScript(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
               });
 
               try {
-                // لینک مستقیم .vid
                 if (VID_RE.test(pageUrl)) {
                   const out = path.join('downloads', nameFrom(pageUrl, i + 1, 1));
                   const origin = new URL(pageUrl).origin + '/';
@@ -109,11 +116,26 @@ jobs:
 
                 page.on('request', r => add(r.url(), 'request'));
 
-                await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                try { await page.waitForSelector('video#player_el, meta[itemprop="contentUrl"]', { timeout: 20000 }); } catch (e) {}
-                await page.waitForTimeout(2000);
+                const resp = await page.goto(pageUrl, { waitUntil: 'load', timeout: 90000 }).catch(e => { console.log('  goto error:', e.message); return null; });
+                console.log('  Page status:', resp ? resp.status() : 'none');
+                console.log('  Final page URL:', page.url());
+                console.log('  Title:', await page.title().catch(() => '?'));
+                await page.waitForTimeout(5000);
 
-                // 1) مستقیم از ساختار این پلیر
+                // رد کردن صفحه‌ی تأیید سن / کوکی
+                const clickTexts = ['Enter', 'I am 18', "I'm 18", 'I am over 18', 'Agree', 'Accept', 'Continue', 'Yes', 'ENTER'];
+                for (const t of clickTexts) {
+                  try {
+                    const el = page.getByText(t, { exact: false }).first();
+                    if (await el.isVisible({ timeout: 500 })) {
+                      console.log('  Clicking:', t);
+                      await el.click({ timeout: 2000 }).catch(() => {});
+                      await page.waitForTimeout(2000);
+                      break;
+                    }
+                  } catch (e) {}
+                }
+
                 const readFromPlayer = async () => {
                   for (const frame of page.frames()) {
                     try {
@@ -121,11 +143,11 @@ jobs:
                       const vals = await frame.evaluate(() => {
                         const out = [];
                         document.querySelectorAll('meta[itemprop="contentUrl"]').forEach(m => out.push(m.content));
-                        document.querySelectorAll('video#player_el, video, video source').forEach(v => {
+                        document.querySelectorAll('video, video source').forEach(v => {
                           out.push(v.getAttribute('src'));
                           out.push(v.currentSrc);
                         });
-                        document.querySelectorAll('.ypsv-download a').forEach(a => out.push(a.href));
+                        document.querySelectorAll('.ypsv-download a, a[download]').forEach(a => out.push(a.href));
                         return out.filter(Boolean);
                       });
                       vals.forEach(s => add(absolute(s, base), 'player'));
@@ -134,7 +156,6 @@ jobs:
                 };
                 await readFromPlayer();
 
-                // 2) اگر نبود، پخش را امتحان کن
                 if (found.size === 0) {
                   for (const frame of page.frames()) {
                     try {
@@ -153,7 +174,6 @@ jobs:
                   }
                 }
 
-                // 3) جستجو در HTML
                 if (found.size === 0) {
                   for (const frame of page.frames()) {
                     try {
@@ -166,12 +186,17 @@ jobs:
 
                 if (found.size === 0) {
                   console.log('  No .vid URL found.');
-                  await page.screenshot({ path: `downloads/debug_${i + 1}.png` }).catch(() => {});
+                  const text = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 500) : '').catch(() => '');
+                  console.log('  Page text start:\n' + text);
+                  console.log('  Frames:', page.frames().map(f => f.url()).join(' | '));
+                  console.log('  Has <video>:', await page.evaluate(() => document.querySelectorAll('video').length).catch(() => '?'));
+                  fs.mkdirSync('debug', { recursive: true });
+                  await page.screenshot({ path: `debug/page_${i + 1}.png`, fullPage: true }).catch(() => {});
+                  fs.writeFileSync(`debug/page_${i + 1}.html`, await page.content().catch(() => ''));
                   await ctx.close();
                   continue;
                 }
 
-                // همه‌ی آدرس‌های پیدا شده یک فایل‌اند؛ تا اولین موفقیت ادامه می‌دهیم
                 let k = 0;
                 for (const target of found) {
                   k++;
@@ -195,19 +220,33 @@ jobs:
           EOF
 
       - name: Find and download
+        id: grab
+        continue-on-error: true
         env:
           URLS: ${{ github.event.inputs.urls }}
         run: node grab.js
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
+          if-no-files-found: ignore
 
       - name: List files
         if: always()
         run: ls -lh downloads/ || true
 
       - name: Release
-        if: success()
+        if: steps.grab.outcome == 'success'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: asia-${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail if nothing downloaded
+        if: steps.grab.outcome != 'success'
+        run: exit 1
