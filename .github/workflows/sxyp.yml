@@ -33,28 +33,46 @@ jobs:
           const fs = require('fs');
           const path = require('path');
 
-          // فقط فایل‌های .vid
           const VID_RE = /\.vid(\?|#|$)/i;
           const urls = (process.env.URLS || '').split(/\s+/).filter(u => /^https?:\/\//.test(u));
+          const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
           function nameFrom(u, i, k) {
             try {
-              const p = new URL(u);
-              const n = path.basename(p.pathname);
+              const n = path.basename(new URL(u).pathname);
               if (n && VID_RE.test(n)) return n;
             } catch (e) {}
             return `video_${i}_${k}.vid`;
           }
 
+          function absolute(u, base) {
+            try { return new URL(u, base).href; } catch (e) { return null; }
+          }
+
+          // دانلود با همان کانتکست مرورگر (کوکی‌ها + ریدایرکت‌ها)
           async function download(ctx, videoUrl, referer, outPath) {
             const res = await ctx.request.get(videoUrl, {
               headers: { Referer: referer, Accept: '*/*' },
-              timeout: 600000
+              maxRedirects: 10,
+              timeout: 900000
             });
-            console.log('  Download status:', res.status());
-            if (!res.ok()) return false;
+            console.log('  Final URL:', res.url());
+            console.log('  Status:', res.status());
+            if (!res.ok()) {
+              const body = (await res.body()).slice(0, 200).toString();
+              console.log('  Body start:', body);
+              return false;
+            }
             fs.writeFileSync(outPath, await res.body());
             return true;
+          }
+
+          async function saveIfBig(out) {
+            const size = fs.statSync(out).size;
+            if (size > 102400) { console.log(`  OK: ${out} (${size} bytes)`); return true; }
+            console.log('  File too small, removing.');
+            fs.unlinkSync(out);
+            return false;
           }
 
           (async () => {
@@ -68,7 +86,7 @@ jobs:
               const pageUrl = urls[i];
               console.log(`\n[${i + 1}] ${pageUrl}`);
               const ctx = await browser.newContext({
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                userAgent: UA,
                 viewport: { width: 1280, height: 720 }
               });
 
@@ -77,11 +95,7 @@ jobs:
                 if (VID_RE.test(pageUrl)) {
                   const out = path.join('downloads', nameFrom(pageUrl, i + 1, 1));
                   const origin = new URL(pageUrl).origin + '/';
-                  if (await download(ctx, pageUrl, origin, out)) {
-                    const size = fs.statSync(out).size;
-                    if (size > 102400) { console.log(`  OK: ${out} (${size} bytes)`); success++; }
-                    else { console.log('  File too small, removing.'); fs.unlinkSync(out); }
-                  }
+                  if (await download(ctx, pageUrl, origin, out) && await saveIfBig(out)) success++;
                   await ctx.close();
                   continue;
                 }
@@ -89,51 +103,61 @@ jobs:
                 const found = new Set();
                 const page = await ctx.newPage();
 
-                const onUrl = (u) => {
-                  if (VID_RE.test(u) && !found.has(u)) {
-                    found.add(u);
-                    console.log('  Found .vid URL:', u);
-                  }
+                const add = (u, why) => {
+                  if (!u || !VID_RE.test(u)) return;
+                  if (!found.has(u)) { found.add(u); console.log(`  Found .vid (${why}):`, u); }
                 };
-                page.on('request', r => onUrl(r.url()));
-                page.on('response', r => onUrl(r.url()));
+
+                page.on('request', r => add(r.url(), 'request'));
+                page.on('response', r => add(r.url(), 'response'));
 
                 await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                await page.waitForTimeout(4000);
+                await page.waitForTimeout(3000);
 
-                // تلاش برای پخش ویدیو در صفحه و iframe ها
-                for (const frame of page.frames()) {
-                  try {
-                    await frame.evaluate(() => {
-                      document.querySelectorAll('video').forEach(v => {
-                        v.muted = true;
-                        v.play().catch(() => {});
-                      });
-                    });
-                    for (const sel of ['.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid', 'button[aria-label*="Play" i]', '.play-button', '.play', 'video']) {
-                      const el = await frame.$(sel);
-                      if (el) { await el.click({ timeout: 2000 }).catch(() => {}); }
-                    }
-                  } catch (e) {}
-                }
-
-                // منتظر ماندن برای پیدا شدن لینک .vid
-                for (let t = 0; t < 25 && found.size === 0; t++) {
-                  await page.waitForTimeout(1000);
-                }
-
-                // اگر پیدا نشد، src تگ‌های video و HTML فریم‌ها را بررسی کن
-                if (found.size === 0) {
+                // خواندن src تگ video (آدرس نسبی را کامل می‌کنیم)
+                const readVideoSrcs = async () => {
                   for (const frame of page.frames()) {
                     try {
                       const srcs = await frame.evaluate(() =>
                         Array.from(document.querySelectorAll('video, video source'))
-                          .map(v => v.currentSrc || v.src).filter(Boolean));
-                      srcs.forEach(s => { if (/^https?:/.test(s) && VID_RE.test(s)) found.add(s); });
+                          .map(v => v.getAttribute('src') || v.currentSrc || '').filter(Boolean));
+                      const base = frame.url() || pageUrl;
+                      srcs.forEach(s => add(absolute(s, base), 'video src'));
+                    } catch (e) {}
+                  }
+                };
 
-                      const html = await frame.content();
-                      const m = html.match(/https?:\\?\/\\?\/[^"'\s<>\\]+(?:\\\/[^"'\s<>\\]+)*\.vid[^"'\s<>]*/gi) || [];
-                      m.forEach(s => found.add(s.replace(/\\\//g, '/')));
+                await readVideoSrcs();
+
+                // اگر چیزی پیدا نشد، پخش را امتحان کن
+                if (found.size === 0) {
+                  for (const frame of page.frames()) {
+                    try {
+                      await frame.evaluate(() => {
+                        document.querySelectorAll('video').forEach(v => {
+                          v.muted = true;
+                          v.play().catch(() => {});
+                        });
+                      });
+                      for (const sel of ['.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid', 'button[aria-label*="Play" i]', '.play-button', '.play', 'video']) {
+                        const el = await frame.$(sel);
+                        if (el) await el.click({ timeout: 2000 }).catch(() => {});
+                      }
+                    } catch (e) {}
+                  }
+                  for (let t = 0; t < 20 && found.size === 0; t++) {
+                    await page.waitForTimeout(1000);
+                    await readVideoSrcs();
+                  }
+                }
+
+                // آخرین تلاش: جستجو در HTML
+                if (found.size === 0) {
+                  for (const frame of page.frames()) {
+                    try {
+                      const html = (await frame.content()).replace(/\\\//g, '/');
+                      const m = html.match(/(?:https?:)?\/\/[^"'\s<>\\]+\.vid[^"'\s<>]*|\/[^"'\s<>\\]+\.vid[^"'\s<>]*/gi) || [];
+                      m.forEach(s => add(absolute(s, frame.url() || pageUrl), 'html'));
                     } catch (e) {}
                   }
                 }
@@ -145,15 +169,16 @@ jobs:
                   continue;
                 }
 
+                // اگر هم لینک /cdn8/ (اولیه) و هم لینک نهایی /widi/ پیدا شد، هر دو یک فایل‌اند؛
+                // فقط تا اولین دانلود موفق ادامه می‌دهیم.
                 let k = 0;
                 for (const target of found) {
                   k++;
                   console.log('  Downloading:', target);
                   const out = path.join('downloads', nameFrom(target, i + 1, k));
-                  if (await download(ctx, target, pageUrl, out)) {
-                    const size = fs.statSync(out).size;
-                    if (size > 102400) { console.log(`  OK: ${out} (${size} bytes)`); success++; }
-                    else { console.log('  File too small, removing.'); fs.unlinkSync(out); }
+                  if (await download(ctx, target, pageUrl, out) && await saveIfBig(out)) {
+                    success++;
+                    break;
                   }
                 }
               } catch (e) {
