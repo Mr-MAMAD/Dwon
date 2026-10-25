@@ -1,4 +1,4 @@
-name: sxyp Downloader (Smart Split)
+name: Downloader (Smart Split)
 
 on:
   workflow_dispatch:
@@ -6,6 +6,11 @@ on:
       urls:
         description: 'Video URLs (space or newline separated)'
         required: true
+        type: string
+      referer:
+        description: 'Referer (برای trafficdeposit همین پیش‌فرض معمولاً کافی است)'
+        required: false
+        default: 'https://sxyprn.com/'
         type: string
 
 jobs:
@@ -23,10 +28,16 @@ jobs:
 
       - name: Download
         shell: bash
+        env:
+          URLS: ${{ github.event.inputs.urls }}
+          REFERER: ${{ github.event.inputs.referer }}
         run: |
           success=0
           total=0
           failed_urls=""
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+          ORIGIN=$(echo "$REFERER" | sed -E 's#^(https?://[^/]+).*#\1#')
 
           while IFS= read -r url; do
             url=$(echo "$url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -44,49 +55,45 @@ jobs:
             echo "[$total] در حال دانلود: $url"
             echo "=========================================="
 
-            # استخراج نام فایل از پارامتر file اگر وجود داشته باشد
+            # استخراج نام فایل (بدون تغییر پسوند)
             if echo "$url" | grep -q 'file='; then
               file_param=$(echo "$url" | sed -n 's/.*file=\([^&]*\).*/\1/p' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
               filename=$(basename "$file_param")
             else
-              filename=$(basename "$url" | cut -d'?' -f1)
+              filename=$(basename "${url%%\?*}")
             fi
+            [ -z "$filename" ] && filename="video_${total}"
 
-            [ -z "$filename" ] && filename="video_${total}.mp4"
             echo "ذخیره به عنوان: $filename"
 
-            download_failed=false
-
-            curl -L \
-              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              -H "Referer: https://sxyprn.com/" \
-              -H "Origin: https://sxyprn.com" \
+            if ! curl -fL \
+              -A "$UA" \
+              -H "Accept: */*" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              -e "$REFERER" \
+              -H "Origin: $ORIGIN" \
               --connect-timeout 30 \
+              --retry 3 --retry-delay 5 --retry-all-errors \
               -o "downloads/$filename" \
-              "$url" 2>&1 || download_failed=true
-
-            if [ "$download_failed" = true ]; then
+              "$url"; then
               echo "❌ خطا در دانلود: $url"
-              failed_urls="${failed_urls}${url} (خطای curl)\n"
+              failed_urls="${failed_urls}${url} (خطای curl - احتمالاً لینک منقضی یا مسدود)\n"
+              rm -f "downloads/$filename"
               continue
             fi
 
-            if [ -f "downloads/$filename" ]; then
-              size=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
-              if [ "$size" -gt 102400 ]; then
-                echo "✅ دانلود شد: $filename ($(numfmt --to=iec $size))"
-                success=$((success+1))
-              else
-                echo "❌ فایل خیلی کوچک است ($size بایت)"
-                failed_urls="${failed_urls}${url} (فایل کوچک: ${size} بایت)\n"
-                rm -f "downloads/$filename"
-              fi
-            else
-              echo "❌ فایل ایجاد نشد: $filename"
-              failed_urls="${failed_urls}${url} (فایل ذخیره نشد)\n"
+            size=$(stat -c%s "downloads/$filename" 2>/dev/null || echo 0)
+            if [ "$size" -le 102400 ]; then
+              echo "❌ فایل خیلی کوچک است ($size بایت)"
+              failed_urls="${failed_urls}${url} (فایل کوچک: ${size} بایت)\n"
+              rm -f "downloads/$filename"
+              continue
             fi
+
+            echo "✅ دانلود شد: $filename ($(numfmt --to=iec "$size"))"
+            success=$((success+1))
             echo ""
-          done < <(echo "${{ github.event.inputs.urls }}" | tr ' ' '\n')
+          done < <(printf '%s\n' "$URLS" | tr -s ' \t' '\n')
 
           echo ""
           echo "=========================================="
