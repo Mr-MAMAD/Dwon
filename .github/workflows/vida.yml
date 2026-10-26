@@ -1,4 +1,4 @@
-name: Vida Downloader (Find Video)
+name: Downloader (Find Video)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       urls:
         description: 'Page URLs (space or newline separated)'
         required: true
-        default: 'https://vidara.so/v/cpbnwULfofbCA'
+        default: ''
         type: string
 
 jobs:
@@ -59,6 +59,7 @@ jobs:
           }
 
           async function downloadDirect(ctx, url, referer, out) {
+            try { fs.unlinkSync(out); } catch (e) {}
             const res = await ctx.request.get(url, {
               headers: { Referer: referer, Accept: '*/*' },
               maxRedirects: 10,
@@ -67,15 +68,16 @@ jobs:
             console.log('  Final URL:', res.url());
             console.log('  Status:', res.status());
             if (!res.ok()) return false;
-            fs.writeFileSync(out, await res.body());
-            const size = fs.statSync(out).size;
-            if (size < MIN_SIZE) { console.log('  Too small:', size); fs.unlinkSync(out); return false; }
-            console.log(`  OK: ${out} (${size} bytes)`);
+            const body = await res.body();
+            if (body.length < MIN_SIZE) { console.log('  Too small:', body.length); return false; }
+            fs.writeFileSync(out, body);
+            console.log(`  OK: ${out} (${body.length} bytes)`);
             return true;
           }
 
           function downloadHls(url, referer, out) {
             const origin = new URL(referer).origin;
+            try { fs.unlinkSync(out); } catch (e) {}
             const r = spawnSync('ffmpeg', [
               '-y', '-loglevel', 'error',
               '-user_agent', UA,
@@ -85,9 +87,13 @@ jobs:
               '-bsf:a', 'aac_adtstoasc',
               out
             ], { stdio: 'inherit' });
-            if (r.status !== 0 || !fs.existsSync(out)) return false;
-            const size = fs.statSync(out).size;
-            if (size < MIN_SIZE) { console.log('  Too small:', size); fs.unlinkSync(out); return false; }
+            const exists = fs.existsSync(out);
+            const size = exists ? fs.statSync(out).size : 0;
+            if (r.status !== 0 || size < MIN_SIZE) {
+              console.log('  HLS failed or too small:', size);
+              if (exists) fs.unlinkSync(out);
+              return false;
+            }
             console.log(`  OK: ${out} (${size} bytes)`);
             return true;
           }
@@ -265,12 +271,22 @@ jobs:
           path: debug/
           if-no-files-found: ignore
 
-      - name: List files
+      - name: Clean empty files
+        id: clean
         if: always()
-        run: ls -lh downloads/ || true
+        run: |
+          mkdir -p downloads
+          find downloads -type f -size -1c -print -delete
+          find downloads -type f -size -100k -print -delete
+          ls -lh downloads/ || true
+          if [ -n "$(find downloads -type f | head -1)" ]; then
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Release
-        if: steps.grab.outcome == 'success'
+        if: steps.clean.outputs.has_files == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: asia-${{ github.run_number }}
@@ -279,5 +295,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Fail if nothing downloaded
-        if: steps.grab.outcome != 'success'
-        run: exit 1
+        if: steps.clean.outputs.has_files != 'true'
+        run: |
+          echo "No valid file was downloaded."
+          exit 1
