@@ -1,4 +1,4 @@
-name: Downloader (Find Video)
+name: vida Downloader (Find Video)
 
 on:
   workflow_dispatch:
@@ -289,7 +289,7 @@ jobs:
         if: steps.clean.outputs.has_files == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: asia-${{ github.run_number }}
+          tag_name: vida-${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
