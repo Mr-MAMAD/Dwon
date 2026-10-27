@@ -1,4 +1,4 @@
-name: Downloader (Find Video)
+name: phub2 Downloader (Find Video)
 
 on:
   workflow_dispatch:
