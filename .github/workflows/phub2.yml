@@ -1,4 +1,4 @@
-name: ph2 Downloader (Find Video)
+name: Downloader (Find Video)
 
 on:
   workflow_dispatch:
@@ -7,6 +7,11 @@ on:
         description: 'Page URLs (space or newline separated)'
         required: true
         default: 'https://vidara.so/v/cpbnwULfofbCA'
+        type: string
+      quality:
+        description: 'Preferred quality (height), e.g. 240 / 480 / 720'
+        required: true
+        default: '480'
         type: string
 
 jobs:
@@ -63,16 +68,16 @@ jobs:
           const HLS_RE = /\.m3u8(\?|#|$)/i;
           const AD_RE = /(doubleclick|googlesyndication|googleads|exoclick|exosrv|adsco|adserver|adsystem|adnxs|popads|popcash|propeller|juicyads|trafficjunky|vast|vpaid|\/ads?\/|[\/_.-]ads?[\/_.-]|advert|banner|preroll|pre-roll|promo|sponsor|clickadu|hilltopads|adcash|ero-advertising|tsyndicate|syndication)/i;
           const urls = (process.env.URLS || '').split(/\s+/).filter(u => /^https?:\/\//.test(u));
+          const QUALITY = parseInt(process.env.QUALITY || '480', 10) || 480;
           const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
           const MIN_SIZE = 102400;
-          // ویدیوی کمتر از این اندازه معمولاً تبلیغ است (فقط برای امتیازدهی، نه حذف قطعی)
           const BIG_SIZE = 20 * 1024 * 1024;
 
+          console.log('Target quality:', QUALITY + 'p');
+
           function pageId(u, i) {
-            try {
-              const last = path.basename(new URL(u).pathname);
-              return last || `video_${i}`;
-            } catch (e) { return `video_${i}`; }
+            try { return path.basename(new URL(u).pathname) || `video_${i}`; }
+            catch (e) { return `video_${i}`; }
           }
 
           function fileNameFrom(u, i, k) {
@@ -85,13 +90,75 @@ jobs:
 
           function hostOf(u) { try { return new URL(u).hostname; } catch (e) { return ''; } }
 
-          // اندازه‌ی فایل از روی Range / HEAD
+          function headersFor(referer) {
+            const origin = new URL(referer).origin;
+            return `Referer: ${referer}\r\nOrigin: ${origin}\r\n`;
+          }
+
+          // کیفیت از روی آدرس (مثلاً 480p یا _480_)
+          function qualityFromUrl(u) {
+            const m = u.match(/(?:^|[\/_.\-=])(144|240|360|480|540|720|1080|1440|2160)p?(?:[\/_.\-?&]|$)/i);
+            return m ? parseInt(m[1], 10) : 0;
+          }
+
+          async function fetchText(ctx, url, referer) {
+            try {
+              const r = await ctx.request.get(url, { headers: { Referer: referer, Accept: '*/*' }, timeout: 30000 });
+              if (!r.ok()) return '';
+              return await r.text();
+            } catch (e) { return ''; }
+          }
+
+          // تحلیل master playlist
+          function parseMaster(text, base) {
+            const lines = text.split(/\r?\n/);
+            const audios = {};
+            lines.forEach(l => {
+              if (l.startsWith('#EXT-X-MEDIA') && /TYPE=AUDIO/.test(l)) {
+                const g = (l.match(/GROUP-ID="([^"]+)"/) || [])[1];
+                const u = (l.match(/URI="([^"]+)"/) || [])[1];
+                if (g && u) { try { audios[g] = new URL(u, base).href; } catch (e) {} }
+              }
+            });
+            const vars = [];
+            for (let n = 0; n < lines.length; n++) {
+              const l = lines[n];
+              if (!l.startsWith('#EXT-X-STREAM-INF')) continue;
+              const res = l.match(/RESOLUTION=(\d+)x(\d+)/);
+              const ag = (l.match(/AUDIO="([^"]+)"/) || [])[1];
+              let m = n + 1;
+              while (m < lines.length && (!lines[m].trim() || lines[m].startsWith('#'))) m++;
+              if (m >= lines.length) continue;
+              try {
+                const vurl = new URL(lines[m].trim(), base).href;
+                const height = res ? Math.min(parseInt(res[1], 10), parseInt(res[2], 10)) : qualityFromUrl(vurl);
+                vars.push({ url: vurl, height, audio: ag ? (audios[ag] || null) : null });
+              } catch (e) {}
+            }
+            return vars;
+          }
+
+          // ارتفاع و مدت با ffprobe
+          function probeMedia(url, referer) {
+            try {
+              const r = spawnSync('ffprobe', [
+                '-v', 'error', '-user_agent', UA, '-headers', headersFor(referer),
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=height:format=duration',
+                '-of', 'json', url
+              ], { encoding: 'utf8', timeout: 60000 });
+              const j = JSON.parse(r.stdout || '{}');
+              const height = j.streams && j.streams[0] ? parseInt(j.streams[0].height, 10) || 0 : 0;
+              const dur = j.format ? parseFloat(j.format.duration) || 0 : 0;
+              return { height, dur };
+            } catch (e) { return { height: 0, dur: 0 }; }
+          }
+
           async function probeSize(ctx, url, referer) {
             try {
               const r = await ctx.request.get(url, {
                 headers: { Referer: referer, Range: 'bytes=0-0', Accept: '*/*' },
-                maxRedirects: 10,
-                timeout: 20000
+                maxRedirects: 10, timeout: 20000
               });
               const cr = r.headers()['content-range'];
               if (cr && /\/(\d+)$/.test(cr)) return parseInt(cr.match(/\/(\d+)$/)[1], 10);
@@ -105,8 +172,7 @@ jobs:
             try { fs.unlinkSync(out); } catch (e) {}
             const res = await ctx.request.get(url, {
               headers: { Referer: referer, Accept: '*/*' },
-              maxRedirects: 10,
-              timeout: 1800000
+              maxRedirects: 10, timeout: 1800000
             });
             console.log('  Final URL:', res.url());
             console.log('  Status:', res.status());
@@ -118,18 +184,13 @@ jobs:
             return true;
           }
 
-          function downloadHls(url, referer, out) {
-            const origin = new URL(referer).origin;
+          function downloadHls(url, audio, referer, out) {
             try { fs.unlinkSync(out); } catch (e) {}
-            const r = spawnSync('ffmpeg', [
-              '-y', '-loglevel', 'error',
-              '-user_agent', UA,
-              '-headers', `Referer: ${referer}\r\nOrigin: ${origin}\r\n`,
-              '-i', url,
-              '-c', 'copy',
-              '-bsf:a', 'aac_adtstoasc',
-              out
-            ], { stdio: 'inherit' });
+            const h = headersFor(referer);
+            const args = ['-y', '-loglevel', 'error', '-user_agent', UA, '-headers', h, '-i', url];
+            if (audio) args.push('-user_agent', UA, '-headers', h, '-i', audio, '-map', '0:v:0', '-map', '1:a:0');
+            args.push('-c', 'copy', '-bsf:a', 'aac_adtstoasc', out);
+            const r = spawnSync('ffmpeg', args, { stdio: 'inherit' });
             const exists = fs.existsSync(out);
             const size = exists ? fs.statSync(out).size : 0;
             if (r.status !== 0 || size < MIN_SIZE) {
@@ -139,20 +200,6 @@ jobs:
             }
             console.log(`  OK: ${out} (${size} bytes)`);
             return true;
-          }
-
-          // مدت زمان HLS با ffprobe (برای تشخیص تبلیغ کوتاه از ویدیوی اصلی)
-          function hlsDuration(url, referer) {
-            try {
-              const origin = new URL(referer).origin;
-              const r = spawnSync('ffprobe', [
-                '-v', 'error', '-user_agent', UA,
-                '-headers', `Referer: ${referer}\r\nOrigin: ${origin}\r\n`,
-                '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', url
-              ], { encoding: 'utf8', timeout: 60000 });
-              const d = parseFloat((r.stdout || '').trim());
-              return isNaN(d) ? 0 : d;
-            } catch (e) { return 0; }
           }
 
           (async () => {
@@ -176,7 +223,6 @@ jobs:
               });
 
               try {
-                // کاندیدها: url -> { type, why, order }
                 const cands = new Map();
                 let order = 0;
 
@@ -194,7 +240,6 @@ jobs:
 
                 const page = await ctx.newPage();
 
-                // پاپ‌آپ‌ها بسته می‌شوند
                 ctx.on('page', async p => {
                   if (p === page) return;
                   await p.waitForTimeout(1000).catch(() => {});
@@ -249,7 +294,6 @@ jobs:
                   await page.mouse.click(640, 360).catch(() => {});
                 };
 
-                // دکمه‌ی رد کردن تبلیغ
                 const trySkipAd = async () => {
                   const sels = [
                     '.videoAdUiSkipButton', '.ytp-ad-skip-button', '.jw-skip', '.jw-skiplink',
@@ -276,28 +320,64 @@ jobs:
                   }
                 };
 
-                await readFromDom();
+                // انتخاب کیفیت از منوی پلیر
+                const trySelectQuality = async () => {
+                  const menuSels = [
+                    '.jw-icon-settings', '.jw-settings-quality', '.vjs-menu-button', '.vjs-quality-selector',
+                    '.plyr__control[data-plyr="settings"]', '[class*="quality" i]', '[class*="setting" i]',
+                    '[aria-label*="Settings" i]', '[aria-label*="Quality" i]', '[title*="Quality" i]'
+                  ];
+                  const re = new RegExp(`(^|\\D)${QUALITY}\\s*p?(\\D|$)`, 'i');
+                  for (const frame of page.frames()) {
+                    for (const s of menuSels) {
+                      try {
+                        const el = await frame.$(s);
+                        if (el && await el.isVisible().catch(() => false)) {
+                          await el.click({ timeout: 1000, force: true }).catch(() => {});
+                          await page.waitForTimeout(500);
+                          const opt = frame.getByText(re).first();
+                          if (await opt.isVisible({ timeout: 500 }).catch(() => false)) {
+                            console.log(`  Selecting ${QUALITY}p in player menu (${s})`);
+                            await opt.click({ timeout: 1500, force: true }).catch(() => {});
+                            await page.waitForTimeout(1500);
+                            return true;
+                          }
+                        }
+                      } catch (e) {}
+                    }
+                    // گاهی گزینه‌ها بدون منو نمایان‌اند
+                    try {
+                      const opt = frame.getByText(re).first();
+                      if (await opt.isVisible({ timeout: 300 }).catch(() => false)) {
+                        console.log(`  Clicking visible ${QUALITY}p option`);
+                        await opt.click({ timeout: 1500, force: true }).catch(() => {});
+                        await page.waitForTimeout(1500);
+                        return true;
+                      }
+                    } catch (e) {}
+                  }
+                  return false;
+                };
 
-                // پخش + صبر طولانی‌تر تا تبلیغ تمام شود و ویدیوی اصلی لود شود
+                await readFromDom();
                 await tryPlay();
-                const maxWait = 60; // ثانیه
+
+                const maxWait = 60;
                 let lastCount = -1, stable = 0;
                 for (let s = 0; s < maxWait; s++) {
                   await page.waitForTimeout(1000);
                   if (s % 3 === 0) await trySkipAd();
                   if (s % 4 === 0) await readFromDom();
                   if (s % 10 === 9) await tryPlay();
+                  if (s === 12 || s === 28) { await trySelectQuality(); await readFromDom(); }
 
-                  // اگر کاندیدی هست و مدتی چیز جدیدی نیامد، ادامه نده
                   if (cands.size > 0) {
                     if (cands.size === lastCount) stable++; else { stable = 0; lastCount = cands.size; }
-                    // حداقل ۲۰ ثانیه صبر، تا لینک اصلی بعد از تبلیغ هم ثبت شود
-                    if (s >= 20 && stable >= 12) break;
+                    if (s >= 30 && stable >= 12) break;
                   }
                 }
                 await readFromDom();
 
-                // جستجو در HTML
                 if (cands.size === 0) {
                   for (const frame of page.frames()) {
                     try {
@@ -320,102 +400,70 @@ jobs:
                   continue;
                 }
 
-                // امتیازدهی کاندیدها
-                const list = [];
+                // ساخت لیست نهایی (master playlist به کیفیت‌هایش باز می‌شود)
+                const entries = [];
+                const entryUrls = new Set();
+                const pushEntry = (e) => { if (!entryUrls.has(e.url)) { entryUrls.add(e.url); entries.push(e); } };
+
                 for (const [url, info] of cands) {
-                  let score = 0;
-                  const host = hostOf(url);
-                  if (AD_RE.test(url)) score -= 100;
+                  if (info.type === 'hls') {
+                    const text = await fetchText(ctx, url, pageUrl);
+                    if (text.includes('#EXT-X-STREAM-INF')) {
+                      const vars = parseMaster(text, url);
+                      console.log(`  Master playlist: ${url}\n    variants: ${vars.map(v => (v.height || '?') + 'p').join(', ')}`);
+                      vars.forEach(v => pushEntry({ type: 'hls', url: v.url, audio: v.audio, height: v.height, why: 'master', order: info.order, master: url }));
+                    } else {
+                      pushEntry({ type: 'hls', url, audio: null, height: qualityFromUrl(url), why: info.why, order: info.order });
+                    }
+                  } else {
+                    pushEntry({ type: 'file', url, audio: null, height: qualityFromUrl(url), why: info.why, order: info.order });
+                  }
+                }
+
+                // امتیازدهی
+                const list = [];
+                for (const e of entries) {
+                  let score = 0, size = 0, dur = 0;
+                  const host = hostOf(e.url);
+                  if (AD_RE.test(e.url)) score -= 100;
                   if (host === pageHost || host.endsWith('.' + pageHost.replace(/^www\./, ''))) score += 20;
 
-                  let size = 0, dur = 0;
-                  if (info.type === 'file') {
-                    size = await probeSize(ctx, url, pageUrl);
+                  // ارتفاع نامشخص یا برابر هدف => با ffprobe دقیق‌تر بررسی کن
+                  if (e.height === 0 || e.height === QUALITY) {
+                    const p = probeMedia(e.url, pageUrl);
+                    if (e.height === 0) e.height = p.height;
+                    dur = p.dur;
+                  }
+                  if (e.type === 'file') size = await probeSize(ctx, e.url, pageUrl);
+
+                  if (e.height === QUALITY) score += 200;
+                  else if (e.height > 0) score -= Math.min(100, Math.floor(Math.abs(e.height - QUALITY) / 5));
+
+                  if (e.type === 'file') {
                     if (size >= BIG_SIZE) score += 50;
                     else if (size > 0 && size < 5 * 1024 * 1024) score -= 30;
                     score += Math.min(60, Math.floor(size / (50 * 1024 * 1024)) * 10);
                   } else {
-                    dur = hlsDuration(url, pageUrl);
                     if (dur >= 120) score += 50;
                     else if (dur > 0 && dur < 60) score -= 30;
                     score += Math.min(60, Math.floor(dur / 300) * 10);
                   }
-                  list.push({ url, ...info, score, size, dur });
+                  list.push({ ...e, score, size, dur });
                 }
                 list.sort((a, b) => b.score - a.score || b.size - a.size || b.dur - a.dur || b.order - a.order);
 
                 console.log('  --- Candidates (best first) ---');
-                list.forEach((c, n) => console.log(`  #${n + 1} score=${c.score} type=${c.type} size=${c.size} dur=${c.dur.toFixed(0)}s why=${c.why}\n      ${c.url}`));
+                list.forEach((c, n) => console.log(`  #${n + 1} score=${c.score} type=${c.type} height=${c.height || '?'} size=${c.size} dur=${c.dur.toFixed(0)}s why=${c.why}\n      ${c.url}`));
+
+                if (!list.some(c => c.height === QUALITY)) {
+                  console.log(`  WARNING: ${QUALITY}p not found, nearest quality will be used.`);
+                }
 
                 let done = false;
                 let k = 0;
                 for (const c of list) {
                   k++;
-                  console.log(`  Downloading #${k}:`, c.url);
+                  console.log(`  Downloading #${k} (${c.height || '?'}p):`, c.url);
                   if (c.type === 'file') {
                     const out = path.join('downloads', fileNameFrom(c.url, i + 1, k));
-                    if (await downloadDirect(ctx, c.url, pageUrl, out)) { done = true; break; }
-                  } else {
-                    const out = path.join('downloads', `${pageId(pageUrl, i + 1)}.mp4`);
-                    if (downloadHls(c.url, pageUrl, out)) { done = true; break; }
-                  }
-                  // اگر بهترین کاندید شکست خورد، سراغ بعدی می‌رویم
-                }
-
-                if (done) success++;
-                else console.log('  All candidates failed.');
-              } catch (e) {
-                console.log('  Error:', e.message);
-              }
-              await ctx.close();
-            }
-
-            await browser.close();
-            console.log(`\nSuccess: ${success} / ${urls.length}`);
-            process.exit(success > 0 ? 0 : 1);
-          })();
-          EOF
-
-      - name: Find and download
-        id: grab
-        continue-on-error: true
-        env:
-          URLS: ${{ github.event.inputs.urls }}
-        run: node grab.js
-
-      - name: Upload debug files
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug
-          path: debug/
-          if-no-files-found: ignore
-
-      - name: Clean empty files
-        id: clean
-        if: always()
-        run: |
-          mkdir -p downloads
-          find downloads -type f -size -1c -print -delete
-          find downloads -type f -size -100k -print -delete
-          ls -lh downloads/ || true
-          if [ -n "$(find downloads -type f | head -1)" ]; then
-            echo "has_files=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_files=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Release
-        if: steps.clean.outputs.has_files == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: asia-${{ github.run_number }}
-          files: downloads/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Fail if nothing downloaded
-        if: steps.clean.outputs.has_files != 'true'
-        run: |
-          echo "No valid file was downloaded."
-          exit 1
+                    if (await downloadDirect(ctx,
