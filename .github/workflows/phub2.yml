@@ -96,7 +96,16 @@ jobs:
           }
 
           function qualityFromUrl(u) {
-            const m = u.match(/(?:^|[\/_.\-=])(144|240|360|480|540|720|1080|1440|2160)p?(?:[\/_.\-?&]|$)/i);
+            let name = '';
+            try { name = decodeURIComponent(path.basename(new URL(u).pathname)); } catch (e) { name = u; }
+            // 480P_1000K_123.mp4  یا  480p_...
+            let m = name.match(/^(\d{3,4})p[_\-.]/i);
+            if (m) return parseInt(m[1], 10);
+            // ..._480p_... یا ..._480P.
+            m = name.match(/[_\-.](\d{3,4})p(?:[_\-.]|$)/i);
+            if (m) return parseInt(m[1], 10);
+            // مسیر مثل /480p/ یا /480/
+            m = u.match(/(?:^|[\/_.\-=])(144|240|360|480|540|720|1080|1440|2160)p?(?:[\/_.\-?&]|$)/i);
             return m ? parseInt(m[1], 10) : 0;
           }
 
@@ -321,7 +330,9 @@ jobs:
                   const menuSels = [
                     '.jw-icon-settings', '.jw-settings-quality', '.vjs-menu-button', '.vjs-quality-selector',
                     '.plyr__control[data-plyr="settings"]', '[class*="quality" i]', '[class*="setting" i]',
-                    '[aria-label*="Settings" i]', '[aria-label*="Quality" i]', '[title*="Quality" i]'
+                    '[class*="gear" i]', '[class*="resolution" i]', '[class*="menu" i]',
+                    '[aria-label*="Settings" i]', '[aria-label*="Quality" i]', '[title*="Quality" i]',
+                    '[title*="Settings" i]', 'button svg', 'video'
                   ];
                   const re = new RegExp(`(^|\\D)${QUALITY}\\s*p?(\\D|$)`, 'i');
                   for (const frame of page.frames()) {
@@ -411,6 +422,40 @@ jobs:
                     }
                   } else {
                     pushEntry({ type: 'file', url, audio: null, height: qualityFromUrl(url), why: info.why, order: info.order });
+                  }
+                }
+
+                // اگر کیفیت هدف پیدا نشد، آدرس آن را از روی کیفیت دیگر بساز و امتحان کن
+                if (!entries.some(e => e.height === QUALITY)) {
+                  const BITRATES = ['500K', '600K', '700K', '800K', '900K', '1000K', '1200K', '1500K', '1800K', '2000K', '2500K', '3000K', '4000K'];
+                  const bases = entries.filter(e => e.type === 'file' && /(^|\/)\d{3,4}P_\d+K_/i.test(e.url));
+                  for (const b of bases) {
+                    const u = new URL(b.url);
+                    const dir = u.pathname.slice(0, u.pathname.lastIndexOf('/') + 1);
+                    const base = decodeURIComponent(path.basename(u.pathname));
+                    const mm = base.match(/^(\d{3,4})P_(\d+K)_(.+)$/i);
+                    if (!mm) continue;
+                    const tail = mm[3];
+                    const tried = [];
+                    const order2 = [mm[2].toUpperCase(), ...BITRATES.filter(x => x !== mm[2].toUpperCase())];
+                    console.log(`  Probing ${QUALITY}P variants based on: ${base}`);
+                    let foundUrl = null;
+                    for (const br of order2) {
+                      const nu = new URL(b.url);
+                      nu.pathname = dir + `${QUALITY}P_${br}_${tail}`;
+                      const cand = nu.href;
+                      const sz = await probeSize(ctx, cand, pageUrl);
+                      tried.push(`${QUALITY}P_${br} -> ${sz}`);
+                      if (sz > MIN_SIZE) { foundUrl = cand; break; }
+                    }
+                    console.log('    ' + tried.join(' | '));
+                    if (foundUrl) {
+                      console.log('  Guessed URL works:', foundUrl);
+                      pushEntry({ type: 'file', url: foundUrl, audio: null, height: QUALITY, why: 'guessed', order: b.order });
+                      break;
+                    } else {
+                      console.log('  No guessed URL worked (token may be tied to file name).');
+                    }
                   }
                 }
 
