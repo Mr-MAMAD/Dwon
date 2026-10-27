@@ -64,31 +64,13 @@ jobs:
           const fs = require('fs');
           const path = require('path');
 
-          const FILE_RE = /\.(mp4|webm|mkv|mov|m4v|vid)(\?|#|$)/i;
           const HLS_RE = /\.m3u8(\?|#|$)/i;
-          const AD_RE = /(doubleclick|googlesyndication|googleads|exoclick|exosrv|adsco|adserver|adsystem|adnxs|popads|popcash|propeller|juicyads|trafficjunky|vast|vpaid|\/ads?\/|[\/_.-]ads?[\/_.-]|advert|banner|preroll|pre-roll|promo|sponsor|clickadu|hilltopads|adcash|ero-advertising|tsyndicate|syndication)/i;
           const urls = (process.env.URLS || '').split(/\s+/).filter(u => /^https?:\/\//.test(u));
           const QUALITY = parseInt(process.env.QUALITY || '480', 10) || 480;
           const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
           const MIN_SIZE = 102400;
-          const BIG_SIZE = 20 * 1024 * 1024;
 
           console.log('Target quality:', QUALITY + 'p');
-
-          function pageId(u, i) {
-            try { return path.basename(new URL(u).pathname) || `video_${i}`; }
-            catch (e) { return `video_${i}`; }
-          }
-
-          function fileNameFrom(u, i, k) {
-            try {
-              const n = path.basename(new URL(u).pathname);
-              if (n && FILE_RE.test(n)) return n;
-            } catch (e) {}
-            return `video_${i}_${k}.mp4`;
-          }
-
-          function hostOf(u) { try { return new URL(u).hostname; } catch (e) { return ''; } }
 
           function headersFor(referer) {
             const origin = new URL(referer).origin;
@@ -97,19 +79,15 @@ jobs:
 
           function qualityFromUrl(u) {
             let name = '';
-            try { name = decodeURIComponent(path.basename(new URL(u).pathname)); } catch (e) { name = u; }
-            let m = name.match(/^(\d{3,4})p[_\-.]/i);
-            if (m) return parseInt(m[1], 10);
-            m = name.match(/[_\-.](\d{3,4})p(?:[_\-.]|$)/i);
-            if (m) return parseInt(m[1], 10);
-            m = u.match(/(?:^|[\/_.\-=])(144|240|360|480|540|720|1080|1440|2160)p?(?:[\/_.\-?&]|$)/i);
+            try { name = decodeURIComponent(u.split('?')[0]); } catch (e) { name = u; }
+            const m = name.match(/(?:^|[\/_])(\d{3,4})P?_\d+K/i) || name.match(/[\/_.\-](144|240|360|480|540|720|1080|1440|2160)p?(?:[\/_.\-]|$)/i);
             return m ? parseInt(m[1], 10) : 0;
           }
 
           async function fetchText(ctx, url, referer) {
             try {
               const r = await ctx.request.get(url, { headers: { Referer: referer, Accept: '*/*' }, timeout: 30000 });
-              if (!r.ok()) return '';
+              if (!r.ok()) { console.log('  playlist status:', r.status()); return ''; }
               return await r.text();
             } catch (e) { return ''; }
           }
@@ -129,6 +107,7 @@ jobs:
               const l = lines[n];
               if (!l.startsWith('#EXT-X-STREAM-INF')) continue;
               const res = l.match(/RESOLUTION=(\d+)x(\d+)/);
+              const bw = parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || '0', 10);
               const ag = (l.match(/AUDIO="([^"]+)"/) || [])[1];
               let m = n + 1;
               while (m < lines.length && (!lines[m].trim() || lines[m].startsWith('#'))) m++;
@@ -136,55 +115,10 @@ jobs:
               try {
                 const vurl = new URL(lines[m].trim(), base).href;
                 const height = res ? Math.min(parseInt(res[1], 10), parseInt(res[2], 10)) : qualityFromUrl(vurl);
-                vars.push({ url: vurl, height, audio: ag ? (audios[ag] || null) : null });
+                vars.push({ url: vurl, height, bw, audio: ag ? (audios[ag] || null) : null });
               } catch (e) {}
             }
             return vars;
-          }
-
-          function probeMedia(url, referer) {
-            try {
-              const r = spawnSync('ffprobe', [
-                '-v', 'error', '-user_agent', UA, '-headers', headersFor(referer),
-                '-select_streams', 'v:0',
-                '-show_entries', 'stream=height:format=duration',
-                '-of', 'json', url
-              ], { encoding: 'utf8', timeout: 60000 });
-              const j = JSON.parse(r.stdout || '{}');
-              const height = j.streams && j.streams[0] ? parseInt(j.streams[0].height, 10) || 0 : 0;
-              const dur = j.format ? parseFloat(j.format.duration) || 0 : 0;
-              return { height, dur };
-            } catch (e) { return { height: 0, dur: 0 }; }
-          }
-
-          async function probeSize(ctx, url, referer) {
-            try {
-              const r = await ctx.request.get(url, {
-                headers: { Referer: referer, Range: 'bytes=0-0', Accept: '*/*' },
-                maxRedirects: 10, timeout: 20000
-              });
-              const cr = r.headers()['content-range'];
-              if (cr && /\/(\d+)$/.test(cr)) return parseInt(cr.match(/\/(\d+)$/)[1], 10);
-              const cl = r.headers()['content-length'];
-              if (cl && r.status() === 200) return parseInt(cl, 10);
-            } catch (e) {}
-            return 0;
-          }
-
-          async function downloadDirect(ctx, url, referer, out) {
-            try { fs.unlinkSync(out); } catch (e) {}
-            const res = await ctx.request.get(url, {
-              headers: { Referer: referer, Accept: '*/*' },
-              maxRedirects: 10, timeout: 1800000
-            });
-            console.log('  Final URL:', res.url());
-            console.log('  Status:', res.status());
-            if (!res.ok()) return false;
-            const body = await res.body();
-            if (body.length < MIN_SIZE) { console.log('  Too small:', body.length); return false; }
-            fs.writeFileSync(out, body);
-            console.log(`  OK: ${out} (${body.length} bytes)`);
-            return true;
           }
 
           function downloadHls(url, audio, referer, out) {
@@ -205,6 +139,71 @@ jobs:
             return true;
           }
 
+          function probeHeight(file) {
+            try {
+              const r = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', file], { encoding: 'utf8' });
+              return (r.stdout || '').trim();
+            } catch (e) { return ''; }
+          }
+
+          // نزدیک‌ترین کیفیت به هدف
+          function nearest(list, getH) {
+            let best = null, bd = 1e9;
+            for (const it of list) {
+              const h = getH(it);
+              if (!h) continue;
+              const d = Math.abs(h - QUALITY);
+              if (d < bd) { bd = d; best = it; }
+            }
+            return best;
+          }
+
+          // یک آدرس m3u8 (master یا variant) را در کیفیت هدف دانلود می‌کند
+          async function downloadFromPlaylist(ctx, url, referer, outBase) {
+            const text = await fetchText(ctx, url, referer);
+            let target = { url, audio: null, height: qualityFromUrl(url) };
+            if (text.includes('#EXT-X-STREAM-INF')) {
+              const vars = parseMaster(text, url);
+              console.log('  Variants:', vars.map(v => (v.height || '?') + 'p').join(', '));
+              const exact = vars.filter(v => v.height === QUALITY).sort((a, b) => b.bw - a.bw)[0];
+              target = exact || nearest(vars, v => v.height) || vars[0] || target;
+            }
+            console.log(`  Using ${target.height || '?'}p:`, target.url);
+            const out = path.join('downloads', `${outBase}_${target.height || QUALITY}p.mp4`);
+            const ok = downloadHls(target.url, target.audio, referer, out);
+            if (ok) console.log('  Video size (w,h):', probeHeight(out));
+            return ok;
+          }
+
+          // خواندن flashvars پلیر از صفحه
+          async function getFlashvars(page) {
+            for (const frame of page.frames()) {
+              try {
+                const fv = await frame.evaluate(() => {
+                  const keys = Object.keys(window).filter(k => k.indexOf('flashvars_') === 0);
+                  for (const k of keys) {
+                    const v = window[k];
+                    if (v && Array.isArray(v.mediaDefinitions)) {
+                      return { id: k.replace('flashvars_', ''), title: v.video_title || '', defs: v.mediaDefinitions };
+                    }
+                  }
+                  return null;
+                });
+                if (fv) return fv;
+              } catch (e) {}
+            }
+            // جایگزین: جستجو در HTML
+            for (const frame of page.frames()) {
+              try {
+                const html = await frame.content();
+                const re = /"mediaDefinitions"\s*:\s*(\[[\s\S]*?\])\s*,\s*"(?:isVertical|hotspots|thumbs)"/;
+                const m = html.match(re);
+                if (m) return { id: 'video', title: '', defs: JSON.parse(m[1]) };
+              } catch (e) {}
+            }
+            return null;
+          }
+
           (async () => {
             const browser = await chromium.launch({
               headless: true,
@@ -214,211 +213,69 @@ jobs:
 
             for (let i = 0; i < urls.length; i++) {
               const pageUrl = urls[i];
-              const pageHost = hostOf(pageUrl);
               console.log(`\n[${i + 1}] ${pageUrl}`);
-              const ctx = await browser.newContext({
-                userAgent: UA,
-                viewport: { width: 1280, height: 720 },
-                locale: 'en-US'
-              });
+              const ctx = await browser.newContext({ userAgent: UA, viewport: { width: 1280, height: 720 }, locale: 'en-US' });
               await ctx.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
               });
 
               try {
-                const cands = new Map();
-                let order = 0;
-
-                const add = (u, why) => {
-                  if (!u || !/^https?:/i.test(u)) return;
-                  const clean = u.replace(/#\.mp4$/, '');
-                  if (cands.has(clean)) return;
-                  let type = null;
-                  if (HLS_RE.test(clean)) type = 'hls';
-                  else if (FILE_RE.test(clean) || why === 'content-type') type = 'file';
-                  if (!type) return;
-                  cands.set(clean, { type, why, order: order++ });
-                  console.log(`  Found ${type} (${why}):`, clean);
-                };
-
                 const page = await ctx.newPage();
-
+                const m3u8Seen = new Map();
+                page.on('request', r => {
+                  const u = r.url();
+                  if (HLS_RE.test(u) && !m3u8Seen.has(u)) { m3u8Seen.set(u, m3u8Seen.size); console.log('  Found m3u8 (request):', u); }
+                });
                 ctx.on('page', async p => {
                   if (p === page) return;
                   await p.waitForTimeout(1000).catch(() => {});
-                  console.log('  Closing popup:', p.url());
                   await p.close().catch(() => {});
-                });
-
-                page.on('request', r => add(r.url(), 'request'));
-                page.on('response', r => {
-                  const ct = (r.headers()['content-type'] || '').toLowerCase();
-                  if (ct.startsWith('video/')) add(r.url(), 'content-type');
-                  if (ct.includes('mpegurl')) add(r.url(), 'content-type');
                 });
 
                 const resp = await page.goto(pageUrl, { waitUntil: 'load', timeout: 90000 }).catch(e => { console.log('  goto error:', e.message); return null; });
                 console.log('  Page status:', resp ? resp.status() : 'none');
                 console.log('  Final page URL:', page.url());
                 console.log('  Title:', await page.title().catch(() => '?'));
-                await page.waitForTimeout(4000);
 
-                const readFromDom = async () => {
-                  for (const frame of page.frames()) {
-                    try {
-                      const base = frame.url() || pageUrl;
-                      const vals = await frame.evaluate(() => {
-                        const out = [];
-                        document.querySelectorAll('video, video source, source').forEach(v => {
-                          out.push(v.getAttribute('src'));
-                          out.push(v.currentSrc);
-                        });
-                        document.querySelectorAll('meta[itemprop="contentUrl"], meta[property="og:video"], meta[property="og:video:url"]').forEach(m => out.push(m.content));
-                        document.querySelectorAll('a[download]').forEach(a => out.push(a.href));
-                        return out.filter(Boolean);
-                      });
-                      vals.forEach(s => { try { add(new URL(s, base).href, 'dom'); } catch (e) {} });
-                    } catch (e) {}
+                // ---------- روش اصلی: flashvars.mediaDefinitions ----------
+                let fv = null;
+                for (let t = 0; t < 8 && !fv; t++) {
+                  fv = await getFlashvars(page);
+                  if (!fv) await page.waitForTimeout(1500);
+                }
+
+                if (fv) {
+                  const hls = fv.defs.filter(d => d && d.format === 'hls' && typeof d.videoUrl === 'string' && d.videoUrl);
+                  console.log('  mediaDefinitions (hls):', hls.map(d => `${d.quality || d.height}p`).join(', ') || '(none)');
+                  let pick = hls.find(d => String(d.quality) === String(QUALITY) || Number(d.height) === QUALITY);
+                  if (!pick) {
+                    pick = nearest(hls, d => Number(d.height) || parseInt(d.quality, 10) || 0);
+                    if (pick) console.log(`  WARNING: ${QUALITY}p not listed, using nearest:`, pick.quality || pick.height);
                   }
-                };
-
-                const tryPlay = async () => {
-                  for (const frame of page.frames()) {
-                    try {
-                      await frame.evaluate(() => {
-                        document.querySelectorAll('video').forEach(v => { v.muted = true; v.play().catch(() => {}); });
-                      });
-                      for (const sel of ['.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid', '.play-button', '.play', '[class*="play" i]', 'video']) {
-                        const el = await frame.$(sel);
-                        if (el) await el.click({ timeout: 1500, force: true }).catch(() => {});
-                      }
-                    } catch (e) {}
+                  if (pick) {
+                    const vurl = pick.videoUrl.replace(/\\\//g, '/');
+                    console.log('  Selected from player data:', vurl);
+                    if (await downloadFromPlaylist(ctx, vurl, pageUrl, fv.id)) { success++; await ctx.close(); continue; }
+                    console.log('  Direct playlist download failed, trying fallback...');
                   }
-                  await page.mouse.click(640, 360).catch(() => {});
-                };
+                } else {
+                  console.log('  No flashvars found, using fallback.');
+                }
 
-                const trySkipAd = async () => {
-                  const sels = [
-                    '.videoAdUiSkipButton', '.ytp-ad-skip-button', '.jw-skip', '.jw-skiplink',
-                    '.vjs-skip-button', '.skip-button', '.skip_button', '#skip', '.ad-skip', '.adskip',
-                    '[class*="skip" i]', '[id*="skip" i]'
-                  ];
-                  for (const frame of page.frames()) {
-                    for (const s of sels) {
-                      try {
-                        const el = await frame.$(s);
-                        if (el && await el.isVisible().catch(() => false)) {
-                          console.log('  Clicking skip:', s);
-                          await el.click({ timeout: 1500, force: true }).catch(() => {});
-                        }
-                      } catch (e) {}
-                    }
-                    try {
-                      const byText = frame.getByText(/skip( ad)?|close ad|رد کردن/i).first();
-                      if (await byText.isVisible({ timeout: 300 }).catch(() => false)) {
-                        console.log('  Clicking skip (text)');
-                        await byText.click({ timeout: 1500, force: true }).catch(() => {});
-                      }
-                    } catch (e) {}
-                  }
-                };
-
-                // روش عمومی انتخاب کیفیت (برای پلیرهای ناشناخته)
-                const trySelectQualityGeneric = async () => {
-                  const re = new RegExp(`^\\s*${QUALITY}\\s*p?\\s*$|(^|\\D)${QUALITY}\\s*p(\\D|$)`, 'i');
-
-                  const clickOption = async (frame) => {
-                    try {
-                      const opt = frame.getByText(re).first();
-                      if (await opt.isVisible({ timeout: 400 }).catch(() => false)) {
-                        console.log(`  Clicking ${QUALITY}p option`);
-                        await opt.click({ timeout: 2000, force: true }).catch(() => {});
-                        await page.waitForTimeout(2500);
-                        return true;
-                      }
-                    } catch (e) {}
-                    return false;
-                  };
-
-                  for (const frame of page.frames()) {
-                    if (await clickOption(frame)) return true;
-
-                    const menuSels = [
-                      '.jw-icon-settings', '.jw-settings-quality', '.vjs-quality-selector',
-                      '.vjs-menu-button', '.plyr__control[data-plyr="settings"]',
-                      '[class*="quality" i]', '[class*="setting" i]', '[class*="gear" i]',
-                      '[class*="resolution" i]', '[aria-label*="Settings" i]',
-                      '[aria-label*="Quality" i]', '[title*="Quality" i]', '[title*="Settings" i]'
-                    ];
-                    for (const s of menuSels) {
-                      try {
-                        const els = await frame.$$(s);
-                        for (const el of els.slice(0, 3)) {
-                          if (!(await el.isVisible().catch(() => false))) continue;
-                          await el.click({ timeout: 1000, force: true }).catch(() => {});
-                          await page.waitForTimeout(600);
-                          if (await clickOption(frame)) { console.log(`  (menu: ${s})`); return true; }
-                        }
-                      } catch (e) {}
-                    }
-
-                    try {
-                      const v = await frame.$('video');
-                      if (v) {
-                        const box = await v.boundingBox();
-                        if (box) {
-                          await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-                          await page.waitForTimeout(500);
-                          const ctrls = await frame.$$('button, [role="button"], [class*="icon" i], [class*="btn" i]');
-                          for (const c of ctrls.slice(0, 40)) {
-                            const b = await c.boundingBox().catch(() => null);
-                            if (!b || b.y < box.y + box.height * 0.6) continue;
-                            await c.click({ timeout: 800, force: true }).catch(() => {});
-                            await page.waitForTimeout(400);
-                            if (await clickOption(frame)) { console.log('  (menu: bottom control bar)'); return true; }
-                          }
-                        }
-                      }
-                    } catch (e) {}
-                  }
-
-                  for (const frame of page.frames()) {
-                    try {
-                      const t = await frame.evaluate(() => Array.from(document.querySelectorAll('*'))
-                        .filter(e => e.children.length === 0 && /\d{3,4}\s*p/i.test(e.textContent || ''))
-                        .map(e => `${e.tagName}.${(e.className || '').toString().slice(0, 40)}="${(e.textContent || '').trim().slice(0, 20)}"`)
-                        .slice(0, 10));
-                      if (t.length) console.log('  Quality-like elements in', frame.url().slice(0, 60), ':', t.join(' | '));
-                    } catch (e) {}
-                  }
-                  return false;
-                };
-
-                // انتخاب کیفیت مخصوص پلیر mgp_ (چرخ‌دنده ← Quality ← گزینه)
-                const trySelectQuality = async () => {
+                // ---------- جایگزین: انتخاب کیفیت در پلیر + شنود شبکه ----------
+                const setQuality = async () => {
                   for (const frame of page.frames()) {
                     try {
                       const isMgp = await frame.evaluate(() => !!document.querySelector('[class*="mgp_"]'));
                       if (!isMgp) continue;
-
-                      const area = await frame.$('.mgp_videoWrapper, .mgp_eventCatcher');
-                      if (area) {
-                        const b = await area.boundingBox();
-                        if (b) await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
-                      }
-                      await page.waitForTimeout(500);
-
                       const res = await frame.evaluate(async (q) => {
                         const sleep = ms => new Promise(r => setTimeout(r, ms));
                         const cur = () => ((document.querySelector('.mgp_quality-btn-text') || {}).textContent || '').trim();
                         const items = () => Array.from(document.querySelectorAll('.mgp_settings-menu-quality-item'));
                         const find = () => items().find(it => new RegExp('^\\s*' + q + '(\\D|$)').test((it.textContent || '').trim()));
-                        const fire = (el) => ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']
+                        const fire = el => ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']
                           .forEach(t => el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })));
-
-                        if (parseInt(cur(), 10) === q) return { ok: true, already: true, cur: cur() };
-
-                        // مسیر اصلی: چرخ‌دنده ← Quality ← گزینه
+                        if (parseInt(cur(), 10) === q) return { ok: true, cur: cur() };
                         let it = null;
                         const gear = document.querySelector('.mgp_btn-settings');
                         if (gear) {
@@ -428,115 +285,39 @@ jobs:
                           if (row) { fire(row); await sleep(800); }
                           it = find();
                         }
-
-                        // مسیر جایگزین: دکمه‌ی کیفیت کنار چرخ‌دنده
                         if (!it) {
                           const qb = document.querySelector('.mgp_btn-quality');
                           if (qb) { fire(qb); await sleep(800); }
                           it = find();
                         }
-
                         if (!it) return { ok: false, cur: cur(), items: items().map(i => (i.textContent || '').trim()) };
                         fire(it.querySelector('.mgp_settings-menu-page-row-right') || it);
                         await sleep(1500);
                         return { ok: parseInt(cur(), 10) === q, cur: cur() };
                       }, QUALITY);
-
                       console.log('  mgp quality result:', JSON.stringify(res));
                       if (res.ok) return true;
-
-                      const loc = frame.locator('.mgp_settings-menu-quality-item')
-                        .filter({ hasText: new RegExp('^\\s*' + QUALITY + '(\\D|$)') }).first();
-                      if (await loc.count()) {
-                        await loc.click({ force: true, timeout: 2000 }).catch(() => {});
-                        await page.waitForTimeout(1500);
-                        const now = await frame.evaluate(() => ((document.querySelector('.mgp_quality-btn-text') || {}).textContent || '').trim());
-                        console.log('  mgp quality after real click:', now);
-                        if (parseInt(now, 10) === QUALITY) return true;
-                      }
-                    } catch (e) { console.log('  mgp quality error:', e.message); }
+                    } catch (e) {}
                   }
                   return false;
                 };
 
-                await readFromDom();
+                await page.waitForTimeout(3000);
+                await setQuality();
+                m3u8Seen.clear();
 
-                // مرحله ۱: اول کیفیت را در تنظیمات پلیر روی هدف بگذار (قبل از هر پخشی)
-                let qualityPicked = false;
-                for (let a = 0; a < 15 && !qualityPicked; a++) {
-                  const hasPlayer = await Promise.all(page.frames().map(f =>
-                    f.evaluate(() => !!document.querySelector('.mgp_btn-settings')).catch(() => false)
-                  )).then(r => r.some(Boolean));
-                  if (hasPlayer) {
-                    qualityPicked = await trySelectQuality();
-                    console.log(`  Quality set attempt ${a + 1}:`, qualityPicked);
-                    if (qualityPicked) break;
-                  }
-                  await page.waitForTimeout(2000);
+                for (const frame of page.frames()) {
+                  try {
+                    const bp = await frame.$('.mgp_bigPlay, .mgp_smallPlay');
+                    if (bp) await bp.click({ timeout: 1500, force: true }).catch(() => {});
+                    await frame.evaluate(() => document.querySelectorAll('video').forEach(v => { v.muted = true; v.play().catch(() => {}); }));
+                  } catch (e) {}
                 }
-                if (!qualityPicked) {
-                  qualityPicked = await trySelectQualityGeneric();
-                  console.log('  Generic quality select:', qualityPicked);
-                }
+                for (let s = 0; s < 45 && m3u8Seen.size === 0; s++) await page.waitForTimeout(1000);
+                await page.waitForTimeout(3000);
 
-                // آنچه تا اینجا (قبل از انتخاب کیفیت) ثبت شده نادیده گرفته شود
-                if (qualityPicked && cands.size > 0) {
-                  console.log(`  Clearing ${cands.size} candidate(s) captured before quality selection`);
-                  cands.clear();
-                }
-
-                // مرحله ۲: حالا پخش
-                const clickBigPlay = async () => {
-                  for (const frame of page.frames()) {
-                    try {
-                      const bp = await frame.$('.mgp_bigPlay, .mgp_smallPlay, .mgp_playbackBtn');
-                      if (bp) { await bp.click({ timeout: 1500, force: true }).catch(() => {}); }
-                    } catch (e) {}
-                  }
-                };
-                await clickBigPlay();
-                await tryPlay();
-
-                const maxWait = 90;
-                let lastCount = -1, stable = 0;
-                for (let s = 0; s < maxWait; s++) {
-                  await page.waitForTimeout(1000);
-                  if (s % 3 === 0) await trySkipAd();
-                  if (s % 4 === 0) await readFromDom();
-                  if (s % 10 === 9) { await clickBigPlay(); await tryPlay(); }
-
-                  // اگر پلیر بعد از پخش خودش کیفیت را عوض کرد، دوباره هدف را بگذار
-                  if (s === 15 || s === 35) {
-                    const cur = await Promise.all(page.frames().map(f =>
-                      f.evaluate(() => ((document.querySelector('.mgp_quality-btn-text') || {}).textContent || '').trim()).catch(() => '')
-                    )).then(r => r.find(Boolean) || '');
-                    if (cur && parseInt(cur, 10) !== QUALITY) {
-                      console.log('  Player quality is', cur, '- re-selecting');
-                      await trySelectQuality();
-                    }
-                  }
-
-                  if (cands.size > 0) {
-                    if (cands.size === lastCount) stable++; else { stable = 0; lastCount = cands.size; }
-                    if (s >= 30 && stable >= 12) break;
-                  }
-                }
-                await readFromDom();
-
-                if (cands.size === 0) {
-                  for (const frame of page.frames()) {
-                    try {
-                      const html = (await frame.content()).replace(/\\\//g, '/').replace(/\\u0026/g, '&');
-                      const m = html.match(/https?:\/\/[^"'\s<>\\]+\.(?:mp4|m3u8|webm|mkv|mov|m4v|vid)[^"'\s<>\\]*/gi) || [];
-                      m.forEach(s => add(s, 'html'));
-                    } catch (e) {}
-                  }
-                }
-
-                if (cands.size === 0) {
+                if (m3u8Seen.size === 0) {
                   console.log('  No video URL found.');
-                  const text = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 500) : '').catch(() => '');
-                  console.log('  Page text start:\n' + text);
                   console.log('  Frames:', page.frames().map(f => f.url()).join(' | '));
                   fs.mkdirSync('debug', { recursive: true });
                   await page.screenshot({ path: `debug/page_${i + 1}.png`, fullPage: true }).catch(() => {});
@@ -545,153 +326,14 @@ jobs:
                   continue;
                 }
 
-                const entries = [];
-                const entryUrls = new Set();
-                const pushEntry = (e) => { if (!entryUrls.has(e.url)) { entryUrls.add(e.url); entries.push(e); } };
-
-                for (const [url, info] of cands) {
-                  if (info.type === 'hls') {
-                    const text = await fetchText(ctx, url, pageUrl);
-                    if (text.includes('#EXT-X-STREAM-INF')) {
-                      const vars = parseMaster(text, url);
-                      console.log(`  Master playlist: ${url}\n    variants: ${vars.map(v => (v.height || '?') + 'p').join(', ')}`);
-                      vars.forEach(v => pushEntry({ type: 'hls', url: v.url, audio: v.audio, height: v.height, why: 'master', order: info.order, master: url }));
-                    } else {
-                      pushEntry({ type: 'hls', url, audio: null, height: qualityFromUrl(url), why: info.why, order: info.order });
-                    }
-                  } else {
-                    pushEntry({ type: 'file', url, audio: null, height: qualityFromUrl(url), why: info.why, order: info.order });
-                  }
-                }
-
-                // اگر کیفیت هدف نیست: master playlist را از روی لینک‌های m3u8 حدس بزن
-                if (!entries.some(e => e.height === QUALITY)) {
-                  const hlsUrls = Array.from(cands.entries()).filter(([u, inf]) => inf.type === 'hls').map(([u]) => u);
-                  console.log('  HLS URLs seen:\n    ' + (hlsUrls.join('\n    ') || '(none)'));
-                  const guesses = new Set();
-                  for (const u of hlsUrls) {
-                    const x = new URL(u);
-                    const dir = x.pathname.slice(0, x.pathname.lastIndexOf('/') + 1);
-                    const parent = dir.replace(/[^\/]+\/$/, '');
-                    for (const d of [dir, parent]) {
-                      for (const n of ['master.m3u8', 'index.m3u8', 'playlist.m3u8', 'hls.m3u8']) {
-                        const g = new URL(x.href); g.pathname = d + n;
-                        if (g.href !== u) guesses.add(g.href);
-                      }
-                    }
-                    const base = x.pathname.slice(x.pathname.lastIndexOf('/') + 1);
-                    const swapped = base.replace(/(144|240|360|480|720|1080)/, String(QUALITY));
-                    if (swapped !== base) {
-                      const g = new URL(x.href); g.pathname = dir + swapped;
-                      guesses.add(g.href);
-                    }
-                    const dirSwapped = dir.replace(/(144|240|360|480|720|1080)/, String(QUALITY));
-                    if (dirSwapped !== dir) {
-                      const g = new URL(x.href); g.pathname = dirSwapped + base;
-                      guesses.add(g.href);
-                    }
-                  }
-                  for (const g of guesses) {
-                    const text = await fetchText(ctx, g, pageUrl);
-                    if (!text.startsWith('#EXTM3U')) continue;
-                    console.log('  Valid playlist guessed:', g);
-                    if (text.includes('#EXT-X-STREAM-INF')) {
-                      const vars = parseMaster(text, g);
-                      console.log('    variants: ' + vars.map(v => (v.height || '?') + 'p').join(', '));
-                      vars.forEach(v => pushEntry({ type: 'hls', url: v.url, audio: v.audio, height: v.height, why: 'guessed-master', order: 0 }));
-                    } else {
-                      pushEntry({ type: 'hls', url: g, audio: null, height: QUALITY, why: 'guessed-variant', order: 0 });
-                    }
-                  }
-                }
-
-                // اگر کیفیت هدف پیدا نشد، آدرس آن را از روی کیفیت دیگر بساز و امتحان کن
-                if (!entries.some(e => e.height === QUALITY)) {
-                  const BITRATES = ['500K', '600K', '700K', '800K', '900K', '1000K', '1200K', '1500K', '1800K', '2000K', '2500K', '3000K', '4000K'];
-                  const bases = entries.filter(e => e.type === 'file' && /(^|\/)\d{3,4}P_\d+K_/i.test(e.url));
-                  for (const b of bases) {
-                    const u = new URL(b.url);
-                    const dir = u.pathname.slice(0, u.pathname.lastIndexOf('/') + 1);
-                    const base = decodeURIComponent(path.basename(u.pathname));
-                    const mm = base.match(/^(\d{3,4})P_(\d+K)_(.+)$/i);
-                    if (!mm) continue;
-                    const tail = mm[3];
-                    const tried = [];
-                    const order2 = [mm[2].toUpperCase(), ...BITRATES.filter(x => x !== mm[2].toUpperCase())];
-                    console.log(`  Probing ${QUALITY}P variants based on: ${base}`);
-                    let foundUrl = null;
-                    for (const br of order2) {
-                      const nu = new URL(b.url);
-                      nu.pathname = dir + `${QUALITY}P_${br}_${tail}`;
-                      const cand = nu.href;
-                      const sz = await probeSize(ctx, cand, pageUrl);
-                      tried.push(`${QUALITY}P_${br} -> ${sz}`);
-                      if (sz > MIN_SIZE) { foundUrl = cand; break; }
-                    }
-                    console.log('    ' + tried.join(' | '));
-                    if (foundUrl) {
-                      console.log('  Guessed URL works:', foundUrl);
-                      pushEntry({ type: 'file', url: foundUrl, audio: null, height: QUALITY, why: 'guessed', order: b.order });
-                      break;
-                    } else {
-                      console.log('  No guessed URL worked (token may be tied to file name).');
-                    }
-                  }
-                }
-
-                const list = [];
-                for (const e of entries) {
-                  let score = 0, size = 0, dur = 0;
-                  const host = hostOf(e.url);
-                  if (AD_RE.test(e.url)) score -= 100;
-                  if (host === pageHost || host.endsWith('.' + pageHost.replace(/^www\./, ''))) score += 20;
-
-                  if (e.height === 0 || e.height === QUALITY) {
-                    const p = probeMedia(e.url, pageUrl);
-                    if (e.height === 0) e.height = p.height;
-                    dur = p.dur;
-                  }
-                  if (e.type === 'file') size = await probeSize(ctx, e.url, pageUrl);
-
-                  if (e.height === QUALITY) score += 200;
-                  else if (e.height > 0) score -= Math.min(100, Math.floor(Math.abs(e.height - QUALITY) / 5));
-
-                  if (e.type === 'file') {
-                    if (size >= BIG_SIZE) score += 50;
-                    else if (size > 0 && size < 5 * 1024 * 1024) score -= 30;
-                    score += Math.min(60, Math.floor(size / (50 * 1024 * 1024)) * 10);
-                  } else {
-                    if (dur >= 120) score += 50;
-                    else if (dur > 0 && dur < 60) score -= 30;
-                    score += Math.min(60, Math.floor(dur / 300) * 10);
-                  }
-                  list.push({ ...e, score, size, dur });
-                }
-                list.sort((a, b) => b.score - a.score || b.size - a.size || b.dur - a.dur || b.order - a.order);
-
-                console.log('  --- Candidates (best first) ---');
-                list.forEach((c, n) => console.log(`  #${n + 1} score=${c.score} type=${c.type} height=${c.height || '?'} size=${c.size} dur=${c.dur.toFixed(0)}s why=${c.why}\n      ${c.url}`));
-
-                if (!list.some(c => c.height === QUALITY)) {
-                  console.log(`  WARNING: ${QUALITY}p not found, nearest quality will be used.`);
-                }
-
+                // ترجیح لینکی که کیفیتش در آدرس همان هدف است
+                const seen = Array.from(m3u8Seen.keys());
+                seen.sort((a, b) => (qualityFromUrl(b) === QUALITY) - (qualityFromUrl(a) === QUALITY));
                 let done = false;
-                let k = 0;
-                for (const c of list) {
-                  k++;
-                  console.log(`  Downloading #${k} (${c.height || '?'}p):`, c.url);
-                  if (c.type === 'file') {
-                    const out = path.join('downloads', fileNameFrom(c.url, i + 1, k));
-                    if (await downloadDirect(ctx, c.url, pageUrl, out)) { done = true; break; }
-                  } else {
-                    const out = path.join('downloads', `${pageId(pageUrl, i + 1)}_${c.height || 'x'}p.mp4`);
-                    if (downloadHls(c.url, c.audio, pageUrl, out)) { done = true; break; }
-                  }
+                for (const u of seen) {
+                  if (await downloadFromPlaylist(ctx, u, pageUrl, `video_${i + 1}`)) { done = true; break; }
                 }
-
-                if (done) success++;
-                else console.log('  All candidates failed.');
+                if (done) success++; else console.log('  All candidates failed.');
               } catch (e) {
                 console.log('  Error:', e.message);
               }
@@ -738,7 +380,7 @@ jobs:
         if: steps.clean.outputs.has_files == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: pg-${{ github.run_number }}
+          tag_name: ph-${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
