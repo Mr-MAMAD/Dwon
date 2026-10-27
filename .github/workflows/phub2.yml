@@ -95,7 +95,6 @@ jobs:
             return `Referer: ${referer}\r\nOrigin: ${origin}\r\n`;
           }
 
-          // کیفیت از روی آدرس (مثلاً 480p یا _480_)
           function qualityFromUrl(u) {
             const m = u.match(/(?:^|[\/_.\-=])(144|240|360|480|540|720|1080|1440|2160)p?(?:[\/_.\-?&]|$)/i);
             return m ? parseInt(m[1], 10) : 0;
@@ -109,7 +108,6 @@ jobs:
             } catch (e) { return ''; }
           }
 
-          // تحلیل master playlist
           function parseMaster(text, base) {
             const lines = text.split(/\r?\n/);
             const audios = {};
@@ -138,7 +136,6 @@ jobs:
             return vars;
           }
 
-          // ارتفاع و مدت با ffprobe
           function probeMedia(url, referer) {
             try {
               const r = spawnSync('ffprobe', [
@@ -320,7 +317,6 @@ jobs:
                   }
                 };
 
-                // انتخاب کیفیت از منوی پلیر
                 const trySelectQuality = async () => {
                   const menuSels = [
                     '.jw-icon-settings', '.jw-settings-quality', '.vjs-menu-button', '.vjs-quality-selector',
@@ -345,7 +341,6 @@ jobs:
                         }
                       } catch (e) {}
                     }
-                    // گاهی گزینه‌ها بدون منو نمایان‌اند
                     try {
                       const opt = frame.getByText(re).first();
                       if (await opt.isVisible({ timeout: 300 }).catch(() => false)) {
@@ -400,7 +395,6 @@ jobs:
                   continue;
                 }
 
-                // ساخت لیست نهایی (master playlist به کیفیت‌هایش باز می‌شود)
                 const entries = [];
                 const entryUrls = new Set();
                 const pushEntry = (e) => { if (!entryUrls.has(e.url)) { entryUrls.add(e.url); entries.push(e); } };
@@ -420,7 +414,6 @@ jobs:
                   }
                 }
 
-                // امتیازدهی
                 const list = [];
                 for (const e of entries) {
                   let score = 0, size = 0, dur = 0;
@@ -428,7 +421,6 @@ jobs:
                   if (AD_RE.test(e.url)) score -= 100;
                   if (host === pageHost || host.endsWith('.' + pageHost.replace(/^www\./, ''))) score += 20;
 
-                  // ارتفاع نامشخص یا برابر هدف => با ffprobe دقیق‌تر بررسی کن
                   if (e.height === 0 || e.height === QUALITY) {
                     const p = probeMedia(e.url, pageUrl);
                     if (e.height === 0) e.height = p.height;
@@ -466,4 +458,68 @@ jobs:
                   console.log(`  Downloading #${k} (${c.height || '?'}p):`, c.url);
                   if (c.type === 'file') {
                     const out = path.join('downloads', fileNameFrom(c.url, i + 1, k));
-                    if (await downloadDirect(ctx,
+                    if (await downloadDirect(ctx, c.url, pageUrl, out)) { done = true; break; }
+                  } else {
+                    const out = path.join('downloads', `${pageId(pageUrl, i + 1)}_${c.height || 'x'}p.mp4`);
+                    if (downloadHls(c.url, c.audio, pageUrl, out)) { done = true; break; }
+                  }
+                }
+
+                if (done) success++;
+                else console.log('  All candidates failed.');
+              } catch (e) {
+                console.log('  Error:', e.message);
+              }
+              await ctx.close();
+            }
+
+            await browser.close();
+            console.log(`\nSuccess: ${success} / ${urls.length}`);
+            process.exit(success > 0 ? 0 : 1);
+          })();
+          EOF
+
+      - name: Find and download
+        id: grab
+        continue-on-error: true
+        env:
+          URLS: ${{ github.event.inputs.urls }}
+          QUALITY: ${{ github.event.inputs.quality }}
+        run: node grab.js
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
+          if-no-files-found: ignore
+
+      - name: Clean empty files
+        id: clean
+        if: always()
+        run: |
+          mkdir -p downloads
+          find downloads -type f -size -1c -print -delete
+          find downloads -type f -size -100k -print -delete
+          ls -lh downloads/ || true
+          if [ -n "$(find downloads -type f | head -1)" ]; then
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Release
+        if: steps.clean.outputs.has_files == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: asia-${{ github.run_number }}
+          files: downloads/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail if nothing downloaded
+        if: steps.clean.outputs.has_files != 'true'
+        run: |
+          echo "No valid file was downloaded."
+          exit 1
