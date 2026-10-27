@@ -1,4 +1,4 @@
-name: phub2 Downloader (Find Video)
+name: "phub2 download"
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       urls:
         description: 'Page URLs (space or newline separated)'
         required: true
-        default: 'https://vidara.so/v/cpbnwULfofbCA'
+        default: 'https://playmogo.com/d/nbefeblvoesi'
         type: string
       quality:
         description: 'Preferred quality (height), e.g. 240 / 480 / 720'
@@ -98,13 +98,10 @@ jobs:
           function qualityFromUrl(u) {
             let name = '';
             try { name = decodeURIComponent(path.basename(new URL(u).pathname)); } catch (e) { name = u; }
-            // 480P_1000K_123.mp4  یا  480p_...
             let m = name.match(/^(\d{3,4})p[_\-.]/i);
             if (m) return parseInt(m[1], 10);
-            // ..._480p_... یا ..._480P.
             m = name.match(/[_\-.](\d{3,4})p(?:[_\-.]|$)/i);
             if (m) return parseInt(m[1], 10);
-            // مسیر مثل /480p/ یا /480/
             m = u.match(/(?:^|[\/_.\-=])(144|240|360|480|540|720|1080|1440|2160)p?(?:[\/_.\-?&]|$)/i);
             return m ? parseInt(m[1], 10) : 0;
           }
@@ -326,56 +323,155 @@ jobs:
                   }
                 };
 
-                const trySelectQuality = async () => {
-                  const menuSels = [
-                    '.jw-icon-settings', '.jw-settings-quality', '.vjs-menu-button', '.vjs-quality-selector',
-                    '.plyr__control[data-plyr="settings"]', '[class*="quality" i]', '[class*="setting" i]',
-                    '[class*="gear" i]', '[class*="resolution" i]', '[class*="menu" i]',
-                    '[aria-label*="Settings" i]', '[aria-label*="Quality" i]', '[title*="Quality" i]',
-                    '[title*="Settings" i]', 'button svg', 'video'
-                  ];
-                  const re = new RegExp(`(^|\\D)${QUALITY}\\s*p?(\\D|$)`, 'i');
+                // روش عمومی انتخاب کیفیت (برای پلیرهای ناشناخته)
+                const trySelectQualityGeneric = async () => {
+                  const re = new RegExp(`^\\s*${QUALITY}\\s*p?\\s*$|(^|\\D)${QUALITY}\\s*p(\\D|$)`, 'i');
+
+                  const clickOption = async (frame) => {
+                    try {
+                      const opt = frame.getByText(re).first();
+                      if (await opt.isVisible({ timeout: 400 }).catch(() => false)) {
+                        console.log(`  Clicking ${QUALITY}p option`);
+                        await opt.click({ timeout: 2000, force: true }).catch(() => {});
+                        await page.waitForTimeout(2500);
+                        return true;
+                      }
+                    } catch (e) {}
+                    return false;
+                  };
+
                   for (const frame of page.frames()) {
+                    if (await clickOption(frame)) return true;
+
+                    const menuSels = [
+                      '.jw-icon-settings', '.jw-settings-quality', '.vjs-quality-selector',
+                      '.vjs-menu-button', '.plyr__control[data-plyr="settings"]',
+                      '[class*="quality" i]', '[class*="setting" i]', '[class*="gear" i]',
+                      '[class*="resolution" i]', '[aria-label*="Settings" i]',
+                      '[aria-label*="Quality" i]', '[title*="Quality" i]', '[title*="Settings" i]'
+                    ];
                     for (const s of menuSels) {
                       try {
-                        const el = await frame.$(s);
-                        if (el && await el.isVisible().catch(() => false)) {
+                        const els = await frame.$$(s);
+                        for (const el of els.slice(0, 3)) {
+                          if (!(await el.isVisible().catch(() => false))) continue;
                           await el.click({ timeout: 1000, force: true }).catch(() => {});
-                          await page.waitForTimeout(500);
-                          const opt = frame.getByText(re).first();
-                          if (await opt.isVisible({ timeout: 500 }).catch(() => false)) {
-                            console.log(`  Selecting ${QUALITY}p in player menu (${s})`);
-                            await opt.click({ timeout: 1500, force: true }).catch(() => {});
-                            await page.waitForTimeout(1500);
-                            return true;
-                          }
+                          await page.waitForTimeout(600);
+                          if (await clickOption(frame)) { console.log(`  (menu: ${s})`); return true; }
                         }
                       } catch (e) {}
                     }
+
                     try {
-                      const opt = frame.getByText(re).first();
-                      if (await opt.isVisible({ timeout: 300 }).catch(() => false)) {
-                        console.log(`  Clicking visible ${QUALITY}p option`);
-                        await opt.click({ timeout: 1500, force: true }).catch(() => {});
-                        await page.waitForTimeout(1500);
-                        return true;
+                      const v = await frame.$('video');
+                      if (v) {
+                        const box = await v.boundingBox();
+                        if (box) {
+                          await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+                          await page.waitForTimeout(500);
+                          const ctrls = await frame.$$('button, [role="button"], [class*="icon" i], [class*="btn" i]');
+                          for (const c of ctrls.slice(0, 40)) {
+                            const b = await c.boundingBox().catch(() => null);
+                            if (!b || b.y < box.y + box.height * 0.6) continue;
+                            await c.click({ timeout: 800, force: true }).catch(() => {});
+                            await page.waitForTimeout(400);
+                            if (await clickOption(frame)) { console.log('  (menu: bottom control bar)'); return true; }
+                          }
+                        }
                       }
+                    } catch (e) {}
+                  }
+
+                  for (const frame of page.frames()) {
+                    try {
+                      const t = await frame.evaluate(() => Array.from(document.querySelectorAll('*'))
+                        .filter(e => e.children.length === 0 && /\d{3,4}\s*p/i.test(e.textContent || ''))
+                        .map(e => `${e.tagName}.${(e.className || '').toString().slice(0, 40)}="${(e.textContent || '').trim().slice(0, 20)}"`)
+                        .slice(0, 10));
+                      if (t.length) console.log('  Quality-like elements in', frame.url().slice(0, 60), ':', t.join(' | '));
                     } catch (e) {}
                   }
                   return false;
                 };
 
+                // انتخاب کیفیت مخصوص پلیر mgp_
+                const trySelectQuality = async () => {
+                  for (const frame of page.frames()) {
+                    try {
+                      const isMgp = await frame.evaluate(() => !!document.querySelector('[class*="mgp_"]'));
+                      if (!isMgp) continue;
+
+                      const area = await frame.$('.mgp_videoWrapper, .mgp_eventCatcher');
+                      if (area) {
+                        const b = await area.boundingBox();
+                        if (b) await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
+                      }
+                      await page.waitForTimeout(500);
+
+                      const res = await frame.evaluate(async (q) => {
+                        const sleep = ms => new Promise(r => setTimeout(r, ms));
+                        const cur = () => ((document.querySelector('.mgp_quality-btn-text') || {}).textContent || '').trim();
+                        const items = () => Array.from(document.querySelectorAll('.mgp_settings-menu-quality-item'));
+                        const find = () => items().find(it => new RegExp('^\\s*' + q + '(\\D|$)').test((it.textContent || '').trim()));
+                        const fire = (el) => ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']
+                          .forEach(t => el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })));
+
+                        if (parseInt(cur(), 10) === q) return { ok: true, already: true, cur: cur() };
+
+                        const qb = document.querySelector('.mgp_btn-quality');
+                        if (qb) { fire(qb); await sleep(700); }
+                        let it = find();
+
+                        if (!it) {
+                          const gear = document.querySelector('.mgp_btn-settings');
+                          if (gear) {
+                            fire(gear); await sleep(700);
+                            const row = Array.from(document.querySelectorAll('.mgp_settings-menu-page-row'))
+                              .find(r => /quality/i.test(r.textContent || ''));
+                            if (row) { fire(row); await sleep(700); }
+                            it = find();
+                          }
+                        }
+
+                        if (!it) return { ok: false, cur: cur(), items: items().map(i => (i.textContent || '').trim()) };
+                        fire(it.querySelector('.mgp_settings-menu-page-row-right') || it);
+                        await sleep(2500);
+                        return { ok: parseInt(cur(), 10) === q, cur: cur() };
+                      }, QUALITY);
+
+                      console.log('  mgp quality result:', JSON.stringify(res));
+                      if (res.ok) { await page.waitForTimeout(4000); return true; }
+
+                      const loc = frame.locator('.mgp_settings-menu-quality-item')
+                        .filter({ hasText: new RegExp('^\\s*' + QUALITY + '(\\D|$)') }).first();
+                      if (await loc.count()) {
+                        await loc.click({ force: true, timeout: 2000 }).catch(() => {});
+                        await page.waitForTimeout(4000);
+                        const now = await frame.evaluate(() => ((document.querySelector('.mgp_quality-btn-text') || {}).textContent || '').trim());
+                        console.log('  mgp quality after real click:', now);
+                        if (parseInt(now, 10) === QUALITY) return true;
+                      }
+                    } catch (e) { console.log('  mgp quality error:', e.message); }
+                  }
+                  return await trySelectQualityGeneric();
+                };
+
                 await readFromDom();
                 await tryPlay();
 
-                const maxWait = 60;
+                const maxWait = 90;
                 let lastCount = -1, stable = 0;
+                let qualityPicked = false;
                 for (let s = 0; s < maxWait; s++) {
                   await page.waitForTimeout(1000);
                   if (s % 3 === 0) await trySkipAd();
                   if (s % 4 === 0) await readFromDom();
                   if (s % 10 === 9) await tryPlay();
-                  if (s === 12 || s === 28) { await trySelectQuality(); await readFromDom(); }
+                  if (!qualityPicked && (s === 6 || s === 14 || s === 22 || s === 32 || s === 44 || s === 60)) {
+                    qualityPicked = await trySelectQuality();
+                    await page.waitForTimeout(1500);
+                    await readFromDom();
+                  }
 
                   if (cands.size > 0) {
                     if (cands.size === lastCount) stable++; else { stable = 0; lastCount = cands.size; }
