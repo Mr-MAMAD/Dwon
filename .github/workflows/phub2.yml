@@ -394,7 +394,7 @@ jobs:
                   return false;
                 };
 
-                // انتخاب کیفیت مخصوص پلیر mgp_
+                // انتخاب کیفیت مخصوص پلیر mgp_ (چرخ‌دنده ← Quality ← گزینه)
                 const trySelectQuality = async () => {
                   for (const frame of page.frames()) {
                     try {
@@ -418,71 +418,102 @@ jobs:
 
                         if (parseInt(cur(), 10) === q) return { ok: true, already: true, cur: cur() };
 
-                        const qb = document.querySelector('.mgp_btn-quality');
-                        if (qb) { fire(qb); await sleep(700); }
-                        let it = find();
+                        // مسیر اصلی: چرخ‌دنده ← Quality ← گزینه
+                        let it = null;
+                        const gear = document.querySelector('.mgp_btn-settings');
+                        if (gear) {
+                          fire(gear); await sleep(800);
+                          const row = Array.from(document.querySelectorAll('.mgp_settings-menu-page-row'))
+                            .find(r => /quality/i.test((r.querySelector('.mgp_settings-menu-page-row-left') || r).textContent || ''));
+                          if (row) { fire(row); await sleep(800); }
+                          it = find();
+                        }
 
+                        // مسیر جایگزین: دکمه‌ی کیفیت کنار چرخ‌دنده
                         if (!it) {
-                          const gear = document.querySelector('.mgp_btn-settings');
-                          if (gear) {
-                            fire(gear); await sleep(700);
-                            const row = Array.from(document.querySelectorAll('.mgp_settings-menu-page-row'))
-                              .find(r => /quality/i.test(r.textContent || ''));
-                            if (row) { fire(row); await sleep(700); }
-                            it = find();
-                          }
+                          const qb = document.querySelector('.mgp_btn-quality');
+                          if (qb) { fire(qb); await sleep(800); }
+                          it = find();
                         }
 
                         if (!it) return { ok: false, cur: cur(), items: items().map(i => (i.textContent || '').trim()) };
                         fire(it.querySelector('.mgp_settings-menu-page-row-right') || it);
-                        await sleep(2500);
+                        await sleep(1500);
                         return { ok: parseInt(cur(), 10) === q, cur: cur() };
                       }, QUALITY);
 
                       console.log('  mgp quality result:', JSON.stringify(res));
-                      if (res.ok) {
-                        await frame.evaluate(() => {
-                          document.querySelectorAll('video').forEach(v => {
-                            try {
-                              v.muted = true;
-                              v.currentTime = Math.min((v.duration || 60) - 5, (v.currentTime || 0) + 30);
-                              v.play().catch(() => {});
-                            } catch (e) {}
-                          });
-                        }).catch(() => {});
-                        await page.waitForTimeout(6000);
-                        return true;
-                      }
+                      if (res.ok) return true;
 
                       const loc = frame.locator('.mgp_settings-menu-quality-item')
                         .filter({ hasText: new RegExp('^\\s*' + QUALITY + '(\\D|$)') }).first();
                       if (await loc.count()) {
                         await loc.click({ force: true, timeout: 2000 }).catch(() => {});
-                        await page.waitForTimeout(4000);
+                        await page.waitForTimeout(1500);
                         const now = await frame.evaluate(() => ((document.querySelector('.mgp_quality-btn-text') || {}).textContent || '').trim());
                         console.log('  mgp quality after real click:', now);
                         if (parseInt(now, 10) === QUALITY) return true;
                       }
                     } catch (e) { console.log('  mgp quality error:', e.message); }
                   }
-                  return await trySelectQualityGeneric();
+                  return false;
                 };
 
                 await readFromDom();
+
+                // مرحله ۱: اول کیفیت را در تنظیمات پلیر روی هدف بگذار (قبل از هر پخشی)
+                let qualityPicked = false;
+                for (let a = 0; a < 15 && !qualityPicked; a++) {
+                  const hasPlayer = await Promise.all(page.frames().map(f =>
+                    f.evaluate(() => !!document.querySelector('.mgp_btn-settings')).catch(() => false)
+                  )).then(r => r.some(Boolean));
+                  if (hasPlayer) {
+                    qualityPicked = await trySelectQuality();
+                    console.log(`  Quality set attempt ${a + 1}:`, qualityPicked);
+                    if (qualityPicked) break;
+                  }
+                  await page.waitForTimeout(2000);
+                }
+                if (!qualityPicked) {
+                  qualityPicked = await trySelectQualityGeneric();
+                  console.log('  Generic quality select:', qualityPicked);
+                }
+
+                // آنچه تا اینجا (قبل از انتخاب کیفیت) ثبت شده نادیده گرفته شود
+                if (qualityPicked && cands.size > 0) {
+                  console.log(`  Clearing ${cands.size} candidate(s) captured before quality selection`);
+                  cands.clear();
+                }
+
+                // مرحله ۲: حالا پخش
+                const clickBigPlay = async () => {
+                  for (const frame of page.frames()) {
+                    try {
+                      const bp = await frame.$('.mgp_bigPlay, .mgp_smallPlay, .mgp_playbackBtn');
+                      if (bp) { await bp.click({ timeout: 1500, force: true }).catch(() => {}); }
+                    } catch (e) {}
+                  }
+                };
+                await clickBigPlay();
                 await tryPlay();
 
                 const maxWait = 90;
                 let lastCount = -1, stable = 0;
-                let qualityPicked = false;
                 for (let s = 0; s < maxWait; s++) {
                   await page.waitForTimeout(1000);
                   if (s % 3 === 0) await trySkipAd();
                   if (s % 4 === 0) await readFromDom();
-                  if (s % 10 === 9) await tryPlay();
-                  if (!qualityPicked && (s === 6 || s === 14 || s === 22 || s === 32 || s === 44 || s === 60)) {
-                    qualityPicked = await trySelectQuality();
-                    await page.waitForTimeout(1500);
-                    await readFromDom();
+                  if (s % 10 === 9) { await clickBigPlay(); await tryPlay(); }
+
+                  // اگر پلیر بعد از پخش خودش کیفیت را عوض کرد، دوباره هدف را بگذار
+                  if (s === 15 || s === 35) {
+                    const cur = await Promise.all(page.frames().map(f =>
+                      f.evaluate(() => ((document.querySelector('.mgp_quality-btn-text') || {}).textContent || '').trim()).catch(() => '')
+                    )).then(r => r.find(Boolean) || '');
+                    if (cur && parseInt(cur, 10) !== QUALITY) {
+                      console.log('  Player quality is', cur, '- re-selecting');
+                      await trySelectQuality();
+                    }
                   }
 
                   if (cands.size > 0) {
@@ -707,7 +738,7 @@ jobs:
         if: steps.clean.outputs.has_files == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ph-${{ github.run_number }}
+          tag_name: pg-${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
