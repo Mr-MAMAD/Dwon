@@ -1,4 +1,4 @@
-name: Dood Downloader (Find Video)
+name: phub Downloader (Find Video)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       urls:
         description: 'Page URLs (space or newline separated)'
         required: true
-        default: 'https://playmogo.com/d/nbefeblvoesi'
+        default: 'https://vidara.so/v/cpbnwULfofbCA'
         type: string
 
 jobs:
@@ -39,9 +39,12 @@ jobs:
 
           const FILE_RE = /\.(mp4|webm|mkv|mov|m4v|vid)(\?|#|$)/i;
           const HLS_RE = /\.m3u8(\?|#|$)/i;
+          const AD_RE = /(doubleclick|googlesyndication|googleads|exoclick|exosrv|adsco|adserver|adsystem|adnxs|popads|popcash|propeller|juicyads|trafficjunky|vast|vpaid|\/ads?\/|[\/_.-]ads?[\/_.-]|advert|banner|preroll|pre-roll|promo|sponsor|clickadu|hilltopads|adcash|ero-advertising|tsyndicate|syndication)/i;
           const urls = (process.env.URLS || '').split(/\s+/).filter(u => /^https?:\/\//.test(u));
           const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
           const MIN_SIZE = 102400;
+          // ویدیوی کمتر از این اندازه معمولاً تبلیغ است (فقط برای امتیازدهی، نه حذف قطعی)
+          const BIG_SIZE = 20 * 1024 * 1024;
 
           function pageId(u, i) {
             try {
@@ -56,6 +59,24 @@ jobs:
               if (n && FILE_RE.test(n)) return n;
             } catch (e) {}
             return `video_${i}_${k}.mp4`;
+          }
+
+          function hostOf(u) { try { return new URL(u).hostname; } catch (e) { return ''; } }
+
+          // اندازه‌ی فایل از روی Range / HEAD
+          async function probeSize(ctx, url, referer) {
+            try {
+              const r = await ctx.request.get(url, {
+                headers: { Referer: referer, Range: 'bytes=0-0', Accept: '*/*' },
+                maxRedirects: 10,
+                timeout: 20000
+              });
+              const cr = r.headers()['content-range'];
+              if (cr && /\/(\d+)$/.test(cr)) return parseInt(cr.match(/\/(\d+)$/)[1], 10);
+              const cl = r.headers()['content-length'];
+              if (cl && r.status() === 200) return parseInt(cl, 10);
+            } catch (e) {}
+            return 0;
           }
 
           async function downloadDirect(ctx, url, referer, out) {
@@ -98,11 +119,19 @@ jobs:
             return true;
           }
 
-          const CLICK_TEXTS = [
-            'Create Download Link', 'Generate Download Link', 'Generate Link', 'Get Download Link',
-            'Get Link', 'Download Now', 'Free Download', 'Fast Download', 'Direct Download',
-            'Download', 'Continue', 'Proceed', 'Verify', 'I am not a robot', 'Click here'
-          ];
+          // مدت زمان HLS با ffprobe (برای تشخیص تبلیغ کوتاه از ویدیوی اصلی)
+          function hlsDuration(url, referer) {
+            try {
+              const origin = new URL(referer).origin;
+              const r = spawnSync('ffprobe', [
+                '-v', 'error', '-user_agent', UA,
+                '-headers', `Referer: ${referer}\r\nOrigin: ${origin}\r\n`,
+                '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', url
+              ], { encoding: 'utf8', timeout: 60000 });
+              const d = parseFloat((r.stdout || '').trim());
+              return isNaN(d) ? 0 : d;
+            } catch (e) { return 0; }
+          }
 
           (async () => {
             const browser = await chromium.launch({
@@ -113,59 +142,40 @@ jobs:
 
             for (let i = 0; i < urls.length; i++) {
               const pageUrl = urls[i];
+              const pageHost = hostOf(pageUrl);
               console.log(`\n[${i + 1}] ${pageUrl}`);
               const ctx = await browser.newContext({
                 userAgent: UA,
                 viewport: { width: 1280, height: 720 },
-                locale: 'en-US',
-                acceptDownloads: true
+                locale: 'en-US'
               });
               await ctx.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
               });
 
               try {
-                const direct = [];
-                const hls = [];
-                const seen = new Set();
-                let browserDownloaded = false;
+                // کاندیدها: url -> { type, why, order }
+                const cands = new Map();
+                let order = 0;
 
                 const add = (u, why) => {
-                  if (!u || seen.has(u) || !/^https?:/i.test(u)) return;
-                  if (HLS_RE.test(u)) { seen.add(u); hls.push(u); console.log(`  Found HLS (${why}):`, u); }
-                  else if (FILE_RE.test(u)) { seen.add(u); direct.push(u); console.log(`  Found file (${why}):`, u); }
+                  if (!u || !/^https?:/i.test(u)) return;
+                  const clean = u.replace(/#\.mp4$/, '');
+                  if (cands.has(clean)) return;
+                  let type = null;
+                  if (HLS_RE.test(clean)) type = 'hls';
+                  else if (FILE_RE.test(clean) || why === 'content-type') type = 'file';
+                  if (!type) return;
+                  cands.set(clean, { type, why, order: order++ });
+                  console.log(`  Found ${type} (${why}):`, clean);
                 };
 
                 const page = await ctx.newPage();
 
-                // دانلود شروع‌شده توسط مرورگر (بعد از کلیک روی دکمه)
-                const attachDownloadHandler = (p) => {
-                  p.on('download', async (dl) => {
-                    try {
-                      let name = dl.suggestedFilename() || `video_${i + 1}.mp4`;
-                      name = name.replace(/[\\/:*?"<>|]/g, '_');
-                      const out = path.join('downloads', name);
-                      console.log('  Browser download started:', dl.url());
-                      await dl.saveAs(out);
-                      const size = fs.existsSync(out) ? fs.statSync(out).size : 0;
-                      if (size >= MIN_SIZE) {
-                        console.log(`  OK (browser download): ${out} (${size} bytes)`);
-                        browserDownloaded = true;
-                      } else {
-                        console.log('  Browser download too small:', size);
-                        if (fs.existsSync(out)) fs.unlinkSync(out);
-                      }
-                    } catch (e) { console.log('  Download error:', e.message); }
-                  });
-                };
-                attachDownloadHandler(page);
-
-                // پاپ‌آپ‌ها: بستن (به‌جز وقتی دانلود دارند)
+                // پاپ‌آپ‌ها بسته می‌شوند
                 ctx.on('page', async p => {
                   if (p === page) return;
-                  attachDownloadHandler(p);
-                  p.on('request', r => add(r.url(), 'popup-request'));
-                  await p.waitForTimeout(1500).catch(() => {});
+                  await p.waitForTimeout(1000).catch(() => {});
                   console.log('  Closing popup:', p.url());
                   await p.close().catch(() => {});
                 });
@@ -173,8 +183,7 @@ jobs:
                 page.on('request', r => add(r.url(), 'request'));
                 page.on('response', r => {
                   const ct = (r.headers()['content-type'] || '').toLowerCase();
-                  const cd = (r.headers()['content-disposition'] || '').toLowerCase();
-                  if (ct.startsWith('video/') || ct.includes('octet-stream') && cd.includes('attachment')) add(r.url() + (FILE_RE.test(r.url()) ? '' : '#.mp4'), 'content-type');
+                  if (ct.startsWith('video/')) add(r.url(), 'content-type');
                   if (ct.includes('mpegurl')) add(r.url(), 'content-type');
                 });
 
@@ -195,7 +204,7 @@ jobs:
                           out.push(v.currentSrc);
                         });
                         document.querySelectorAll('meta[itemprop="contentUrl"], meta[property="og:video"], meta[property="og:video:url"]').forEach(m => out.push(m.content));
-                        document.querySelectorAll('a[download], a[href]').forEach(a => out.push(a.href));
+                        document.querySelectorAll('a[download]').forEach(a => out.push(a.href));
                         return out.filter(Boolean);
                       });
                       vals.forEach(s => { try { add(new URL(s, base).href, 'dom'); } catch (e) {} });
@@ -209,7 +218,7 @@ jobs:
                       await frame.evaluate(() => {
                         document.querySelectorAll('video').forEach(v => { v.muted = true; v.play().catch(() => {}); });
                       });
-                      for (const sel of ['.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid', '.play-button', '.play', 'video']) {
+                      for (const sel of ['.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid', '.play-button', '.play', '[class*="play" i]', 'video']) {
                         const el = await frame.$(sel);
                         if (el) await el.click({ timeout: 1500, force: true }).catch(() => {});
                       }
@@ -218,62 +227,56 @@ jobs:
                   await page.mouse.click(640, 360).catch(() => {});
                 };
 
-                // کلیک روی دکمه‌ها/لینک‌های دانلود
-                const clickedTexts = new Set();
-                const tryDownloadButtons = async () => {
-                  for (const t of CLICK_TEXTS) {
-                    for (const frame of page.frames()) {
+                // دکمه‌ی رد کردن تبلیغ
+                const trySkipAd = async () => {
+                  const sels = [
+                    '.videoAdUiSkipButton', '.ytp-ad-skip-button', '.jw-skip', '.jw-skiplink',
+                    '.vjs-skip-button', '.skip-button', '.skip_button', '#skip', '.ad-skip', '.adskip',
+                    '[class*="skip" i]', '[id*="skip" i]'
+                  ];
+                  for (const frame of page.frames()) {
+                    for (const s of sels) {
                       try {
-                        const loc = frame.locator(`a:visible, button:visible, input[type=submit]:visible, input[type=button]:visible, div[role=button]:visible`)
-                          .filter({ hasText: new RegExp(t, 'i') });
-                        const n = await loc.count();
-                        for (let j = 0; j < Math.min(n, 2); j++) {
-                          const el = loc.nth(j);
-                          const label = ((await el.innerText().catch(() => '')) || (await el.getAttribute('value').catch(() => '')) || '').trim().slice(0, 60);
-                          const key = `${t}|${label}`;
-                          if (clickedTexts.has(key) && t !== 'Download') continue;
-                          clickedTexts.add(key);
-                          console.log('  Clicking:', label || t);
-                          await el.click({ timeout: 2500, force: true }).catch(() => {});
-                          await page.waitForTimeout(2500);
-                          if (browserDownloaded) return;
+                        const el = await frame.$(s);
+                        if (el && await el.isVisible().catch(() => false)) {
+                          console.log('  Clicking skip:', s);
+                          await el.click({ timeout: 1500, force: true }).catch(() => {});
                         }
                       } catch (e) {}
                     }
+                    try {
+                      const byText = frame.getByText(/skip( ad)?|close ad|رد کردن/i).first();
+                      if (await byText.isVisible({ timeout: 300 }).catch(() => false)) {
+                        console.log('  Clicking skip (text)');
+                        await byText.click({ timeout: 1500, force: true }).catch(() => {});
+                      }
+                    } catch (e) {}
                   }
                 };
 
                 await readFromDom();
 
-                // مرحله ۱: پلیر
-                for (let t = 0; t < 2 && !browserDownloaded && direct.length + hls.length === 0; t++) {
-                  await tryPlay();
-                  await page.waitForTimeout(3000);
-                  await readFromDom();
-                }
+                // پخش + صبر طولانی‌تر تا تبلیغ تمام شود و ویدیوی اصلی لود شود
+                await tryPlay();
+                const maxWait = 60; // ثانیه
+                let lastCount = -1, stable = 0;
+                for (let s = 0; s < maxWait; s++) {
+                  await page.waitForTimeout(1000);
+                  if (s % 3 === 0) await trySkipAd();
+                  if (s % 4 === 0) await readFromDom();
+                  if (s % 10 === 9) await tryPlay();
 
-                // مرحله ۲: دکمه‌های دانلود (چند دور، با صبر برای تایمر)
-                for (let round = 0; round < 4 && !browserDownloaded && direct.length + hls.length === 0; round++) {
-                  console.log(`  Download-button round ${round + 1}`);
-                  await tryDownloadButtons();
-                  if (browserDownloaded) break;
-                  // صبر برای تایمر (تا ۱۵ ثانیه) و بررسی ظاهر شدن لینک
-                  for (let w = 0; w < 15 && !browserDownloaded && direct.length + hls.length === 0; w++) {
-                    await page.waitForTimeout(1000);
-                    if (w % 3 === 2) await readFromDom();
+                  // اگر کاندیدی هست و مدتی چیز جدیدی نیامد، ادامه نده
+                  if (cands.size > 0) {
+                    if (cands.size === lastCount) stable++; else { stable = 0; lastCount = cands.size; }
+                    // حداقل ۲۰ ثانیه صبر، تا لینک اصلی بعد از تبلیغ هم ثبت شود
+                    if (s >= 20 && stable >= 12) break;
                   }
                 }
+                await readFromDom();
 
-                if (browserDownloaded) { success++; await ctx.close(); continue; }
-
-                // کمی صبر تا لینک‌های دیگر هم ثبت شوند
-                if (direct.length + hls.length > 0) {
-                  await page.waitForTimeout(3000);
-                  await readFromDom();
-                }
-
-                // جستجو در HTML و اسکریپت‌ها
-                if (direct.length + hls.length === 0) {
+                // جستجو در HTML
+                if (cands.size === 0) {
                   for (const frame of page.frames()) {
                     try {
                       const html = (await frame.content()).replace(/\\\//g, '/').replace(/\\u0026/g, '&');
@@ -283,11 +286,10 @@ jobs:
                   }
                 }
 
-                if (direct.length + hls.length === 0) {
+                if (cands.size === 0) {
                   console.log('  No video URL found.');
-                  const text = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 800) : '').catch(() => '');
+                  const text = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 500) : '').catch(() => '');
                   console.log('  Page text start:\n' + text);
-                  console.log('  Final page URL:', page.url());
                   console.log('  Frames:', page.frames().map(f => f.url()).join(' | '));
                   fs.mkdirSync('debug', { recursive: true });
                   await page.screenshot({ path: `debug/page_${i + 1}.png`, fullPage: true }).catch(() => {});
@@ -296,27 +298,46 @@ jobs:
                   continue;
                 }
 
-                let done = false;
+                // امتیازدهی کاندیدها
+                const list = [];
+                for (const [url, info] of cands) {
+                  let score = 0;
+                  const host = hostOf(url);
+                  if (AD_RE.test(url)) score -= 100;
+                  if (host === pageHost || host.endsWith('.' + pageHost.replace(/^www\./, ''))) score += 20;
 
-                // فایل‌های مستقیم (آدرس‌های #.mp4 که برای تشخیص اضافه شده‌اند، پاک می‌شوند)
-                let k = 0;
-                for (const raw of direct) {
-                  const target = raw.replace(/#\.mp4$/, '');
-                  k++;
-                  console.log('  Downloading file:', target);
-                  const out = path.join('downloads', fileNameFrom(target, i + 1, k));
-                  if (await downloadDirect(ctx, target, pageUrl, out)) { done = true; break; }
-                }
-
-                // استریم HLS
-                if (!done) {
-                  let h = 0;
-                  for (const target of hls) {
-                    h++;
-                    console.log('  Downloading HLS with ffmpeg:', target);
-                    const out = path.join('downloads', `${pageId(pageUrl, i + 1)}${hls.length > 1 ? '_' + h : ''}.mp4`);
-                    if (downloadHls(target, pageUrl, out)) { done = true; break; }
+                  let size = 0, dur = 0;
+                  if (info.type === 'file') {
+                    size = await probeSize(ctx, url, pageUrl);
+                    if (size >= BIG_SIZE) score += 50;
+                    else if (size > 0 && size < 5 * 1024 * 1024) score -= 30;
+                    score += Math.min(60, Math.floor(size / (50 * 1024 * 1024)) * 10);
+                  } else {
+                    dur = hlsDuration(url, pageUrl);
+                    if (dur >= 120) score += 50;
+                    else if (dur > 0 && dur < 60) score -= 30;
+                    score += Math.min(60, Math.floor(dur / 300) * 10);
                   }
+                  list.push({ url, ...info, score, size, dur });
+                }
+                list.sort((a, b) => b.score - a.score || b.size - a.size || b.dur - a.dur || b.order - a.order);
+
+                console.log('  --- Candidates (best first) ---');
+                list.forEach((c, n) => console.log(`  #${n + 1} score=${c.score} type=${c.type} size=${c.size} dur=${c.dur.toFixed(0)}s why=${c.why}\n      ${c.url}`));
+
+                let done = false;
+                let k = 0;
+                for (const c of list) {
+                  k++;
+                  console.log(`  Downloading #${k}:`, c.url);
+                  if (c.type === 'file') {
+                    const out = path.join('downloads', fileNameFrom(c.url, i + 1, k));
+                    if (await downloadDirect(ctx, c.url, pageUrl, out)) { done = true; break; }
+                  } else {
+                    const out = path.join('downloads', `${pageId(pageUrl, i + 1)}.mp4`);
+                    if (downloadHls(c.url, pageUrl, out)) { done = true; break; }
+                  }
+                  // اگر بهترین کاندید شکست خورد، سراغ بعدی می‌رویم
                 }
 
                 if (done) success++;
