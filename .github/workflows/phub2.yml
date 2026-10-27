@@ -1,4 +1,4 @@
-name: "phub2 download"
+name: "دانلود از سایت dood"
 
 on:
   workflow_dispatch:
@@ -440,7 +440,19 @@ jobs:
                       }, QUALITY);
 
                       console.log('  mgp quality result:', JSON.stringify(res));
-                      if (res.ok) { await page.waitForTimeout(4000); return true; }
+                      if (res.ok) {
+                        await frame.evaluate(() => {
+                          document.querySelectorAll('video').forEach(v => {
+                            try {
+                              v.muted = true;
+                              v.currentTime = Math.min((v.duration || 60) - 5, (v.currentTime || 0) + 30);
+                              v.play().catch(() => {});
+                            } catch (e) {}
+                          });
+                        }).catch(() => {});
+                        await page.waitForTimeout(6000);
+                        return true;
+                      }
 
                       const loc = frame.locator('.mgp_settings-menu-quality-item')
                         .filter({ hasText: new RegExp('^\\s*' + QUALITY + '(\\D|$)') }).first();
@@ -518,6 +530,47 @@ jobs:
                     }
                   } else {
                     pushEntry({ type: 'file', url, audio: null, height: qualityFromUrl(url), why: info.why, order: info.order });
+                  }
+                }
+
+                // اگر کیفیت هدف نیست: master playlist را از روی لینک‌های m3u8 حدس بزن
+                if (!entries.some(e => e.height === QUALITY)) {
+                  const hlsUrls = Array.from(cands.entries()).filter(([u, inf]) => inf.type === 'hls').map(([u]) => u);
+                  console.log('  HLS URLs seen:\n    ' + (hlsUrls.join('\n    ') || '(none)'));
+                  const guesses = new Set();
+                  for (const u of hlsUrls) {
+                    const x = new URL(u);
+                    const dir = x.pathname.slice(0, x.pathname.lastIndexOf('/') + 1);
+                    const parent = dir.replace(/[^\/]+\/$/, '');
+                    for (const d of [dir, parent]) {
+                      for (const n of ['master.m3u8', 'index.m3u8', 'playlist.m3u8', 'hls.m3u8']) {
+                        const g = new URL(x.href); g.pathname = d + n;
+                        if (g.href !== u) guesses.add(g.href);
+                      }
+                    }
+                    const base = x.pathname.slice(x.pathname.lastIndexOf('/') + 1);
+                    const swapped = base.replace(/(144|240|360|480|720|1080)/, String(QUALITY));
+                    if (swapped !== base) {
+                      const g = new URL(x.href); g.pathname = dir + swapped;
+                      guesses.add(g.href);
+                    }
+                    const dirSwapped = dir.replace(/(144|240|360|480|720|1080)/, String(QUALITY));
+                    if (dirSwapped !== dir) {
+                      const g = new URL(x.href); g.pathname = dirSwapped + base;
+                      guesses.add(g.href);
+                    }
+                  }
+                  for (const g of guesses) {
+                    const text = await fetchText(ctx, g, pageUrl);
+                    if (!text.startsWith('#EXTM3U')) continue;
+                    console.log('  Valid playlist guessed:', g);
+                    if (text.includes('#EXT-X-STREAM-INF')) {
+                      const vars = parseMaster(text, g);
+                      console.log('    variants: ' + vars.map(v => (v.height || '?') + 'p').join(', '));
+                      vars.forEach(v => pushEntry({ type: 'hls', url: v.url, audio: v.audio, height: v.height, why: 'guessed-master', order: 0 }));
+                    } else {
+                      pushEntry({ type: 'hls', url: g, audio: null, height: QUALITY, why: 'guessed-variant', order: 0 });
+                    }
                   }
                 }
 
@@ -654,7 +707,7 @@ jobs:
         if: steps.clean.outputs.has_files == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: asia-${{ github.run_number }}
+          tag_name: ph-${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
