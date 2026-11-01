@@ -1,4 +1,4 @@
-name: "phub3"
+name: phub3 Downloader (Find Video)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       urls:
         description: 'Page URLs (space or newline separated)'
         required: true
-        default: 'https://playmogo.com/d/nbefeblvoesi'
+        default: 'https://vidara.so/v/cpbnwULfofbCA'
         type: string
       quality:
         description: 'Preferred quality (height), e.g. 240 / 480 / 720'
@@ -24,36 +24,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare
+      - name: Install tools
         run: |
           mkdir -p downloads
-          cat > package.json << 'EOF'
-          {
-            "name": "grab",
-            "version": "1.0.0",
-            "private": true,
-            "dependencies": { "playwright": "1.48.2" }
-          }
-          EOF
-          which ffmpeg ffprobe || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
-
-      - name: Cache Playwright and node_modules
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            node_modules
-            ~/.cache/ms-playwright
-          key: pw-1.48.2-${{ runner.os }}
-
-      - name: Install Playwright
-        run: |
-          npm install --no-audit --no-fund
-          if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
-            npx playwright install chromium
-          else
-            npx playwright install --with-deps chromium
-          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
 
       - name: Write script
         shell: bash
@@ -64,18 +42,34 @@ jobs:
           const fs = require('fs');
           const path = require('path');
 
+          const FILE_RE = /\.(mp4|webm|mkv|mov|m4v|vid)(\?|#|$)/i;
           const HLS_RE = /\.m3u8(\?|#|$)/i;
+          const SEG_RE = /(\.m4s|\.ts)(\?|#|$)|\/(init|seg)[-_][^\/]*\.mp4(\?|#|$)/i;
+          const AD_RE = /(doubleclick|googlesyndication|googleads|exoclick|exosrv|adsco|adserver|adsystem|adnxs|popads|popcash|propeller|juicyads|trafficjunky|vast|vpaid|\/ads?\/|[\/_.-]ads?[\/_.-]|advert|banner|preroll|pre-roll|promo|sponsor|clickadu|hilltopads|adcash|ero-advertising|tsyndicate|syndication)/i;
           const urls = (process.env.URLS || '').split(/\s+/).filter(u => /^https?:\/\//.test(u));
           const QUALITY = parseInt(process.env.QUALITY || '480', 10) || 480;
           const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
           const MIN_SIZE = 102400;
+          const BIG_SIZE = 20 * 1024 * 1024;
 
           console.log('Target quality:', QUALITY + 'p');
 
-          function headersFor(referer) {
-            const origin = new URL(referer).origin;
-            return `Referer: ${referer}\r\nOrigin: ${origin}\r\n`;
+          function pageId(u, i) {
+            try {
+              const last = path.basename(new URL(u).pathname);
+              return last || `video_${i}`;
+            } catch (e) { return `video_${i}`; }
           }
+
+          function fileNameFrom(u, i, k) {
+            try {
+              const n = path.basename(new URL(u).pathname);
+              if (n && FILE_RE.test(n)) return n;
+            } catch (e) {}
+            return `video_${i}_${k}.mp4`;
+          }
+
+          function hostOf(u) { try { return new URL(u).hostname; } catch (e) { return ''; } }
 
           function qualityFromUrl(u) {
             let name = '';
@@ -84,12 +78,69 @@ jobs:
             return m ? parseInt(m[1], 10) : 0;
           }
 
-          async function fetchText(ctx, url, referer) {
+          function nearest(list, getH) {
+            let best = null, bd = 1e9;
+            for (const it of list) {
+              const h = getH(it);
+              if (!h) continue;
+              const d = Math.abs(h - QUALITY);
+              if (d < bd) { bd = d; best = it; }
+            }
+            return best;
+          }
+
+          function browserHeaders(pageUrl, cookie) {
+            const h = { 'Referer': pageUrl, 'Origin': new URL(pageUrl).origin, 'Accept': '*/*', 'Accept-Language': 'en-US,en;q=0.9' };
+            if (cookie) h['Cookie'] = cookie;
+            return h;
+          }
+
+          function ffHeaderString(h) {
+            return Object.keys(h).map(k => `${k}: ${h[k]}\r\n`).join('');
+          }
+
+          async function probeSize(ctx, url, referer) {
             try {
-              const r = await ctx.request.get(url, { headers: { Referer: referer, Accept: '*/*' }, timeout: 30000 });
-              if (!r.ok()) { console.log('  playlist status:', r.status()); return ''; }
+              const r = await ctx.request.get(url, {
+                headers: { Referer: referer, Range: 'bytes=0-0', Accept: '*/*' },
+                maxRedirects: 10,
+                timeout: 20000
+              });
+              const cr = r.headers()['content-range'];
+              if (cr && /\/(\d+)$/.test(cr)) return parseInt(cr.match(/\/(\d+)$/)[1], 10);
+              const cl = r.headers()['content-length'];
+              if (cl && r.status() === 200) return parseInt(cl, 10);
+            } catch (e) {}
+            return 0;
+          }
+
+          async function downloadDirect(ctx, url, referer, out) {
+            try { fs.unlinkSync(out); } catch (e) {}
+            const res = await ctx.request.get(url, {
+              headers: { Referer: referer, Accept: '*/*' },
+              maxRedirects: 10,
+              timeout: 1800000
+            });
+            console.log('  Final URL:', res.url());
+            console.log('  Status:', res.status());
+            if (!res.ok()) return false;
+            const body = await res.body();
+            if (body.length < MIN_SIZE) { console.log('  Too small:', body.length); return false; }
+            fs.writeFileSync(out, body);
+            console.log(`  OK: ${out} (${body.length} bytes)`);
+            return true;
+          }
+
+          async function getText(ctx, url, headers) {
+            try {
+              const r = await ctx.request.get(url, { headers, timeout: 30000, maxRedirects: 10 });
+              if (!r.ok()) {
+                console.log('  playlist status:', r.status(), url.slice(0, 120));
+                console.log('  body start:', (await r.text().catch(() => '')).slice(0, 150).replace(/\s+/g, ' '));
+                return '';
+              }
               return await r.text();
-            } catch (e) { return ''; }
+            } catch (e) { console.log('  playlist error:', e.message); return ''; }
           }
 
           function parseMaster(text, base) {
@@ -121,56 +172,86 @@ jobs:
             return vars;
           }
 
-          let COOKIE_HEADER = '';
-
-          function downloadHls(url, audio, referer, out) {
+          function runFfmpegHls(url, audio, headers, out) {
             try { fs.unlinkSync(out); } catch (e) {}
-            const refs = [referer, new URL(url).origin + '/', ''];
-            for (const ref of refs) {
-              let h = '';
-              if (ref) h += `Referer: ${ref}\r\nOrigin: ${new URL(ref).origin}\r\n`;
-              if (COOKIE_HEADER) h += `Cookie: ${COOKIE_HEADER}\r\n`;
-              h += 'Accept: */*\r\nAccept-Language: en-US,en;q=0.9\r\n';
-              console.log('  ffmpeg try, referer =', ref || '(none)');
-              const args = ['-y', '-loglevel', 'error', '-user_agent', UA, '-headers', h, '-i', url];
-              if (audio) args.push('-user_agent', UA, '-headers', h, '-i', audio, '-map', '0:v:0', '-map', '1:a:0');
-              args.push('-c', 'copy', '-bsf:a', 'aac_adtstoasc', out);
-              const r = spawnSync('ffmpeg', args, { stdio: 'inherit' });
-              const exists = fs.existsSync(out);
-              const size = exists ? fs.statSync(out).size : 0;
-              if (r.status === 0 && size >= MIN_SIZE) {
-                console.log(`  OK: ${out} (${size} bytes)`);
-                return true;
-              }
-              if (exists) fs.unlinkSync(out);
-            }
-            console.log('  HLS failed with all referer variants');
+            const hs = ffHeaderString(headers);
+            const args = ['-y', '-loglevel', 'error', '-user_agent', UA, '-headers', hs, '-i', url];
+            if (audio) args.push('-user_agent', UA, '-headers', hs, '-i', audio, '-map', '0:v:0', '-map', '1:a:0');
+            args.push('-c', 'copy', out);
+            const r = spawnSync('ffmpeg', args, { stdio: 'inherit' });
+            const size = fs.existsSync(out) ? fs.statSync(out).size : 0;
+            if (r.status === 0 && size >= MIN_SIZE) { console.log(`  OK: ${out} (${size} bytes)`); return true; }
+            if (fs.existsSync(out)) fs.unlinkSync(out);
             return false;
           }
 
-          function probeHeight(file) {
+          // دانلود دستی قطعه‌ها با session مرورگر
+          async function manualHls(ctx, url, headers, out) {
+            const tmp = out + '.tmp.bin';
             try {
-              const r = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', file], { encoding: 'utf8' });
-              return (r.stdout || '').trim();
-            } catch (e) { return ''; }
+              let text = await getText(ctx, url, headers);
+              if (!text) return false;
+              if (text.includes('#EXT-X-STREAM-INF')) {
+                const vars = parseMaster(text, url);
+                const v = vars.find(x => x.height === QUALITY) || nearest(vars, x => x.height) || vars[0];
+                if (!v) return false;
+                url = v.url;
+                text = await getText(ctx, url, headers);
+                if (!text) return false;
+              }
+              const lines = text.split(/\r?\n/);
+              const mapM = text.match(/#EXT-X-MAP:URI="([^"]+)"/);
+              const segs = lines.filter(l => l.trim() && !l.startsWith('#')).map(l => new URL(l.trim(), url).href);
+              console.log(`  Manual HLS: ${segs.length} segments`);
+              if (!segs.length) return false;
+              try { fs.unlinkSync(tmp); } catch (e) {}
+
+              const fetchBin = async (u) => {
+                for (let a = 0; a < 3; a++) {
+                  try {
+                    const r = await ctx.request.get(u, { headers, timeout: 60000, maxRedirects: 10 });
+                    if (r.ok()) return await r.body();
+                    if (a === 2) console.log('  segment status:', r.status(), u.slice(0, 120));
+                  } catch (e) {}
+                  await new Promise(r => setTimeout(r, 1000));
+                }
+                return null;
+              };
+
+              if (mapM) {
+                const init = await fetchBin(new URL(mapM[1], url).href);
+                if (!init) return false;
+                fs.appendFileSync(tmp, init);
+              }
+              const BATCH = 6;
+              for (let i = 0; i < segs.length; i += BATCH) {
+                const bodies = await Promise.all(segs.slice(i, i + BATCH).map(fetchBin));
+                for (const b of bodies) {
+                  if (!b) { console.log('  Segment failed, aborting manual download'); return false; }
+                  fs.appendFileSync(tmp, b);
+                }
+                if ((i / BATCH) % 10 === 0) console.log(`  ...${Math.min(i + BATCH, segs.length)}/${segs.length}`);
+              }
+              try { fs.unlinkSync(out); } catch (e) {}
+              const r = spawnSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', tmp, '-c', 'copy', out], { stdio: 'inherit' });
+              const size = fs.existsSync(out) ? fs.statSync(out).size : 0;
+              if (r.status === 0 && size >= MIN_SIZE) { console.log(`  OK (manual): ${out} (${size} bytes)`); return true; }
+              if (fs.existsSync(out)) fs.unlinkSync(out);
+              return false;
+            } finally {
+              try { fs.unlinkSync(tmp); } catch (e) {}
+            }
           }
 
-          // نزدیک‌ترین کیفیت به هدف
-          function nearest(list, getH) {
-            let best = null, bd = 1e9;
-            for (const it of list) {
-              const h = getH(it);
-              if (!h) continue;
-              const d = Math.abs(h - QUALITY);
-              if (d < bd) { bd = d; best = it; }
-            }
-            return best;
+          function probeWH(file) {
+            const r = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', file], { encoding: 'utf8' });
+            return (r.stdout || '').trim();
           }
 
           // یک آدرس m3u8 (master یا variant) را در کیفیت هدف دانلود می‌کند
-          async function downloadFromPlaylist(ctx, url, referer, outBase) {
-            const text = await fetchText(ctx, url, referer);
+          async function downloadPlaylist(ctx, url, headers, outBase) {
             let target = { url, audio: null, height: qualityFromUrl(url) };
+            const text = await getText(ctx, url, headers);
             if (text.includes('#EXT-X-STREAM-INF')) {
               const vars = parseMaster(text, url);
               console.log('  Variants:', vars.map(v => (v.height || '?') + 'p').join(', '));
@@ -179,12 +260,14 @@ jobs:
             }
             console.log(`  Using ${target.height || '?'}p:`, target.url);
             const out = path.join('downloads', `${outBase}_${target.height || QUALITY}p.mp4`);
-            const ok = downloadHls(target.url, target.audio, referer, out);
-            if (ok) console.log('  Video size (w,h):', probeHeight(out));
-            return ok;
+            console.log('  Trying ffmpeg...');
+            if (runFfmpegHls(target.url, target.audio, headers, out)) { console.log('  Video size (w,h):', probeWH(out)); return true; }
+            console.log('  ffmpeg failed, trying manual segment download...');
+            if (await manualHls(ctx, target.url, headers, out)) { console.log('  Video size (w,h):', probeWH(out)); return true; }
+            return false;
           }
 
-          // خواندن flashvars پلیر از صفحه
+          // خواندن flashvars پلیر (در صورت وجود)
           async function getFlashvars(page) {
             for (const frame of page.frames()) {
               try {
@@ -192,22 +275,11 @@ jobs:
                   const keys = Object.keys(window).filter(k => k.indexOf('flashvars_') === 0);
                   for (const k of keys) {
                     const v = window[k];
-                    if (v && Array.isArray(v.mediaDefinitions)) {
-                      return { id: k.replace('flashvars_', ''), title: v.video_title || '', defs: v.mediaDefinitions };
-                    }
+                    if (v && Array.isArray(v.mediaDefinitions)) return { id: k.replace('flashvars_', ''), defs: v.mediaDefinitions };
                   }
                   return null;
                 });
                 if (fv) return fv;
-              } catch (e) {}
-            }
-            // جایگزین: جستجو در HTML
-            for (const frame of page.frames()) {
-              try {
-                const html = await frame.content();
-                const re = /"mediaDefinitions"\s*:\s*(\[[\s\S]*?\])\s*,\s*"(?:isVertical|hotspots|thumbs)"/;
-                const m = html.match(re);
-                if (m) return { id: 'video', title: '', defs: JSON.parse(m[1]) };
               } catch (e) {}
             }
             return null;
@@ -222,60 +294,85 @@ jobs:
 
             for (let i = 0; i < urls.length; i++) {
               const pageUrl = urls[i];
+              const pageHost = hostOf(pageUrl);
               console.log(`\n[${i + 1}] ${pageUrl}`);
-              const ctx = await browser.newContext({ userAgent: UA, viewport: { width: 1280, height: 720 }, locale: 'en-US' });
+              const ctx = await browser.newContext({
+                userAgent: UA,
+                viewport: { width: 1280, height: 720 },
+                locale: 'en-US'
+              });
               await ctx.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
               });
 
               try {
+                const cands = new Map();
+                let order = 0;
+
+                const add = (u, why) => {
+                  if (!u || !/^https?:/i.test(u)) return;
+                  const clean = u.replace(/#\.mp4$/, '');
+                  if (cands.has(clean)) return;
+                  let type = null;
+                  if (HLS_RE.test(clean)) type = 'hls';
+                  else if (FILE_RE.test(clean) || why === 'content-type') type = 'file';
+                  if (!type) return;
+                  cands.set(clean, { type, why, order: order++ });
+                  console.log(`  Found ${type} (${why}):`, clean);
+                };
+
                 const page = await ctx.newPage();
-                const m3u8Seen = new Map();
-                page.on('request', r => {
-                  const u = r.url();
-                  if (HLS_RE.test(u) && !m3u8Seen.has(u)) { m3u8Seen.set(u, m3u8Seen.size); console.log('  Found m3u8 (request):', u); }
-                });
+
                 ctx.on('page', async p => {
                   if (p === page) return;
                   await p.waitForTimeout(1000).catch(() => {});
+                  console.log('  Closing popup:', p.url());
                   await p.close().catch(() => {});
+                });
+
+                page.on('request', r => add(r.url(), 'request'));
+                page.on('response', r => {
+                  const ct = (r.headers()['content-type'] || '').toLowerCase();
+                  if (ct.startsWith('video/')) add(r.url(), 'content-type');
+                  if (ct.includes('mpegurl')) add(r.url(), 'content-type');
                 });
 
                 const resp = await page.goto(pageUrl, { waitUntil: 'load', timeout: 90000 }).catch(e => { console.log('  goto error:', e.message); return null; });
                 console.log('  Page status:', resp ? resp.status() : 'none');
                 console.log('  Final page URL:', page.url());
                 console.log('  Title:', await page.title().catch(() => '?'));
+                await page.waitForTimeout(3000);
 
-                // ---------- روش اصلی: flashvars.mediaDefinitions ----------
+                const cookieStr = async () => (await ctx.cookies()).map(c => `${c.name}=${c.value}`).join('; ');
+
+                // ---------- روش ۱: داده‌ی پلیر (flashvars.mediaDefinitions) ----------
                 let fv = null;
-                for (let t = 0; t < 8 && !fv; t++) {
+                for (let t = 0; t < 4 && !fv; t++) {
                   fv = await getFlashvars(page);
-                  if (!fv) await page.waitForTimeout(1500);
+                  if (!fv) await page.waitForTimeout(1000);
                 }
+                const baseName = fv ? fv.id : pageId(pageUrl, i + 1);
 
                 if (fv) {
                   const hls = fv.defs.filter(d => d && d.format === 'hls' && typeof d.videoUrl === 'string' && d.videoUrl);
                   console.log('  mediaDefinitions (hls):', hls.map(d => `${d.quality || d.height}p`).join(', ') || '(none)');
                   let pick = hls.find(d => String(d.quality) === String(QUALITY) || Number(d.height) === QUALITY);
-                  if (!pick) {
-                    pick = nearest(hls, d => Number(d.height) || parseInt(d.quality, 10) || 0);
-                    if (pick) console.log(`  WARNING: ${QUALITY}p not listed, using nearest:`, pick.quality || pick.height);
-                  }
+                  if (!pick) pick = nearest(hls, d => Number(d.height) || parseInt(d.quality, 10) || 0);
                   if (pick) {
                     const vurl = pick.videoUrl.replace(/\\\//g, '/');
-                    console.log('  Selected from player data:', vurl);
-                    if (await downloadFromPlaylist(ctx, vurl, pageUrl, fv.id)) { success++; await ctx.close(); continue; }
-                    console.log('  Direct playlist download failed, trying fallback...');
+                    console.log('  Method 1 (player data):', vurl);
+                    if (await downloadPlaylist(ctx, vurl, browserHeaders(pageUrl, await cookieStr()), baseName)) {
+                      success++; await ctx.close(); continue;
+                    }
+                    console.log('  Method 1 failed, continuing with player method...');
                   }
-                } else {
-                  console.log('  No flashvars found, using fallback.');
                 }
 
-                // ---------- جایگزین: انتخاب کیفیت در پلیر + شنود شبکه ----------
+                // ---------- روش ۲: انتخاب کیفیت در پلیر قبل از پخش ----------
                 const setQuality = async () => {
                   for (const frame of page.frames()) {
                     try {
-                      const isMgp = await frame.evaluate(() => !!document.querySelector('[class*="mgp_"]'));
+                      const isMgp = await frame.evaluate(() => !!document.querySelector('.mgp_btn-settings'));
                       if (!isMgp) continue;
                       const res = await frame.evaluate(async (q) => {
                         const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -311,22 +408,113 @@ jobs:
                   return false;
                 };
 
-                await page.waitForTimeout(3000);
-                await setQuality();
-                m3u8Seen.clear();
-
-                for (const frame of page.frames()) {
-                  try {
-                    const bp = await frame.$('.mgp_bigPlay, .mgp_smallPlay');
-                    if (bp) await bp.click({ timeout: 1500, force: true }).catch(() => {});
-                    await frame.evaluate(() => document.querySelectorAll('video').forEach(v => { v.muted = true; v.play().catch(() => {}); }));
-                  } catch (e) {}
+                let picked = false;
+                for (let a = 0; a < 6 && !picked; a++) {
+                  const has = await Promise.all(page.frames().map(f =>
+                    f.evaluate(() => !!document.querySelector('.mgp_btn-settings')).catch(() => false)
+                  )).then(r => r.some(Boolean));
+                  if (!has) break; // پلیر mgp نیست
+                  picked = await setQuality();
+                  if (!picked) await page.waitForTimeout(2000);
                 }
-                for (let s = 0; s < 45 && m3u8Seen.size === 0; s++) await page.waitForTimeout(1000);
-                await page.waitForTimeout(3000);
+                if (picked && cands.size > 0) {
+                  console.log(`  Clearing ${cands.size} candidate(s) captured before quality selection`);
+                  cands.clear();
+                }
 
-                if (m3u8Seen.size === 0) {
+                const readFromDom = async () => {
+                  for (const frame of page.frames()) {
+                    try {
+                      const base = frame.url() || pageUrl;
+                      const vals = await frame.evaluate(() => {
+                        const out = [];
+                        document.querySelectorAll('video, video source, source').forEach(v => {
+                          out.push(v.getAttribute('src'));
+                          out.push(v.currentSrc);
+                        });
+                        document.querySelectorAll('meta[itemprop="contentUrl"], meta[property="og:video"], meta[property="og:video:url"]').forEach(m => out.push(m.content));
+                        document.querySelectorAll('a[download]').forEach(a => out.push(a.href));
+                        return out.filter(Boolean);
+                      });
+                      vals.forEach(s => { try { add(new URL(s, base).href, 'dom'); } catch (e) {} });
+                    } catch (e) {}
+                  }
+                };
+
+                const tryPlay = async () => {
+                  for (const frame of page.frames()) {
+                    try {
+                      await frame.evaluate(() => {
+                        document.querySelectorAll('video').forEach(v => { v.muted = true; v.play().catch(() => {}); });
+                      });
+                      for (const sel of ['.mgp_bigPlay', '.mgp_smallPlay', '.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid', '.play-button', '.play', '[class*="play" i]', 'video']) {
+                        const el = await frame.$(sel);
+                        if (el) await el.click({ timeout: 1500, force: true }).catch(() => {});
+                      }
+                    } catch (e) {}
+                  }
+                  await page.mouse.click(640, 360).catch(() => {});
+                };
+
+                const trySkipAd = async () => {
+                  const sels = [
+                    '.videoAdUiSkipButton', '.ytp-ad-skip-button', '.jw-skip', '.jw-skiplink',
+                    '.vjs-skip-button', '.skip-button', '.skip_button', '#skip', '.ad-skip', '.adskip',
+                    '[class*="skip" i]', '[id*="skip" i]'
+                  ];
+                  for (const frame of page.frames()) {
+                    for (const s of sels) {
+                      try {
+                        const el = await frame.$(s);
+                        if (el && await el.isVisible().catch(() => false)) {
+                          console.log('  Clicking skip:', s);
+                          await el.click({ timeout: 1500, force: true }).catch(() => {});
+                        }
+                      } catch (e) {}
+                    }
+                    try {
+                      const byText = frame.getByText(/skip( ad)?|close ad|رد کردن/i).first();
+                      if (await byText.isVisible({ timeout: 300 }).catch(() => false)) {
+                        console.log('  Clicking skip (text)');
+                        await byText.click({ timeout: 1500, force: true }).catch(() => {});
+                      }
+                    } catch (e) {}
+                  }
+                };
+
+                await readFromDom();
+                await tryPlay();
+
+                const maxWait = 60;
+                let lastCount = -1, stable = 0;
+                for (let s = 0; s < maxWait; s++) {
+                  await page.waitForTimeout(1000);
+                  if (s % 3 === 0) await trySkipAd();
+                  if (s % 4 === 0) await readFromDom();
+                  if (s % 10 === 9) await tryPlay();
+                  if (!picked && (s === 10 || s === 25)) { picked = await setQuality(); }
+
+                  if (cands.size > 0) {
+                    if (cands.size === lastCount) stable++; else { stable = 0; lastCount = cands.size; }
+                    if (s >= 20 && stable >= 12) break;
+                  }
+                }
+                await readFromDom();
+
+                if (cands.size === 0) {
+                  for (const frame of page.frames()) {
+                    try {
+                      const html = (await frame.content()).replace(/\\\//g, '/').replace(/\\u0026/g, '&');
+                      const m = html.match(/https?:\/\/[^"'\s<>\\]+\.(?:mp4|m3u8|webm|mkv|mov|m4v|vid)[^"'\s<>\\]*/gi) || [];
+                      m.forEach(s => add(s, 'html'));
+                    } catch (e) {}
+                  }
+                }
+
+                if (cands.size === 0) {
                   console.log('  No video URL found.');
+                  const text = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 500) : '').catch(() => '');
+                  console.log('  Page text start:\n' + text);
                   console.log('  Frames:', page.frames().map(f => f.url()).join(' | '));
                   fs.mkdirSync('debug', { recursive: true });
                   await page.screenshot({ path: `debug/page_${i + 1}.png`, fullPage: true }).catch(() => {});
@@ -335,14 +523,57 @@ jobs:
                   continue;
                 }
 
-                // ترجیح لینکی که کیفیتش در آدرس همان هدف است
-                const seen = Array.from(m3u8Seen.keys());
-                seen.sort((a, b) => (qualityFromUrl(b) === QUALITY) - (qualityFromUrl(a) === QUALITY));
-                let done = false;
-                for (const u of seen) {
-                  if (await downloadFromPlaylist(ctx, u, pageUrl, `video_${i + 1}`)) { done = true; break; }
+                // امتیازدهی کاندیدها
+                const list = [];
+                for (const [url, info] of cands) {
+                  let score = 0;
+                  const host = hostOf(url);
+                  const h = qualityFromUrl(url);
+                  const isSeg = SEG_RE.test(url);
+
+                  if (AD_RE.test(url)) score -= 100;
+                  if (host === pageHost || host.endsWith('.' + pageHost.replace(/^www\./, ''))) score += 20;
+                  if (isSeg) score -= 200; // قطعه‌ی HLS، فایل مستقل نیست
+
+                  if (h === QUALITY) score += 200;
+                  else if (h > 0) score -= Math.min(100, Math.floor(Math.abs(h - QUALITY) / 5));
+
+                  let size = 0, dur = 0;
+                  if (info.type === 'file' && !isSeg) {
+                    size = await probeSize(ctx, url, pageUrl);
+                    if (size >= BIG_SIZE) score += 50;
+                    else if (size > 0 && size < 5 * 1024 * 1024) score -= 30;
+                    score += Math.min(60, Math.floor(size / (50 * 1024 * 1024)) * 10);
+                  } else if (info.type === 'hls') {
+                    if (/master\.m3u8/i.test(url)) score += 30; // master همه‌ی کیفیت‌ها را دارد
+                  }
+                  list.push({ url, ...info, score, size, dur, height: h, isSeg });
                 }
-                if (done) success++; else console.log('  All candidates failed.');
+                list.sort((a, b) => b.score - a.score || b.size - a.size || b.order - a.order);
+
+                console.log('  --- Candidates (best first) ---');
+                list.forEach((c, n) => console.log(`  #${n + 1} score=${c.score} type=${c.type} height=${c.height || '?'} size=${c.size} why=${c.why}\n      ${c.url}`));
+                if (!list.some(c => c.height === QUALITY && !c.isSeg)) {
+                  console.log(`  WARNING: no ${QUALITY}p candidate found, nearest will be used.`);
+                }
+
+                let done = false;
+                let k = 0;
+                const headers = browserHeaders(pageUrl, await cookieStr());
+                for (const c of list) {
+                  if (c.isSeg) continue;
+                  k++;
+                  console.log(`  Downloading #${k} (${c.height || '?'}p):`, c.url);
+                  if (c.type === 'file') {
+                    const out = path.join('downloads', fileNameFrom(c.url, i + 1, k));
+                    if (await downloadDirect(ctx, c.url, pageUrl, out)) { done = true; break; }
+                  } else {
+                    if (await downloadPlaylist(ctx, c.url, headers, baseName)) { done = true; break; }
+                  }
+                }
+
+                if (done) success++;
+                else console.log('  All candidates failed.');
               } catch (e) {
                 console.log('  Error:', e.message);
               }
@@ -376,6 +607,7 @@ jobs:
         if: always()
         run: |
           mkdir -p downloads
+          find downloads -type f -name '*.tmp.bin' -delete
           find downloads -type f -size -1c -print -delete
           find downloads -type f -size -100k -print -delete
           ls -lh downloads/ || true
@@ -389,7 +621,7 @@ jobs:
         if: steps.clean.outputs.has_files == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ph-${{ github.run_number }}
+          tag_name: ph2-${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
