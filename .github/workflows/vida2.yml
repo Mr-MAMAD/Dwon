@@ -1,0 +1,350 @@
+name: vida2 Downloader (Find Video)
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Page URLs (space or newline separated)'
+        required: true
+        default: ''
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          mkdir -p downloads
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Write script
+        shell: bash
+        run: |
+          cat > grab.js << 'EOF'
+          const { chromium } = require('playwright');
+          const { spawnSync } = require('child_process');
+          const fs = require('fs');
+          const path = require('path');
+
+          const FILE_RE = /\.(mp4|webm|mkv|mov|m4v|vid)(\?|#|$)/i;
+          const HLS_RE = /\.m3u8(\?|#|$)/i;
+          const urls = (process.env.URLS || '').split(/\s+/).filter(u => /^https?:\/\//.test(u));
+          const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+          const MIN_SIZE = 102400;
+          const TARGET_H = 480;
+
+          function pageId(u, i) {
+            try {
+              const last = path.basename(new URL(u).pathname);
+              return last || `video_${i}`;
+            } catch (e) { return `video_${i}`; }
+          }
+
+          function fileNameFrom(u, i, k) {
+            try {
+              const n = path.basename(new URL(u).pathname);
+              if (n && FILE_RE.test(n)) return n;
+            } catch (e) {}
+            return `video_${i}_${k}.mp4`;
+          }
+
+          async function downloadDirect(ctx, url, referer, out) {
+            try { fs.unlinkSync(out); } catch (e) {}
+            const res = await ctx.request.get(url, {
+              headers: { Referer: referer, Accept: '*/*' },
+              maxRedirects: 10,
+              timeout: 1800000
+            });
+            console.log('  Final URL:', res.url());
+            console.log('  Status:', res.status());
+            if (!res.ok()) return false;
+            const body = await res.body();
+            if (body.length < MIN_SIZE) { console.log('  Too small:', body.length); return false; }
+            fs.writeFileSync(out, body);
+            console.log(`  OK: ${out} (${body.length} bytes)`);
+            return true;
+          }
+
+          function downloadHls(url, referer, out) {
+            const origin = new URL(referer).origin;
+            try { fs.unlinkSync(out); } catch (e) {}
+            const r = spawnSync('ffmpeg', [
+              '-y', '-loglevel', 'error',
+              '-user_agent', UA,
+              '-headers', `Referer: ${referer}\r\nOrigin: ${origin}\r\n`,
+              '-i', url,
+              '-c', 'copy',
+              '-bsf:a', 'aac_adtstoasc',
+              out
+            ], { stdio: 'inherit' });
+            const exists = fs.existsSync(out);
+            const size = exists ? fs.statSync(out).size : 0;
+            if (r.status !== 0 || size < MIN_SIZE) {
+              console.log('  HLS failed or too small:', size);
+              if (exists) fs.unlinkSync(out);
+              return false;
+            }
+            console.log(`  OK: ${out} (${size} bytes)`);
+            return true;
+          }
+
+          function getHeight(file) {
+            const r = spawnSync('ffprobe', [
+              '-v', 'error',
+              '-select_streams', 'v:0',
+              '-show_entries', 'stream=height',
+              '-of', 'csv=p=0',
+              file
+            ], { encoding: 'utf8' });
+            const h = parseInt((r.stdout || '').trim(), 10);
+            return isNaN(h) ? 0 : h;
+          }
+
+          // اگر ارتفاع ویدیو 480 نبود، تبدیل می‌کند و مسیر فایل نهایی را برمی‌گرداند
+          function ensure480(file) {
+            const h = getHeight(file);
+            console.log('  Video height:', h);
+            if (h === 0 || h === TARGET_H) return file;
+
+            console.log(`  Converting ${h}p -> ${TARGET_H}p ...`);
+            const parsed = path.parse(file);
+            const tmp = path.join(parsed.dir, `${parsed.name}.tmp480.mp4`);
+            const final = path.join(parsed.dir, `${parsed.name}.mp4`);
+            try { fs.unlinkSync(tmp); } catch (e) {}
+
+            const r = spawnSync('ffmpeg', [
+              '-y', '-loglevel', 'error',
+              '-i', file,
+              '-vf', `scale=-2:${TARGET_H}`,
+              '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+              '-pix_fmt', 'yuv420p',
+              '-c:a', 'aac', '-b:a', '128k',
+              '-movflags', '+faststart',
+              tmp
+            ], { stdio: 'inherit' });
+
+            const size = fs.existsSync(tmp) ? fs.statSync(tmp).size : 0;
+            if (r.status !== 0 || size < MIN_SIZE) {
+              console.log('  Conversion failed, keeping original file.');
+              try { fs.unlinkSync(tmp); } catch (e) {}
+              return file;
+            }
+
+            fs.unlinkSync(file);
+            fs.renameSync(tmp, final);
+            console.log(`  Converted OK: ${final} (${size} bytes)`);
+            return final;
+          }
+
+          (async () => {
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox', '--disable-blink-features=AutomationControlled']
+            });
+            let success = 0;
+
+            for (let i = 0; i < urls.length; i++) {
+              const pageUrl = urls[i];
+              console.log(`\n[${i + 1}] ${pageUrl}`);
+              const ctx = await browser.newContext({
+                userAgent: UA,
+                viewport: { width: 1280, height: 720 },
+                locale: 'en-US'
+              });
+              await ctx.addInitScript(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+              });
+
+              try {
+                const direct = [];
+                const hls = [];
+                const seen = new Set();
+
+                const add = (u, why) => {
+                  if (!u || seen.has(u) || !/^https?:/i.test(u)) return;
+                  if (HLS_RE.test(u)) { seen.add(u); hls.push(u); console.log(`  Found HLS (${why}):`, u); }
+                  else if (FILE_RE.test(u)) { seen.add(u); direct.push(u); console.log(`  Found file (${why}):`, u); }
+                };
+
+                const page = await ctx.newPage();
+
+                // بستن پاپ‌آپ‌های تبلیغاتی
+                ctx.on('page', async p => {
+                  if (p !== page) { console.log('  Closing popup:', p.url()); await p.close().catch(() => {}); }
+                });
+
+                page.on('request', r => add(r.url(), 'request'));
+                page.on('response', r => {
+                  const ct = (r.headers()['content-type'] || '').toLowerCase();
+                  if (ct.startsWith('video/')) add(r.url(), 'content-type');
+                  if (ct.includes('mpegurl')) add(r.url(), 'content-type');
+                });
+
+                const resp = await page.goto(pageUrl, { waitUntil: 'load', timeout: 90000 }).catch(e => { console.log('  goto error:', e.message); return null; });
+                console.log('  Page status:', resp ? resp.status() : 'none');
+                console.log('  Final page URL:', page.url());
+                console.log('  Title:', await page.title().catch(() => '?'));
+                await page.waitForTimeout(4000);
+
+                const readFromDom = async () => {
+                  for (const frame of page.frames()) {
+                    try {
+                      const base = frame.url() || pageUrl;
+                      const vals = await frame.evaluate(() => {
+                        const out = [];
+                        document.querySelectorAll('video, video source, source').forEach(v => {
+                          out.push(v.getAttribute('src'));
+                          out.push(v.currentSrc);
+                        });
+                        document.querySelectorAll('meta[itemprop="contentUrl"], meta[property="og:video"], meta[property="og:video:url"]').forEach(m => out.push(m.content));
+                        document.querySelectorAll('a[download]').forEach(a => out.push(a.href));
+                        return out.filter(Boolean);
+                      });
+                      vals.forEach(s => { try { add(new URL(s, base).href, 'dom'); } catch (e) {} });
+                    } catch (e) {}
+                  }
+                };
+
+                const tryPlay = async () => {
+                  for (const frame of page.frames()) {
+                    try {
+                      await frame.evaluate(() => {
+                        document.querySelectorAll('video').forEach(v => { v.muted = true; v.play().catch(() => {}); });
+                      });
+                      for (const sel of ['.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid', '.play-button', '.play', '[class*="play" i]', 'video']) {
+                        const el = await frame.$(sel);
+                        if (el) await el.click({ timeout: 1500, force: true }).catch(() => {});
+                      }
+                    } catch (e) {}
+                  }
+                  await page.mouse.click(640, 360).catch(() => {});
+                };
+
+                await readFromDom();
+
+                // پخش را امتحان کن تا لینک ویدیو در شبکه ظاهر شود
+                for (let t = 0; t < 4 && direct.length + hls.length === 0; t++) {
+                  await tryPlay();
+                  await page.waitForTimeout(4000);
+                  await readFromDom();
+                }
+
+                // کمی صبر تا لینک‌های دیگر هم ثبت شوند
+                if (direct.length + hls.length > 0) {
+                  await page.waitForTimeout(3000);
+                  await readFromDom();
+                }
+
+                // جستجو در HTML و اسکریپت‌ها
+                if (direct.length + hls.length === 0) {
+                  for (const frame of page.frames()) {
+                    try {
+                      const html = (await frame.content()).replace(/\\\//g, '/').replace(/\\u0026/g, '&');
+                      const m = html.match(/https?:\/\/[^"'\s<>\\]+\.(?:mp4|m3u8|webm|mkv|mov|m4v|vid)[^"'\s<>\\]*/gi) || [];
+                      m.forEach(s => add(s, 'html'));
+                    } catch (e) {}
+                  }
+                }
+
+                if (direct.length + hls.length === 0) {
+                  console.log('  No video URL found.');
+                  const text = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 500) : '').catch(() => '');
+                  console.log('  Page text start:\n' + text);
+                  console.log('  Frames:', page.frames().map(f => f.url()).join(' | '));
+                  fs.mkdirSync('debug', { recursive: true });
+                  await page.screenshot({ path: `debug/page_${i + 1}.png`, fullPage: true }).catch(() => {});
+                  fs.writeFileSync(`debug/page_${i + 1}.html`, await page.content().catch(() => ''));
+                  await ctx.close();
+                  continue;
+                }
+
+                let done = false;
+
+                // اول فایل‌های مستقیم
+                let k = 0;
+                for (const target of direct) {
+                  k++;
+                  console.log('  Downloading file:', target);
+                  const out = path.join('downloads', fileNameFrom(target, i + 1, k));
+                  if (await downloadDirect(ctx, target, pageUrl, out)) { ensure480(out); done = true; break; }
+                }
+
+                // بعد استریم HLS
+                if (!done) {
+                  let h = 0;
+                  for (const target of hls) {
+                    h++;
+                    console.log('  Downloading HLS with ffmpeg:', target);
+                    const out = path.join('downloads', `${pageId(pageUrl, i + 1)}${hls.length > 1 ? '_' + h : ''}.mp4`);
+                    if (downloadHls(target, pageUrl, out)) { ensure480(out); done = true; break; }
+                  }
+                }
+
+                if (done) success++;
+                else console.log('  All candidates failed.');
+              } catch (e) {
+                console.log('  Error:', e.message);
+              }
+              await ctx.close();
+            }
+
+            await browser.close();
+            console.log(`\nSuccess: ${success} / ${urls.length}`);
+            process.exit(success > 0 ? 0 : 1);
+          })();
+          EOF
+
+      - name: Find and download
+        id: grab
+        continue-on-error: true
+        env:
+          URLS: ${{ github.event.inputs.urls }}
+        run: node grab.js
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
+          if-no-files-found: ignore
+
+      - name: Clean empty files
+        id: clean
+        if: always()
+        run: |
+          mkdir -p downloads
+          find downloads -type f -size -1c -print -delete
+          find downloads -type f -size -100k -print -delete
+          ls -lh downloads/ || true
+          if [ -n "$(find downloads -type f | head -1)" ]; then
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Release
+        if: steps.clean.outputs.has_files == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vida-${{ github.run_number }}
+          files: downloads/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail if nothing downloaded
+        if: steps.clean.outputs.has_files != 'true'
+        run: |
+          echo "No valid file was downloaded."
+          exit 1
