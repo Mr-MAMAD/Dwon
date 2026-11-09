@@ -83,6 +83,8 @@ jobs:
               '-y', '-loglevel', 'error',
               '-user_agent', UA,
               '-headers', `Referer: ${referer}\r\nOrigin: ${origin}\r\n`,
+              '-allowed_segment_extensions', 'ALL',
+              '-extension_picky', '0',
               '-i', url,
               '-c', 'copy',
               '-bsf:a', 'aac_adtstoasc',
@@ -234,20 +236,20 @@ jobs:
                 await readFromDom();
 
                 // پخش را امتحان کن تا لینک ویدیو در شبکه ظاهر شود
-                for (let t = 0; t < 4 && direct.length + hls.length === 0; t++) {
+                for (let t = 0; t < 4 && hls.length === 0; t++) {
                   await tryPlay();
                   await page.waitForTimeout(4000);
                   await readFromDom();
                 }
 
                 // کمی صبر تا لینک‌های دیگر هم ثبت شوند
-                if (direct.length + hls.length > 0) {
+                if (hls.length > 0) {
                   await page.waitForTimeout(3000);
                   await readFromDom();
                 }
 
                 // جستجو در HTML و اسکریپت‌ها
-                if (direct.length + hls.length === 0) {
+                if (hls.length === 0) {
                   for (const frame of page.frames()) {
                     try {
                       const html = (await frame.content()).replace(/\\\//g, '/').replace(/\\u0026/g, '&');
@@ -257,8 +259,8 @@ jobs:
                   }
                 }
 
-                if (direct.length + hls.length === 0) {
-                  console.log('  No video URL found.');
+                if (hls.length === 0) {
+                  console.log('  No HLS stream found.');
                   const text = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 500) : '').catch(() => '');
                   console.log('  Page text start:\n' + text);
                   console.log('  Frames:', page.frames().map(f => f.url()).join(' | '));
@@ -283,16 +285,7 @@ jobs:
                   if (downloadHls(target, pageUrl, out)) { ensure480(out); done = true; break; }
                 }
 
-                // فقط اگر HLS پیدا نشد یا شکست خورد، فایل‌های مستقیم
-                if (!done) {
-                  let k = 0;
-                  for (const target of direct) {
-                    k++;
-                    console.log('  Downloading file:', target);
-                    const out = path.join('downloads', fileNameFrom(target, i + 1, k));
-                    if (await downloadDirect(ctx, target, pageUrl, out)) { ensure480(out); done = true; break; }
-                  }
-                }
+                // فایل‌های مستقیم mp4 عمداً دانلود نمی‌شوند (معمولاً تبلیغ هستند)
 
                 if (done) success++;
                 else console.log('  All candidates failed.');
