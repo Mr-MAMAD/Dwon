@@ -1,0 +1,112 @@
+name: Telegram to GitHub Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'لینک پیام‌های تلگرام (با کاما جدا کنید) مثل https://t.me/channel/123'
+        required: true
+        type: string
+      tag:
+        description: 'نام تگ ریلیز (خالی = خودکار)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Telethon
+        run: pip install telethon cryptg
+
+      - name: Download files from Telegram
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          URLS: ${{ github.event.inputs.urls }}
+        run: |
+          mkdir -p downloads
+          cat > dl.py <<'EOF'
+          import os, re, asyncio
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+
+          async def main():
+              client = TelegramClient(StringSession(os.environ["SESSION"]),
+                                      int(os.environ["API_ID"]), os.environ["API_HASH"])
+              await client.start()
+              loaded_dialogs = False
+
+              for raw in os.environ["URLS"].split(","):
+                  link = raw.strip()
+                  if not link:
+                      continue
+
+                  m_priv = re.search(r"t\.me/c/(\d+)/(?:\d+/)?(\d+)", link)
+                  m_pub = re.search(r"t\.me/([A-Za-z0-9_]+)/(?:\d+/)?(\d+)", link)
+
+                  if m_priv:
+                      if not loaded_dialogs:
+                          await client.get_dialogs()
+                          loaded_dialogs = True
+                      entity, msg_id = int("-100" + m_priv.group(1)), int(m_priv.group(2))
+                  elif m_pub:
+                      entity, msg_id = m_pub.group(1), int(m_pub.group(2))
+                  else:
+                      print(f"!! لینک نامعتبر: {link}")
+                      continue
+
+                  try:
+                      msg = await client.get_messages(entity, ids=msg_id)
+                  except Exception as e:
+                      print(f"!! خطا در گرفتن پیام {link}: {e}")
+                      continue
+
+                  if not msg or not msg.media:
+                      print(f"!! پیام فایل ندارد: {link}")
+                      continue
+
+                  print(f"==> در حال دانلود: {link}")
+                  last = {"p": -1}
+                  def progress(cur, total):
+                      p = int(cur * 100 / total) if total else 0
+                      if p // 10 != last["p"] // 10:
+                          last["p"] = p
+                          print(f"   {p}%", flush=True)
+
+                  path = await client.download_media(msg, file="downloads/", progress_callback=progress)
+                  print(f"✔ ذخیره شد: {path}")
+
+              await client.disconnect()
+
+          asyncio.run(main())
+          EOF
+          python dl.py
+          ls -lh downloads/
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_INPUT: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -z "$(ls -A downloads 2>/dev/null)" ]; then
+            echo "!! هیچ فایلی دانلود نشد."
+            exit 1
+          fi
+
+          TAG="${TAG_INPUT:-tg-${GITHUB_RUN_NUMBER}}"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --notes "Files from Telegram" --repo "$GITHUB_REPOSITORY"
+          fi
+
+          gh release upload "$TAG" downloads/* --clobber --repo "$GITHUB_REPOSITORY"
+          echo "✔ آپلود شد: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
