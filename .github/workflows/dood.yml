@@ -1,4 +1,4 @@
-name: vida Downloader (Find Video)
+name: dood Downloader (Find Video)
 
 on:
   workflow_dispatch:
@@ -42,6 +42,16 @@ jobs:
           const urls = (process.env.URLS || '').split(/\s+/).filter(u => /^https?:\/\//.test(u));
           const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
           const MIN_SIZE = 102400;
+          const TARGET_H = 480;
+
+          // فقط از این دامنه‌ها فایل مستقیم دانلود می‌شود (بقیه mp4ها تبلیغ فرض می‌شوند)
+          const DIRECT_HOSTS = ['cloudatacdn.com'];
+          function isAllowedDirect(u) {
+            try {
+              const h = new URL(u).hostname;
+              return DIRECT_HOSTS.some(d => h === d || h.endsWith('.' + d));
+            } catch (e) { return false; }
+          }
 
           function pageId(u, i) {
             try {
@@ -82,6 +92,8 @@ jobs:
               '-y', '-loglevel', 'error',
               '-user_agent', UA,
               '-headers', `Referer: ${referer}\r\nOrigin: ${origin}\r\n`,
+              '-allowed_segment_extensions', 'ALL',
+              '-extension_picky', '0',
               '-i', url,
               '-c', 'copy',
               '-bsf:a', 'aac_adtstoasc',
@@ -96,6 +108,54 @@ jobs:
             }
             console.log(`  OK: ${out} (${size} bytes)`);
             return true;
+          }
+
+          function getHeight(file) {
+            const r = spawnSync('ffprobe', [
+              '-v', 'error',
+              '-select_streams', 'v:0',
+              '-show_entries', 'stream=height',
+              '-of', 'csv=p=0',
+              file
+            ], { encoding: 'utf8' });
+            const h = parseInt((r.stdout || '').trim(), 10);
+            return isNaN(h) ? 0 : h;
+          }
+
+          // اگر ارتفاع ویدیو 480 نبود، تبدیل می‌کند و مسیر فایل نهایی را برمی‌گرداند
+          function ensure480(file) {
+            const h = getHeight(file);
+            console.log('  Video height:', h);
+            if (h === 0 || h === TARGET_H) return file;
+
+            console.log(`  Converting ${h}p -> ${TARGET_H}p ...`);
+            const parsed = path.parse(file);
+            const tmp = path.join(parsed.dir, `${parsed.name}.tmp480.mp4`);
+            const final = path.join(parsed.dir, `${parsed.name}.mp4`);
+            try { fs.unlinkSync(tmp); } catch (e) {}
+
+            const r = spawnSync('ffmpeg', [
+              '-y', '-loglevel', 'error',
+              '-i', file,
+              '-vf', `scale=-2:${TARGET_H}`,
+              '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+              '-pix_fmt', 'yuv420p',
+              '-c:a', 'aac', '-b:a', '128k',
+              '-movflags', '+faststart',
+              tmp
+            ], { stdio: 'inherit' });
+
+            const size = fs.existsSync(tmp) ? fs.statSync(tmp).size : 0;
+            if (r.status !== 0 || size < MIN_SIZE) {
+              console.log('  Conversion failed, keeping original file.');
+              try { fs.unlinkSync(tmp); } catch (e) {}
+              return file;
+            }
+
+            fs.unlinkSync(file);
+            fs.renameSync(tmp, final);
+            console.log(`  Converted OK: ${final} (${size} bytes)`);
+            return final;
           }
 
           (async () => {
@@ -122,10 +182,11 @@ jobs:
                 const hls = [];
                 const seen = new Set();
 
-                const add = (u, why) => {
+                const add = (u, why, isVideo = false) => {
                   if (!u || seen.has(u) || !/^https?:/i.test(u)) return;
                   if (HLS_RE.test(u)) { seen.add(u); hls.push(u); console.log(`  Found HLS (${why}):`, u); }
-                  else if (FILE_RE.test(u)) { seen.add(u); direct.push(u); console.log(`  Found file (${why}):`, u); }
+                  else if ((FILE_RE.test(u) || isVideo) && isAllowedDirect(u)) { seen.add(u); direct.push(u); console.log(`  Found file (${why}):`, u); }
+                  else if (FILE_RE.test(u)) { seen.add(u); console.log(`  Skipped (not allowed host):`, u); }
                 };
 
                 const page = await ctx.newPage();
@@ -135,10 +196,10 @@ jobs:
                   if (p !== page) { console.log('  Closing popup:', p.url()); await p.close().catch(() => {}); }
                 });
 
-                page.on('request', r => add(r.url(), 'request'));
+                page.on('request', r => add(r.url(), 'request', r.resourceType() === 'media'));
                 page.on('response', r => {
                   const ct = (r.headers()['content-type'] || '').toLowerCase();
-                  if (ct.startsWith('video/')) add(r.url(), 'content-type');
+                  if (ct.startsWith('video/')) add(r.url(), 'content-type', true);
                   if (ct.includes('mpegurl')) add(r.url(), 'content-type');
                 });
 
@@ -162,7 +223,7 @@ jobs:
                         document.querySelectorAll('a[download]').forEach(a => out.push(a.href));
                         return out.filter(Boolean);
                       });
-                      vals.forEach(s => { try { add(new URL(s, base).href, 'dom'); } catch (e) {} });
+                      vals.forEach(s => { try { add(new URL(s, base).href, 'dom', true); } catch (e) {} });
                     } catch (e) {}
                   }
                 };
@@ -222,23 +283,26 @@ jobs:
 
                 let done = false;
 
-                // اول فایل‌های مستقیم
-                let k = 0;
-                for (const target of direct) {
-                  k++;
-                  console.log('  Downloading file:', target);
-                  const out = path.join('downloads', fileNameFrom(target, i + 1, k));
-                  if (await downloadDirect(ctx, target, pageUrl, out)) { done = true; break; }
+                // master.m3u8 اولویت دارد، بعد بقیه playlistها
+                hls.sort((a, b) => (/master/i.test(b) ? 1 : 0) - (/master/i.test(a) ? 1 : 0));
+
+                // اول استریم HLS (ویدیوی اصلی)
+                let h = 0;
+                for (const target of hls) {
+                  h++;
+                  console.log('  Downloading HLS with ffmpeg:', target);
+                  const out = path.join('downloads', `${pageId(pageUrl, i + 1)}${h > 1 ? '_' + h : ''}.mp4`);
+                  if (downloadHls(target, pageUrl, out)) { ensure480(out); done = true; break; }
                 }
 
-                // بعد استریم HLS
+                // بعد فایل‌های مستقیم (فقط دامنه‌های مجاز)
                 if (!done) {
-                  let h = 0;
-                  for (const target of hls) {
-                    h++;
-                    console.log('  Downloading HLS with ffmpeg:', target);
-                    const out = path.join('downloads', `${pageId(pageUrl, i + 1)}${hls.length > 1 ? '_' + h : ''}.mp4`);
-                    if (downloadHls(target, pageUrl, out)) { done = true; break; }
+                  let k = 0;
+                  for (const target of direct) {
+                    k++;
+                    console.log('  Downloading file:', target);
+                    const out = path.join('downloads', `${pageId(pageUrl, i + 1)}${k > 1 ? '_' + k : ''}.mp4`);
+                    if (await downloadDirect(ctx, target, pageUrl, out)) { ensure480(out); done = true; break; }
                   }
                 }
 
@@ -289,7 +353,7 @@ jobs:
         if: steps.clean.outputs.has_files == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: vida-${{ github.run_number }}
+          tag_name: dood-${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
