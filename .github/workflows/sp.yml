@@ -1,0 +1,173 @@
+name: Split Release Assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_url:
+        description: 'لینک ریلیز (مثلا https://github.com/owner/repo/releases/tag/v1.0 یا owner/repo برای آخرین ریلیز)'
+        required: true
+        type: string
+      parts:
+        description: 'تعداد پارت‌ها'
+        required: true
+        default: '4'
+        type: string
+      min_size_mb:
+        description: 'فقط فایل‌های بزرگ‌تر از این مقدار (مگابایت) تقسیم شوند'
+        required: true
+        default: '100'
+        type: string
+      name_filter:
+        description: 'فیلتر اختیاری روی اسم فایل (regex، مثلا \.apk$). خالی = همه'
+        required: false
+        default: ''
+        type: string
+      destination:
+        description: 'مقصد خروجی'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release   # آپلود در یک ریلیز جدید همین ریپو
+          - artifact  # آپلود به‌عنوان Actions Artifact
+
+permissions:
+  contents: write
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_URL: ${{ inputs.release_url }}
+      PARTS: ${{ inputs.parts }}
+      MIN_MB: ${{ inputs.min_size_mb }}
+      NAME_FILTER: ${{ inputs.name_filter }}
+    steps:
+      - name: Parse release URL
+        id: parse
+        run: |
+          set -euo pipefail
+          url="${RELEASE_URL%%\?*}"
+          url="${url%/}"
+          repo=""; tag=""; only_file=""
+
+          if [[ "$url" =~ github\.com/([^/]+)/([^/]+)/releases/tag/([^/]+)$ ]]; then
+            repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; tag="${BASH_REMATCH[3]}"
+          elif [[ "$url" =~ github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/(.+)$ ]]; then
+            repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; tag="${BASH_REMATCH[3]}"; only_file="${BASH_REMATCH[4]}"
+          elif [[ "$url" =~ github\.com/([^/]+)/([^/]+)/releases(/latest)?$ ]]; then
+            repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+          elif [[ "$url" =~ ^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$ ]]; then
+            repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+          else
+            echo "::error::لینک ریلیز قابل شناسایی نیست: $RELEASE_URL"; exit 1
+          fi
+
+          dec() { python3 -c 'import sys,urllib.parse;print(urllib.parse.unquote(sys.argv[1]))' "$1"; }
+          [ -n "$tag" ] && tag="$(dec "$tag")"
+          [ -n "$only_file" ] && only_file="$(dec "$only_file")"
+
+          [[ "$PARTS" =~ ^[0-9]+$ ]] && [ "$PARTS" -ge 2 ] || { echo "::error::تعداد پارت باید عدد >= 2 باشد"; exit 1; }
+
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "only_file=$only_file" >> "$GITHUB_OUTPUT"
+          echo "Repo: $repo | Tag: ${tag:-latest} | File: ${only_file:-all}"
+
+      - name: Download & split large assets
+        id: split
+        env:
+          REPO: ${{ steps.parse.outputs.repo }}
+          TAG: ${{ steps.parse.outputs.tag }}
+          ONLY_FILE: ${{ steps.parse.outputs.only_file }}
+        run: |
+          set -euo pipefail
+          mkdir -p work parts
+          min_bytes=$(( MIN_MB * 1024 * 1024 ))
+
+          if [ -n "$TAG" ]; then
+            info="$(gh release view "$TAG" -R "$REPO" --json tagName,assets)"
+          else
+            info="$(gh release view -R "$REPO" --json tagName,assets)"
+          fi
+          real_tag="$(jq -r .tagName <<<"$info")"
+          echo "real_tag=$real_tag" >> "$GITHUB_OUTPUT"
+
+          jq -r --argjson min "$min_bytes" --arg only "$ONLY_FILE" --arg re "$NAME_FILTER" '
+            .assets[]
+            | select(.size > $min)
+            | select($only == "" or .name == $only)
+            | select($re == "" or (.name | test($re)))
+            | .name' <<<"$info" > list.txt
+
+          if [ ! -s list.txt ]; then
+            echo "::warning::هیچ فایلی بزرگ‌تر از ${MIN_MB}MB (با فیلترهای داده‌شده) پیدا نشد."
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          count=0
+          while IFS= read -r name; do
+            echo "::group::$name"
+            gh release download "$real_tag" -R "$REPO" -p "$name" -D work --clobber
+            f="work/$name"
+
+            ( cd work && sha256sum "$name" ) > "parts/$name.sha256"
+            split -n "$PARTS" -d -a 3 --numeric-suffixes=1 "$f" "parts/$name."
+            rm -f "$f"   # آزاد کردن فضای دیسک
+
+            ls -lh "parts/$name."*
+            count=$((count+1))
+            echo "::endgroup::"
+          done < list.txt
+
+          cat > parts/JOIN.txt <<EOF
+          برای ترکیب پارت‌ها:
+
+          Linux / macOS:
+            cat FILE.001 FILE.002 FILE.003 FILE.004 > FILE
+
+          Windows (CMD):
+            copy /b FILE.001+FILE.002+FILE.003+FILE.004 FILE
+
+          بررسی سلامت فایل:
+            sha256sum -c FILE.sha256
+          EOF
+          sed -i 's/^          //' parts/JOIN.txt
+
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          df -h . | tail -1
+
+      - name: Upload as artifact
+        if: steps.split.outputs.count != '0' && inputs.destination == 'artifact'
+        uses: actions/upload-artifact@v4
+        with:
+          name: split-parts
+          path: parts/
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload to a new release in this repo
+        if: steps.split.outputs.count != '0' && inputs.destination == 'release'
+        env:
+          SRC_TAG: ${{ steps.split.outputs.real_tag }}
+          SRC_REPO: ${{ steps.parse.outputs.repo }}
+        run: |
+          set -euo pipefail
+          safe_tag="$(echo "$SRC_TAG" | tr '/ ' '--')"
+          new_tag="split-${safe_tag}"
+
+          if ! gh release view "$new_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$new_tag" -R "$GITHUB_REPOSITORY" \
+              --title "Split: $SRC_REPO @ $SRC_TAG" \
+              --notes "پارت‌های تقسیم‌شده از https://github.com/$SRC_REPO/releases/tag/$SRC_TAG — راهنمای ترکیب در JOIN.txt"
+          fi
+
+          for f in parts/*; do
+            echo "Uploading $f"
+            gh release upload "$new_tag" "$f" -R "$GITHUB_REPOSITORY" --clobber
+          done
+
+          echo "### ✅ Done" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$new_tag" >> "$GITHUB_STEP_SUMMARY"
